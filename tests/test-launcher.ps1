@@ -167,11 +167,12 @@ $postrmText = Get-FileText "ios\audio_bridge_safe_tweak\layout\DEBIAN\postrm"
 if ($postinstText -and $postinstText -match '/usr/lib/TweakInject') {
     if ($postinstText -notmatch '/var/jb/Library/MobileSubstrate/DynamicLibraries' -or
         $postinstText -notmatch 'ROOTLESS_DYLIB' -or
-        $postinstText -notmatch 'ROOTLESS_PLIST' -or
-        $postinstText -notmatch 'cp\s+-f') {
-        $errors += "✗ Safe AudioBridge RootHide postinst must mirror rootless dylib/plist into TweakInject"
+        $postinstText -notmatch 'cp\s+-f' -or
+        $postinstText -notmatch '<!DOCTYPE plist' -or
+        $postinstText -notmatch '<string>TikTok</string>') {
+        $errors += "✗ Safe AudioBridge RootHide postinst must mirror the rootless dylib and write an XML TweakInject plist"
     } else {
-        $success += "✓ Safe AudioBridge RootHide postinst mirrors rootless dylib/plist into TweakInject"
+        $success += "✓ Safe AudioBridge RootHide postinst mirrors dylib and writes XML TweakInject plist"
     }
 }
 if ($postrmText -and (

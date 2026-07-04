@@ -10,6 +10,7 @@ on:
     paths:
       - '.github/workflows/build-audio-bridge-safe-tweak.yml'
       - 'ios/audio_bridge_safe_tweak/**'
+      - 'ios/retag_deb_architecture.py'
       - 'ios/validate_deb.py'
 
 jobs:
@@ -40,6 +41,10 @@ jobs:
         run: |
           make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
           find packages -maxdepth 1 -type f -name '*.deb' -print
+
+      - name: Retag safe package architecture
+        run: |
+          python3 ios/retag_deb_architecture.py --architecture iphoneos-arm64e ios/audio_bridge_safe_tweak/packages/*.deb
 
       - name: Validate safe audio bridge package
         run: |

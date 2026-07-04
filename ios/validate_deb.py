@@ -94,6 +94,10 @@ def validate_safe_package(control_fields, control_entries, data_entries):
     if package != SAFE_PACKAGE:
         return True
 
+    ok &= require(
+        control_fields.get("Architecture") == "iphoneos-arm64e",
+        "safe package Architecture must be iphoneos-arm64e",
+    )
     ok &= require(SAFE_DYLIB in data_entries, f"missing {SAFE_DYLIB}")
     ok &= require(SAFE_PLIST in data_entries, f"missing {SAFE_PLIST}")
 
@@ -107,7 +111,9 @@ def validate_safe_package(control_fields, control_entries, data_entries):
         "postinst missing RootHide AutoPatches link target",
     )
     ok &= require(ROOTLESS_TWEAK_DIR in postinst, "postinst missing rootless source path")
-    ok &= require("cp -f" in postinst, "postinst must mirror rootless files for RootHide")
+    ok &= require("cp -f" in postinst, "postinst must mirror rootless dylib for RootHide")
+    ok &= require("<!DOCTYPE plist" in postinst, "postinst must write an XML RootHide filter plist")
+    ok &= require("<string>TikTok</string>" in postinst, "postinst XML filter missing TikTok executable")
     ok &= require("iOSVCAMAudioBridgeSafe.dylib" in postrm, "postrm missing dylib cleanup")
     ok &= require("iOSVCAMAudioBridgeSafe.plist" in postrm, "postrm missing plist cleanup")
     ok &= require("roothidepatch" in postrm, "postrm missing roothidepatch cleanup")

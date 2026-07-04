@@ -41,7 +41,7 @@ However:
 127.10.10.10:1936 -> PC 127.0.0.1:1936
 ```
 
-This is only for the experimental `com.iosvcam.audiobridge.safe` target-app path. Version 0.3.6 keeps the normal rootless install path and mirrors the same restricted tweak into RootHide's `/usr/lib/TweakInject` when that environment is present. It is not a global system microphone replacement, and system Camera may still record the real iPhone microphone.
+This is only for the experimental `com.iosvcam.audiobridge.safe` target-app path. Version 0.3.7 keeps the normal rootless install path and mirrors the same restricted dylib into RootHide's `/usr/lib/TweakInject` with an XML filter plist when that environment is present. It is not a global system microphone replacement, and system Camera may still record the real iPhone microphone.
 
 ## Safe recommendation
 

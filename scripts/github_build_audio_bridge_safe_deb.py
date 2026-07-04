@@ -49,6 +49,7 @@ COMMIT_PATHS = [
     "ios/audio_bridge_safe_tweak/layout/DEBIAN/postinst",
     "ios/audio_bridge_safe_tweak/layout/DEBIAN/postrm",
     "scripts/github_build_audio_bridge_safe_deb.py",
+    "ios/retag_deb_architecture.py",
     "ios/validate_deb.py",
     "tests/test-launcher.ps1",
     "docs/Audio-Bridge-DiCoy-Integration.md",

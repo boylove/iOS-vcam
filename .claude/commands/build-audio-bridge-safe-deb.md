@@ -47,4 +47,4 @@ If GitHub CLI is not authenticated, run:
 
 The wrapper only builds and downloads the `.deb`. It does **not** install anything on the iPhone. Installation still requires explicit user approval.
 
-The unsafe package `com.iosvcam.audiobridge` remains quarantined. Use only `com.iosvcam.audiobridge.safe` 0.3.6+ for TikTok-only safe-audio experiments. Version 0.3.6 keeps the normal rootless install path and adds guarded RootHide `TweakInject` mirror support.
+The unsafe package `com.iosvcam.audiobridge` remains quarantined. Use only `com.iosvcam.audiobridge.safe` 0.3.7+ for TikTok-only safe-audio experiments. Version 0.3.7 keeps the normal rootless install path, adds guarded RootHide `TweakInject` mirror support, and writes the RootHide filter as XML.
