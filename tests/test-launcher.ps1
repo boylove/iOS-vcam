@@ -1,26 +1,72 @@
-# Quick validation test for iOS-VCAM-Launcher.exe
+# Quick validation test for iOS-VCAM-Launcher.ps1
 Write-Host "============================================================================" -ForegroundColor Cyan
 Write-Host "             iOS-VCAM LAUNCHER - VALIDATION TEST" -ForegroundColor Yellow
 Write-Host "============================================================================" -ForegroundColor Cyan
 Write-Host ""
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $repoRoot
+
 $errors = @()
 $warnings = @()
 $success = @()
 
-# Test 1: Check EXE exists
-Write-Host "[TEST 1] Checking EXE file..." -ForegroundColor Yellow
-if (Test-Path ".\iOS-VCAM-Launcher.exe") {
-    $success += "✓ EXE file exists"
-    $exeSize = (Get-Item ".\iOS-VCAM-Launcher.exe").Length / 1KB
-    $success += "✓ EXE size: $([math]::Round($exeSize, 2)) KB"
+function Get-FileText {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    return Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue
+}
+
+# Test 1: Check PS1 exists and parses
+Write-Host "[TEST 1] Checking PowerShell launcher script..." -ForegroundColor Yellow
+$launcherPath = ".\iOS-VCAM-Launcher.ps1"
+if (Test-Path $launcherPath) {
+    $success += "✓ PowerShell launcher exists (iOS-VCAM-Launcher.ps1)"
+    $scriptSize = (Get-Item $launcherPath).Length / 1KB
+    $success += "✓ Launcher script size: $([math]::Round($scriptSize, 2)) KB"
+
+    $tokens = $null
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $launcherPath).Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    if ($parseErrors.Count -eq 0) {
+        $success += "✓ Launcher PowerShell syntax parses successfully"
+    } else {
+        $errors += "✗ Launcher PowerShell syntax errors: $($parseErrors.Count)"
+        foreach ($parseError in $parseErrors) {
+            $errors += "  - $parseError"
+        }
+    }
 } else {
-    $errors += "✗ EXE file not found"
+    $errors += "✗ PowerShell launcher not found (iOS-VCAM-Launcher.ps1)"
 }
 Write-Host ""
 
-# Test 2: Check config directory structure
-Write-Host "[TEST 2] Checking configuration files..." -ForegroundColor Yellow
+# Test 2: Check launcher entrypoints
+Write-Host "[TEST 2] Checking launcher entrypoints..." -ForegroundColor Yellow
+$batPath = ".\iOS-VCAM-Launcher.bat"
+if (Test-Path $batPath) {
+    $success += "✓ Double-click BAT wrapper exists (iOS-VCAM-Launcher.bat)"
+    $batContent = Get-FileText $batPath
+    if ($batContent -match 'powershell.*-ExecutionPolicy\s+Bypass.*-File.*iOS-VCAM-Launcher\.ps1') {
+        $success += "✓ BAT wrapper launches the canonical PS1 with ExecutionPolicy Bypass"
+    } else {
+        $errors += "✗ BAT wrapper does not launch iOS-VCAM-Launcher.ps1 with ExecutionPolicy Bypass"
+    }
+} else {
+    $errors += "✗ Double-click BAT wrapper not found (iOS-VCAM-Launcher.bat)"
+}
+
+$duplicateLaunchers = @(".\iOS-VCAM-Launcher.exe", ".\iOS-VCAM-Launcher4.2.exe")
+$remainingDuplicates = @($duplicateLaunchers | Where-Object { Test-Path $_ })
+if ($remainingDuplicates.Count -eq 0) {
+    $success += "✓ Stale EXE launchers are absent"
+} else {
+    $errors += "✗ Stale EXE launcher files still present: $($remainingDuplicates -join ', ')"
+}
+Write-Host ""
+
+# Test 3: Check config directory structure
+Write-Host "[TEST 3] Checking configuration files..." -ForegroundColor Yellow
 if (Test-Path ".\config\active") {
     $success += "✓ Config directory exists (config\active)"
     $configs = Get-ChildItem ".\config\active\srs_iphone*.conf" -ErrorAction SilentlyContinue
@@ -34,8 +80,8 @@ if (Test-Path ".\config\active") {
 }
 Write-Host ""
 
-# Test 3: Check SRS binary
-Write-Host "[TEST 3] Checking SRS server binary..." -ForegroundColor Yellow
+# Test 4: Check SRS server binary
+Write-Host "[TEST 4] Checking SRS server binary..." -ForegroundColor Yellow
 if (Test-Path ".\objs\srs.exe") {
     $success += "✓ SRS binary exists (objs\srs.exe)"
     $srsSize = (Get-Item ".\objs\srs.exe").Length / 1MB
@@ -45,8 +91,8 @@ if (Test-Path ".\objs\srs.exe") {
 }
 Write-Host ""
 
-# Test 4: Check Flask server
-Write-Host "[TEST 4] Checking Flask authentication server..." -ForegroundColor Yellow
+# Test 5: Check Flask authentication server
+Write-Host "[TEST 5] Checking Flask authentication server..." -ForegroundColor Yellow
 if (Test-Path ".\server.py") {
     $success += "✓ Flask server exists (server.py)"
 } else {
@@ -54,8 +100,8 @@ if (Test-Path ".\server.py") {
 }
 Write-Host ""
 
-# Test 5: Check icon file
-Write-Host "[TEST 5] Checking icon file..." -ForegroundColor Yellow
+# Test 6: Check icon file
+Write-Host "[TEST 6] Checking icon file..." -ForegroundColor Yellow
 if (Test-Path ".\iOS-VCAM.ico") {
     $success += "✓ Icon file exists (iOS-VCAM.ico)"
 } else {
@@ -63,12 +109,13 @@ if (Test-Path ".\iOS-VCAM.ico") {
 }
 Write-Host ""
 
-# Test 6: Check specific config files referenced in code
-Write-Host "[TEST 6] Checking referenced configuration files..." -ForegroundColor Yellow
+# Test 7: Check specific config files referenced in code
+Write-Host "[TEST 7] Checking referenced configuration files..." -ForegroundColor Yellow
 $requiredConfigs = @(
     "config\active\srs_iphone_ultra_smooth_dynamic.conf",
     "config\active\srs_iphone_ultra_smooth.conf",
-    "config\active\srs_iphone_optimized_smooth.conf"
+    "config\active\srs_iphone_optimized_smooth.conf",
+    "config\active\srs_usb_smooth_playback.conf"
 )
 
 foreach ($config in $requiredConfigs) {
@@ -77,6 +124,123 @@ foreach ($config in $requiredConfigs) {
     } else {
         $errors += "✗ Missing: $config"
     }
+}
+Write-Host ""
+
+# Test 8: Check PS1-only and audio bridge safety invariants
+Write-Host "[TEST 8] Checking safety invariants..." -ForegroundColor Yellow
+$safeTweakFiles = @(
+    "ios\audio_bridge_safe_tweak\control",
+    "ios\audio_bridge_safe_tweak\iOSVCAMAudioBridgeSafe.plist",
+    "ios\audio_bridge_safe_tweak\layout\DEBIAN\postinst",
+    "ios\audio_bridge_safe_tweak\layout\DEBIAN\postrm",
+    "ios\audio_bridge_safe_tweak\Tweak.x"
+)
+foreach ($file in $safeTweakFiles) {
+    $text = Get-FileText $file
+    if ($null -eq $text) {
+        $warnings += "⚠ Safe audio bridge file not found: $file"
+        continue
+    }
+    if ($text -match 'com\.apple\.mediaserverd|\bmediaserverd\b') {
+        $errors += "✗ Safe audio bridge must not target mediaserverd: $file"
+    }
+    if ($text -match 'com\.apple\.camera|Camera\.app|com\.apple\.springboard|SpringBoard') {
+        $errors += "✗ Safe audio bridge must not target Camera.app or SpringBoard: $file"
+    }
+    if ($text -match 'Package:\s*com\.iosvcam\.audiobridge\s*(?:$|\r?\n)') {
+        $errors += "✗ Safe audio bridge must not use quarantined package id: $file"
+    }
+}
+if (-not ($errors | Where-Object { $_ -match 'mediaserverd' })) {
+    $success += "✓ Safe audio bridge sources do not target mediaserverd"
+}
+if (-not ($errors | Where-Object { $_ -match 'Camera\.app|SpringBoard' })) {
+    $success += "✓ Safe audio bridge sources do not target Camera.app or SpringBoard"
+}
+if (-not ($errors | Where-Object { $_ -match 'quarantined package id' })) {
+    $success += "✓ Safe audio bridge keeps the safe package id"
+}
+
+$postinstText = Get-FileText "ios\audio_bridge_safe_tweak\layout\DEBIAN\postinst"
+$postrmText = Get-FileText "ios\audio_bridge_safe_tweak\layout\DEBIAN\postrm"
+if ($postinstText -and $postinstText -match '/usr/lib/TweakInject') {
+    if ($postinstText -notmatch '/var/jb/Library/MobileSubstrate/DynamicLibraries' -or
+        $postinstText -notmatch 'ROOTLESS_DYLIB' -or
+        $postinstText -notmatch 'ROOTLESS_PLIST' -or
+        $postinstText -notmatch 'cp\s+-f') {
+        $errors += "✗ Safe AudioBridge RootHide postinst must mirror rootless dylib/plist into TweakInject"
+    } else {
+        $success += "✓ Safe AudioBridge RootHide postinst mirrors rootless dylib/plist into TweakInject"
+    }
+}
+if ($postrmText -and (
+    $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.dylib\.roothidepatch' -or
+    $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.dylib' -or
+    $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.plist')) {
+    $errors += "✗ Safe AudioBridge postrm must clean RootHide mirror files and roothidepatch link"
+} elseif ($postrmText) {
+    $success += "✓ Safe AudioBridge postrm cleans RootHide mirror files and roothidepatch link"
+}
+
+$testFiles = Get-ChildItem ".\tests" -Filter "*.ps1" -ErrorAction SilentlyContinue
+$noExitFlag = '-' + 'NoExit'
+$noExitMatches = @()
+foreach ($file in $testFiles) {
+    $text = Get-FileText $file.FullName
+    if ($file.Name -ne "test-launcher.ps1" -and ($text.Contains('"' + $noExitFlag + '"') -or $text.Contains("'" + $noExitFlag + "'"))) { $noExitMatches += $file.Name }
+}
+if ($noExitMatches.Count -eq 0) {
+    $success += "✓ Launcher tests do not use the NoExit flag"
+} else {
+    $errors += "✗ Launcher tests must not use the NoExit flag: $($noExitMatches -join ', ')"
+}
+
+$compileText = Get-FileText ".\compile-v4.2.ps1"
+if ($compileText -and $compileText -match 'Copy-Item[\s\S]*iOS-VCAM-Launcher\.exe|compatOutputFile') {
+    $errors += "✗ compile-v4.2.ps1 must not recreate the stale root iOS-VCAM-Launcher.exe"
+} else {
+    $success += "✓ Legacy compile script does not recreate root EXE launcher"
+}
+
+$option9Docs = @("docs\Home.md", "docs\Advanced-Features.md", "docs\Troubleshooting.md")
+foreach ($doc in $option9Docs) {
+    $text = Get-FileText $doc
+    if ($text -and (
+        $text -match 'SSH Installation Tool.*Option \[9\]' -or
+        $text -match 'Automated Installation \(Option \[9\]\)' -or
+        $text -match 'Option \[9\].*(directly install|install or update)'
+    )) {
+        $errors += "✗ $doc still advertises Option [9] as the removed .deb installer"
+    }
+}
+if (-not ($errors | Where-Object { $_ -match 'Option \[9\]' })) {
+    $success += "✓ Option [9] docs no longer advertise the removed .deb installer"
+}
+
+$unsafeInstallMatches = @()
+$scanFiles = @()
+$scanFiles += Get-ChildItem ".\docs" -Filter "*.md" -File -ErrorAction SilentlyContinue
+$scanFiles += Get-Item ".\iOS-VCAM-Launcher.ps1" -ErrorAction SilentlyContinue
+foreach ($file in $scanFiles) {
+    $lines = Get-Content -Path $file.FullName -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match 'install(?:ing)?\s+`?com\.iosvcam\.audiobridge(?!\.safe)' -and
+            $line -notmatch 'Do not|do not|not safe|should not|must not|quarantine|quarantined|unsafe|不应|不要|不能|已隔离') {
+            $unsafeInstallMatches += "$($file.FullName):$($i + 1)"
+        }
+    }
+}
+if ($unsafeInstallMatches.Count -eq 0) {
+    $success += "✓ Quarantined com.iosvcam.audiobridge is not recommended for install"
+} else {
+    $errors += "✗ Quarantined com.iosvcam.audiobridge appears as an install recommendation: $($unsafeInstallMatches -join ', ')"
+}
+
+$staleSafePackages = @(Get-ChildItem ".\ios\audio_bridge_safe_tweak\packages" -Filter "*.deb" -ErrorAction SilentlyContinue)
+if ($staleSafePackages.Count -gt 0) {
+    $warnings += "⚠ Development-only safe audio bridge package artifacts present: $($staleSafePackages.Name -join ', ')"
 }
 Write-Host ""
 
@@ -109,17 +273,17 @@ if ($errors.Count -gt 0) {
     }
     Write-Host ""
     Write-Host "RESULT: FAILED - Please fix errors before using the launcher" -ForegroundColor Red
-} else {
-    Write-Host "============================================================================" -ForegroundColor Green
-    Write-Host "               ✓ ALL CRITICAL TESTS PASSED!" -ForegroundColor Green
-    Write-Host "============================================================================" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "The iOS-VCAM Launcher is ready to use!" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "To launch:" -ForegroundColor Yellow
-    Write-Host "  - Double-click: iOS-VCAM-Launcher.exe" -ForegroundColor White
-    Write-Host "  - Or run: iOS-VCAM-Launcher.bat" -ForegroundColor White
+    exit 1
 }
 
+Write-Host "============================================================================" -ForegroundColor Green
+Write-Host "               ✓ ALL CRITICAL TESTS PASSED!" -ForegroundColor Green
+Write-Host "============================================================================" -ForegroundColor Green
 Write-Host ""
-Read-Host "Press Enter to exit"
+Write-Host "The iOS-VCAM Launcher is ready to use!" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "To launch:" -ForegroundColor Yellow
+Write-Host "  Double-click: iOS-VCAM-Launcher.bat" -ForegroundColor White
+Write-Host "  Or run: powershell -ExecutionPolicy Bypass -File .\iOS-VCAM-Launcher.ps1" -ForegroundColor White
+Write-Host ""
+exit 0

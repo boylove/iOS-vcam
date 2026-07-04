@@ -505,8 +505,8 @@ static void IVCAMSafeHookDelegateIfNeeded(id delegate) {
 
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
-        BOOL targetApp = [bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE];
-        IVCAMSafeLog(@"loaded into bundle=%@ process=%@", bundleID, processName);
+        BOOL targetApp = [bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE] || [processName isEqualToString:@"TikTok"];
+        IVCAMSafeLog(@"loaded into bundle=%@ process=%@ target=%d", bundleID, processName, targetApp);
         if (!targetApp) {
             IVCAMSafeLog(@"bundle/process not target; inactive");
             return;

@@ -10,10 +10,11 @@ on:
     paths:
       - '.github/workflows/build-audio-bridge-safe-tweak.yml'
       - 'ios/audio_bridge_safe_tweak/**'
+      - 'ios/validate_deb.py'
 
 jobs:
-  build-rootless:
-    name: Build restricted rootless .deb
+  build-rootless-roothide:
+    name: Build restricted rootless + RootHide-compatible .deb
     runs-on: macos-14
 
     steps:
@@ -40,9 +41,17 @@ jobs:
           make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
           find packages -maxdepth 1 -type f -name '*.deb' -print
 
+      - name: Validate safe audio bridge package
+        run: |
+          for deb in ios/audio_bridge_safe_tweak/packages/*.deb; do
+            python3 ios/validate_deb.py "$deb"
+            dpkg-deb -I "$deb"
+            dpkg-deb -c "$deb"
+          done
+
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iosvcam-audio-bridge-safe-rootless-deb
+          name: iosvcam-audio-bridge-safe-rootless-roothide-deb
           path: ios/audio_bridge_safe_tweak/packages/*.deb
           if-no-files-found: error

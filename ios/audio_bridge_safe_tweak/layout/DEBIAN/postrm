@@ -1,4 +1,7 @@
 #!/bin/sh
+
 TWEAK_DIR="/usr/lib/TweakInject"
 rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib.roothidepatch" 2>/dev/null || true
+rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib" 2>/dev/null || true
+rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeSafe.plist" 2>/dev/null || true
 exit 0

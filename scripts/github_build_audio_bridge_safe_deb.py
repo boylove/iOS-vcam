@@ -37,7 +37,7 @@ DEFAULT_REPO = "boylove/iOS-vcam"
 DEFAULT_REMOTE = "boylove"
 DEFAULT_BRANCH = "build/audio-bridge-tweak"
 DEFAULT_WORKFLOW = "build-audio-bridge-safe-tweak.yml"
-DEFAULT_ARTIFACT = "iosvcam-audio-bridge-safe-rootless-deb"
+DEFAULT_ARTIFACT = "iosvcam-audio-bridge-safe-rootless-roothide-deb"
 DEFAULT_DOWNLOAD_DIR = Path("ios/audio_bridge_safe_tweak/packages")
 COMMIT_PATHS = [
     ".github/workflows/build-audio-bridge-safe-tweak.yml",
@@ -49,6 +49,10 @@ COMMIT_PATHS = [
     "ios/audio_bridge_safe_tweak/layout/DEBIAN/postinst",
     "ios/audio_bridge_safe_tweak/layout/DEBIAN/postrm",
     "scripts/github_build_audio_bridge_safe_deb.py",
+    "ios/validate_deb.py",
+    "tests/test-launcher.ps1",
+    "docs/Audio-Bridge-DiCoy-Integration.md",
+    "docs/Streaming-Guide.md",
     ".claude/commands/build-audio-bridge-safe-deb.md",
 ]
 
@@ -193,8 +197,8 @@ def commit_changes(paths: list[str]) -> None:
         return
 
     message = (
-        "Update safe audio bridge GitHub build\n\n"
-        "Refresh the restricted AudioBridgeSafe tweak inputs for GitHub Actions/Theos builds.\n\n"
+        "Update safe audio bridge RootHide build\n\n"
+        "Refresh the restricted AudioBridgeSafe tweak inputs for rootless and RootHide-compatible builds.\n\n"
         "Co-Authored-By: Claude <noreply@anthropic.com>"
     )
     run(["git", "commit", "-m", message])

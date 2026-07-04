@@ -5,7 +5,7 @@ This guide covers how to stream video from your PC to your iPhone using iOS-VCAM
 ## 📡 Method 1: WiFi Streaming (Easiest)
 
 1.  **Connect Devices:** Ensure your PC and iPhone are on the **same WiFi network**. (5 GHz recommended).
-2.  **Start Server:** Run `iOS-VCAM-Launcher.exe`.
+2.  **Start Server:** Run `powershell -ExecutionPolicy Bypass -File .\iOS-VCAM-Launcher.ps1`.
 3.  **Select Profile:** Choose **Option [A]** (Main Streaming) or select a profile like `srs_iphone_ultra_smooth_dynamic.conf`.
 4.  **Get URL:** The launcher will display an RTMP URL, e.g., `rtmp://192.168.1.50:1935/live/srs`.
 5.  **Configure Source:**
@@ -26,12 +26,20 @@ For professional or long-term use, USB is superior due to zero interference and 
 
 The launcher now includes **Option [U]** which automates the entire USB streaming setup:
 1.  Connect iPhone via USB cable
-2.  Run `iOS-VCAM-Launcher.exe` and choose **Option [U]**
+2.  Run `powershell -ExecutionPolicy Bypass -File .\iOS-VCAM-Launcher.ps1` and choose **Option [U]**
 3.  Enter SSH password when prompted (default: `alpine`)
-4.  Three windows will launch automatically: iProxy, SSH Tunnel, and Monibuca
+4.  The launcher starts iProxy, Flask auth, SRS USB mode, and an SSH reverse tunnel
 5.  Configure iPhone with URL: `rtmp://127.10.10.10:1935/live/srs`
 
 This method uses SSH reverse tunneling and requires the special `.deb` package with IP `127.10.10.10`.
+
+#### Audio status
+
+The stable VCAM path is primarily a **virtual camera/video** path. OBS audio inside RTMP does not automatically become an iPhone microphone.
+
+For explicit safe-audio experiments, enable AudioBridge in launcher configuration before Option [U]. When the PC bridge starts, the USB tunnel also exposes `127.10.10.10:1936` on the iPhone for the restricted `com.iosvcam.audiobridge.safe` target-app tweak. Safe AudioBridge 0.3.6 supports the normal rootless path and guarded RootHide `TweakInject` mirroring, but it is still a manually installed target-app package and not a global system Camera microphone replacement.
+
+The previously built experimental package `com.iosvcam.audiobridge` is not safe to use on the tested Dopamine iOS 16.1.2 setup and should not be installed.
 
 ### Manual USB Setup (Alternative)
 
@@ -75,6 +83,7 @@ If standard `iproxy` is unstable, use Reverse SSH.
     *   **Keyframe Interval:** **1 second** (Important for low latency).
     *   **Profile:** baseline or main.
     *   **Tune:** zerolatency.
+    *   **Audio:** AAC, 48 kHz, and ensure the streaming audio track includes the desktop/mic/media sources you expect.
 
 2.  **Canvas:**
     *   Set Base/Output Resolution to match your iPhone's camera aspect ratio (usually 9:16, e.g., 1080x1920) if you are simulating a vertical camera.

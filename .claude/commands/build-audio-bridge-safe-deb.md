@@ -16,7 +16,7 @@ The wrapper defaults to:
 - Actions repo: `boylove/iOS-vcam`
 - Branch: current branch, typically `build/audio-bridge-tweak`
 - Workflow: `.github/workflows/build-audio-bridge-safe-tweak.yml`
-- Artifact: `iosvcam-audio-bridge-safe-rootless-deb`
+- Artifact: `iosvcam-audio-bridge-safe-rootless-roothide-deb`
 - Download directory: `ios/audio_bridge_safe_tweak/packages/`
 
 ## Include local safe tweak changes
@@ -47,4 +47,4 @@ If GitHub CLI is not authenticated, run:
 
 The wrapper only builds and downloads the `.deb`. It does **not** install anything on the iPhone. Installation still requires explicit user approval.
 
-The unsafe package `com.iosvcam.audiobridge` remains quarantined. Use only `com.iosvcam.audiobridge.safe` 0.3.5+ for TikTok-only safe-audio experiments.
+The unsafe package `com.iosvcam.audiobridge` remains quarantined. Use only `com.iosvcam.audiobridge.safe` 0.3.6+ for TikTok-only safe-audio experiments. Version 0.3.6 keeps the normal rootless install path and adds guarded RootHide `TweakInject` mirror support.
