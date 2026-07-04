@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Retag Debian control Architecture fields and patch Safe AudioBridge .deb files.
+"""Retag Debian control Architecture fields and add backup dylibs to .deb files.
 
 Theos rootless builds can emit `iphoneos-arm64` package metadata even when the
 package is intended for an arm64e device dpkg database. This helper rewrites the
-control tarball and can add a Safe AudioBridge backup dylib path used by RootHide
-upgrade recovery.
+control tarball and can add a backup dylib path used by RootHide upgrade
+recovery.
 """
 
 from __future__ import annotations
@@ -17,8 +17,7 @@ from pathlib import Path
 
 AR_MAGIC = b"!<arch>\n"
 SAFE_DYLIB = "var/jb/Library/MobileSubstrate/DynamicLibraries/iOSVCAMAudioBridgeSafe.dylib"
-SAFE_BACKUP_DIR = "var/jb/usr/lib/iosvcam"
-SAFE_BACKUP_DYLIB = f"{SAFE_BACKUP_DIR}/iOSVCAMAudioBridgeSafe.dylib"
+SAFE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSafe.dylib"
 
 
 def read_ar(path: Path) -> list[tuple[str, bytes]]:
@@ -97,9 +96,10 @@ def retag_control(control_tgz: bytes, architecture: str) -> tuple[bytes, str]:
     return out.getvalue(), old_arch
 
 
-def add_safe_backup_dylib(data_lzma: bytes) -> bytes:
+def add_backup_dylib(data_lzma: bytes, source_path: str, backup_path: str) -> bytes:
     raw_tar = lzma.decompress(data_lzma, format=lzma.FORMAT_ALONE)
     out = io.BytesIO()
+    backup_dir = str(Path(backup_path).parent).replace("\\", "/")
     source_info: tarfile.TarInfo | None = None
     source_data = b""
     saw_backup = False
@@ -112,21 +112,21 @@ def add_safe_backup_dylib(data_lzma: bytes) -> bytes:
                 extracted = src_tar.extractfile(member) if member.isfile() else None
                 content = extracted.read() if extracted else b""
                 norm = normalize_tar_name(member.name)
-                if norm == SAFE_DYLIB:
+                if norm == source_path:
                     source_info = member
                     source_data = content
-                if norm == SAFE_BACKUP_DIR:
+                if norm == backup_dir:
                     saw_backup_dir = True
-                if norm == SAFE_BACKUP_DYLIB:
+                if norm == backup_path:
                     saw_backup = True
                 member.pax_headers = {}
                 dst_tar.addfile(member, io.BytesIO(content) if member.isfile() else None)
 
             if source_info is None:
-                raise ValueError(f"missing {SAFE_DYLIB}; cannot add backup dylib")
+                raise ValueError(f"missing {source_path}; cannot add backup dylib")
 
             if not saw_backup_dir:
-                dir_info = tarfile.TarInfo(SAFE_BACKUP_DIR)
+                dir_info = tarfile.TarInfo(backup_dir)
                 dir_info.type = tarfile.DIRTYPE
                 dir_info.mode = 0o755
                 dir_info.uid = 0
@@ -136,7 +136,7 @@ def add_safe_backup_dylib(data_lzma: bytes) -> bytes:
                 dst_tar.addfile(dir_info)
 
             if not saw_backup:
-                backup_info = tarfile.TarInfo(SAFE_BACKUP_DYLIB)
+                backup_info = tarfile.TarInfo(backup_path)
                 backup_info.mode = 0o755
                 backup_info.uid = 0
                 backup_info.gid = 0
@@ -156,23 +156,27 @@ def output_path_for(path: Path, old_arch: str, new_arch: str) -> Path:
     return path.with_name(f"{stem}_{new_arch}.deb")
 
 
-def retag_deb(path: Path, architecture: str, keep_original: bool, add_backup: bool) -> Path:
+def retag_deb(
+    path: Path,
+    architecture: str,
+    keep_original: bool,
+    backup_dylib: str,
+    backup_dest: str,
+) -> Path:
     members: list[tuple[str, bytes]] = []
     old_arch = ""
     for name, content in read_ar(path):
         if name == "control.tar.gz":
             content, old_arch = retag_control(content, architecture)
-        elif name == "data.tar.lzma" and add_backup:
-            content = add_safe_backup_dylib(content)
+        elif name == "data.tar.lzma" and backup_dylib and backup_dest:
+            content = add_backup_dylib(content, backup_dylib, backup_dest)
         members.append((name, content))
     dest = path if keep_original else output_path_for(path, old_arch, architecture)
     write_ar(dest, members)
     if not keep_original and dest != path:
         path.unlink()
-    print(
-        f"{path} -> {dest} ({old_arch or 'unknown'} -> {architecture}, "
-        f"backup={'yes' if add_backup else 'no'})"
-    )
+    backup_label = f"{backup_dylib} -> {backup_dest}" if backup_dylib else "no"
+    print(f"{path} -> {dest} ({old_arch or 'unknown'} -> {architecture}, backup={backup_label})")
     return dest
 
 
@@ -181,11 +185,21 @@ def main() -> int:
     parser.add_argument("deb", nargs="+", type=Path)
     parser.add_argument("--architecture", default="iphoneos-arm64e")
     parser.add_argument("--keep-original", action="store_true")
+    parser.add_argument("--backup-dylib", default="", help="data.tar path to copy into --backup-dest")
+    parser.add_argument("--backup-dest", default="", help="data.tar backup path to add")
     parser.add_argument("--add-safe-audiobridge-backup", action="store_true")
     args = parser.parse_args()
 
+    backup_dylib = args.backup_dylib
+    backup_dest = args.backup_dest
+    if args.add_safe_audiobridge_backup:
+        backup_dylib = SAFE_DYLIB
+        backup_dest = SAFE_BACKUP_DYLIB
+    if bool(backup_dylib) != bool(backup_dest):
+        raise SystemExit("--backup-dylib and --backup-dest must be provided together")
+
     for deb in args.deb:
-        retag_deb(deb, args.architecture, args.keep_original, args.add_safe_audiobridge_backup)
+        retag_deb(deb, args.architecture, args.keep_original, backup_dylib, backup_dest)
     return 0
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import io
 import lzma
 import re
@@ -11,6 +12,13 @@ ROOTLESS_TWEAK_DIR = "var/jb/Library/MobileSubstrate/DynamicLibraries"
 SAFE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSafe.dylib"
 SAFE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSafe.plist"
 SAFE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSafe.dylib"
+MEDIA_PROBE_PACKAGE = "com.iosvcam.audiobridge.media-probe"
+MEDIA_PROBE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaProbe.dylib"
+MEDIA_PROBE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaProbe.plist"
+MEDIA_PROBE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeMediaProbe.dylib"
+VCAM_DYLIB = f"{ROOTLESS_TWEAK_DIR}/vcamera.dylib"
+VCAM_PLIST = f"{ROOTLESS_TWEAK_DIR}/vcamera.plist"
+VCAM_PREF_PAYLOAD_PATH = "var/mobile/vc.plist"
 
 
 def read_members(f):
@@ -141,7 +149,86 @@ def validate_safe_package(control_fields, control_entries, data_entries):
     return ok
 
 
-def validate(path):
+def validate_media_probe_package(control_fields, control_entries, data_entries):
+    ok = True
+    package = control_fields.get("Package", "")
+    if package != MEDIA_PROBE_PACKAGE:
+        return True
+
+    ok &= require(
+        control_fields.get("Architecture") == "iphoneos-arm64e",
+        "media probe Architecture must be iphoneos-arm64e",
+    )
+    ok &= require(MEDIA_PROBE_DYLIB in data_entries, f"missing {MEDIA_PROBE_DYLIB}")
+    ok &= require(MEDIA_PROBE_PLIST in data_entries, f"missing {MEDIA_PROBE_PLIST}")
+    ok &= require(MEDIA_PROBE_BACKUP_DYLIB in data_entries, f"missing {MEDIA_PROBE_BACKUP_DYLIB}")
+
+    postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
+    postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
+    plist = data_entries.get(MEDIA_PROBE_PLIST, b"").decode("utf-8", errors="replace")
+    dylib = data_entries.get(MEDIA_PROBE_DYLIB, b"")
+
+    ok &= require("/usr/lib/TweakInject" in postinst, "media probe postinst missing TweakInject handling")
+    ok &= require(
+        "/usr/lib/DynamicPatches/AutoPatches.dylib" in postinst,
+        "media probe postinst missing RootHide AutoPatches link target",
+    )
+    ok &= require(ROOTLESS_TWEAK_DIR in postinst, "media probe postinst missing rootless source path")
+    ok &= require("BACKUP_DYLIB" in postinst, "media probe postinst missing backup dylib restore path")
+    ok &= require("PKGMIRROR_DIR" in postinst, "media probe postinst missing RootHide pkgmirror support")
+    ok &= require("com.apple.mediaserverd" in postinst, "media probe postinst missing mediaserverd filter")
+    ok &= require("mediaserverd" in plist, "media probe plist missing mediaserverd filter")
+    ok &= require('case "$1"' in postrm, "media probe postrm must guard cleanup by maintainer-script action")
+    ok &= require("remove|purge" in postrm, "media probe cleanup must be limited to remove/purge")
+    ok &= require("iOSVCAMAudioBridgeMediaProbe.dylib" in postrm, "media probe postrm missing dylib cleanup")
+    ok &= require("iOSVCAMAudioBridgeMediaProbe.plist" in postrm, "media probe postrm missing plist cleanup")
+    ok &= require("roothidepatch" in postrm, "media probe postrm missing roothidepatch cleanup")
+    ok &= require(b"MEDIA_PROBE_LOADED" in dylib, "media probe dylib missing load marker")
+    ok &= require(b"MEDIA_PROBE_PASSIVE" in dylib, "media probe dylib missing passive marker")
+
+    forbidden_text = "\n".join([postinst, postrm, plist, control_fields.get("Package", "")])
+    ok &= require("Package: com.iosvcam.audiobridge\n" not in forbidden_text, "media probe must not use quarantined package id")
+    for marker in [b"IAF1", b"AudioUnitRender", b"AVCaptureAudioDataOutput", b"connected to %@:%d"]:
+        ok &= require(marker not in dylib, f"media probe must remain passive; found {marker!r}")
+
+    print("OK: Media probe package invariants")
+    return ok
+
+
+def validate_vcamera_rtmp_seed(expected_rtmp, control_entries, data_entries):
+    ok = True
+    postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
+
+    ok &= require(VCAM_DYLIB in data_entries, f"missing {VCAM_DYLIB}")
+    ok &= require(VCAM_PLIST in data_entries, f"missing {VCAM_PLIST}")
+    ok &= require(
+        VCAM_PREF_PAYLOAD_PATH not in data_entries,
+        "seeded package must not ship var/mobile/vc.plist in data payload",
+    )
+    ok &= require("/var/mobile/vc.plist" in postinst, "postinst missing vc.plist target")
+    ok &= require(expected_rtmp in postinst, "postinst missing expected RTMP URL")
+    ok &= require("# iOS-VCAM default RTMP seed begin" in postinst, "postinst missing RTMP seed marker")
+    ok &= require("rtmp://*)" in postinst, "postinst must preserve existing rtmp:// values")
+    ok &= require("VCAM_DEFAULT_RTMP" in postinst, "postinst missing default RTMP variable")
+    ok &= require("iosvcam.bak" in postinst, "postinst missing backup path for existing plist")
+
+    forbidden = [
+        r"killall\s+.*SpringBoard",
+        r"\bsbreload\b",
+        r"\brespring\b",
+        r"launchctl\s+.*SpringBoard",
+        r"/etc/ssh/sshd_config",
+        r"ifconfig\s+lo0\s+alias",
+    ]
+    for pattern in forbidden:
+        ok &= require(not re.search(pattern, postinst, re.I), f"forbidden seeded package postinst content: {pattern}")
+
+    if ok:
+        print("OK: VCAM default RTMP seed invariants")
+    return ok
+
+
+def validate(path, expected_vcamera_rtmp=None):
     print(f"Validating: {path}")
     with open(path, "rb") as f:
         members = read_members(f)
@@ -178,18 +265,27 @@ def validate(path):
 
     if not validate_safe_package(control_fields, control_entries, data_entries):
         return 1
+    if not validate_media_probe_package(control_fields, control_entries, data_entries):
+        return 1
+    if expected_vcamera_rtmp and not validate_vcamera_rtmp_seed(expected_vcamera_rtmp, control_entries, data_entries):
+        return 1
 
     print("PASS")
     return 0
 
 
 def main(argv):
-    if len(argv) < 2:
-        print("Usage: python validate_deb.py path/to/file.deb [more.deb ...]")
-        return 2
+    parser = argparse.ArgumentParser(description="Validate iOS .deb package structure")
+    parser.add_argument("paths", nargs="+", help=".deb file(s) to validate")
+    parser.add_argument(
+        "--expect-vcamera-rtmp",
+        help="Assert a vcamera package seeds this RTMP URL in postinst",
+    )
+    args = parser.parse_args(argv[1:])
+
     status = 0
-    for path in argv[1:]:
-        status = max(status, validate(path))
+    for path in args.paths:
+        status = max(status, validate(path, expected_vcamera_rtmp=args.expect_vcamera_rtmp))
     return status
 
 

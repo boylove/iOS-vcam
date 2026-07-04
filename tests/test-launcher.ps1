@@ -190,6 +190,60 @@ if ($postrmText -and (
     $success += "✓ Safe AudioBridge postrm cleans RootHide mirror files only on remove/purge"
 }
 
+$mediaProbeFiles = @(
+    "ios\audio_bridge_media_probe_tweak\control",
+    "ios\audio_bridge_media_probe_tweak\iOSVCAMAudioBridgeMediaProbe.plist",
+    "ios\audio_bridge_media_probe_tweak\layout\DEBIAN\postinst",
+    "ios\audio_bridge_media_probe_tweak\layout\DEBIAN\postrm",
+    "ios\audio_bridge_media_probe_tweak\Tweak.x"
+)
+foreach ($file in $mediaProbeFiles) {
+    $text = Get-FileText $file
+    if ($null -eq $text) {
+        $warnings += "⚠ Media probe file not found: $file"
+        continue
+    }
+    if ($text -match 'Package:\s*com\.iosvcam\.audiobridge\s*(?:$|\r?\n)') {
+        $errors += "✗ Media probe must not use quarantined package id: $file"
+    }
+}
+$mediaProbeControl = Get-FileText "ios\audio_bridge_media_probe_tweak\control"
+$mediaProbeTweak = Get-FileText "ios\audio_bridge_media_probe_tweak\Tweak.x"
+$mediaProbePostinst = Get-FileText "ios\audio_bridge_media_probe_tweak\layout\DEBIAN\postinst"
+$mediaProbePostrm = Get-FileText "ios\audio_bridge_media_probe_tweak\layout\DEBIAN\postrm"
+if ($mediaProbeControl -and $mediaProbeControl -notmatch 'Package:\s*com\.iosvcam\.audiobridge\.media-probe') {
+    $errors += "✗ Media probe package id must be com.iosvcam.audiobridge.media-probe"
+}
+if ($mediaProbeTweak -and (
+    $mediaProbeTweak -notmatch 'MEDIA_PROBE_LOADED' -or
+    $mediaProbeTweak -notmatch 'MEDIA_PROBE_PASSIVE' -or
+    $mediaProbeTweak -notmatch 'media-probe\.disabled' -or
+    $mediaProbeTweak -match 'IAF1|AudioUnitRender|AVCaptureAudioDataOutput|connected to %@:%d')) {
+    $errors += "✗ Media probe must be passive and include load/disable markers without audio replacement hooks"
+} elseif ($mediaProbeTweak) {
+    $success += "✓ Media probe is passive and includes load/disable markers"
+}
+if ($mediaProbePostinst -and (
+    $mediaProbePostinst -notmatch '/usr/lib/TweakInject' -or
+    $mediaProbePostinst -notmatch '/usr/lib/DynamicPatches/AutoPatches\.dylib' -or
+    $mediaProbePostinst -notmatch 'BACKUP_DYLIB' -or
+    $mediaProbePostinst -notmatch 'PKGMIRROR_DIR' -or
+    $mediaProbePostinst -notmatch 'com\.apple\.mediaserverd' -or
+    $mediaProbePostinst -notmatch 'write_filter_openstep')) {
+    $errors += "✗ Media probe postinst must support TweakInject/AutoPatches/pkgmirror mediaserverd probing"
+} elseif ($mediaProbePostinst) {
+    $success += "✓ Media probe postinst supports TweakInject/AutoPatches/pkgmirror mediaserverd probing"
+}
+if ($mediaProbePostrm -and (
+    $mediaProbePostrm -notmatch 'case "\$1"' -or
+    $mediaProbePostrm -notmatch 'remove\|purge' -or
+    $mediaProbePostrm -notmatch 'iOSVCAMAudioBridgeMediaProbe\.dylib\.roothidepatch' -or
+    $mediaProbePostrm -notmatch 'PKGMIRROR_DIR')) {
+    $errors += "✗ Media probe postrm must clean only media probe RootHide files on remove/purge"
+} elseif ($mediaProbePostrm) {
+    $success += "✓ Media probe postrm cleans only media probe RootHide files on remove/purge"
+}
+
 $testFiles = Get-ChildItem ".\tests" -Filter "*.ps1" -ErrorAction SilentlyContinue
 $noExitFlag = '-' + 'NoExit'
 $noExitMatches = @()

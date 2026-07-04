@@ -51,4 +51,4 @@ For stable use, keep the supported setup to:
 - USB reverse tunnel for ports `80` and `1935`
 - OBS video over RTMP
 
-For explicit virtual microphone experiments, use only the restricted `com.iosvcam.audiobridge.safe` path with AudioBridge enabled so port `1936` is tunneled. The Safe AudioBridge package must still be installed manually after explicit approval. Do not install the quarantined `com.iosvcam.audiobridge` package again.
+For explicit virtual microphone experiments, use only reviewed iOS-VCAM packages. The restricted `com.iosvcam.audiobridge.safe` path remains TikTok-targeted and requires AudioBridge enabled so port `1936` is tunneled. The new `com.iosvcam.audiobridge.media-probe` package is only a passive `mediaserverd` load probe for testing a future video-style media-layer path; it does not replace microphone audio. All iPhone packages must still be installed manually after explicit approval. Do not install the quarantined `com.iosvcam.audiobridge` package again.
