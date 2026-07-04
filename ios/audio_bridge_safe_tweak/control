@@ -6,4 +6,4 @@ Description: Restricted iOS-VCAM audio bridge test tweak for selected apps only.
 Maintainer: iOS-VCAM
 Author: iOS-VCAM
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
+Depends: ellekit
