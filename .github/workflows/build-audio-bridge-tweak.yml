@@ -1,0 +1,56 @@
+name: Build iOS Audio Bridge Tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'build/**'
+      - 'feature/**'
+    paths:
+      - '.github/workflows/build-audio-bridge-tweak.yml'
+      - 'ios/audio_bridge_tweak/**'
+
+jobs:
+  build-rootless:
+    name: Build rootless .deb
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install packaging tools
+        run: |
+          brew update
+          brew install dpkg ldid xz
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          xcodebuild -version
+          clang --version
+          dpkg-deb --version | head -n 1
+          ldid -v || true
+          ls "$HOME/theos/sdks" || true
+
+      - name: Build audio bridge tweak
+        working-directory: ios/audio_bridge_tweak
+        run: |
+          make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+          find packages -type f -name '*.deb' -maxdepth 1 -print
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iosvcam-audio-bridge-rootless-deb
+          path: ios/audio_bridge_tweak/packages/*.deb
+          if-no-files-found: error

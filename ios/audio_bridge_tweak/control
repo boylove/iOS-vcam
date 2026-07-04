@@ -1,0 +1,9 @@
+Package: com.iosvcam.audiobridge
+Name: iOS-VCAM Audio Bridge
+Version: 0.1.0
+Architecture: iphoneos-arm64
+Description: Experimental OBS audio companion tweak for iOS-VCAM USB Audio Bridge. Injects framed PCM into AVFoundation audio capture callbacks when compatible.
+Maintainer: iOS-VCAM
+Author: iOS-VCAM
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 15.0)
