@@ -1,4 +1,4 @@
-name: Build iOS Audio Bridge Tweak
+name: Build Safe iOS Audio Bridge Tweak
 
 on:
   workflow_dispatch:
@@ -8,12 +8,12 @@ on:
       - 'build/**'
       - 'feature/**'
     paths:
-      - '.github/workflows/build-audio-bridge-tweak.yml'
-      - 'ios/audio_bridge_tweak/**'
+      - '.github/workflows/build-audio-bridge-safe-tweak.yml'
+      - 'ios/audio_bridge_safe_tweak/**'
 
 jobs:
   build-rootless:
-    name: Build rootless .deb
+    name: Build restricted rootless .deb
     runs-on: macos-14
 
     steps:
@@ -34,23 +34,15 @@ jobs:
           echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
           echo "$HOME/theos/bin" >> "$GITHUB_PATH"
 
-      - name: Show tool versions
-        run: |
-          xcodebuild -version
-          clang --version
-          dpkg-deb --version | head -n 1
-          ldid -v || true
-          ls "$HOME/theos/sdks" || true
-
-      - name: Build audio bridge tweak
-        working-directory: ios/audio_bridge_tweak
+      - name: Build safe audio bridge tweak
+        working-directory: ios/audio_bridge_safe_tweak
         run: |
           make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
-          find packages -type f -name '*.deb' -maxdepth 1 -print
+          find packages -maxdepth 1 -type f -name '*.deb' -print
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iosvcam-audio-bridge-rootless-deb
-          path: ios/audio_bridge_tweak/packages/*.deb
+          name: iosvcam-audio-bridge-safe-rootless-deb
+          path: ios/audio_bridge_safe_tweak/packages/*.deb
           if-no-files-found: error
