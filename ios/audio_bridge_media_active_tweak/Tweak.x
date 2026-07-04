@@ -40,22 +40,17 @@ static uint64_t gRenderNoData = 0;
 static uint64_t gRenderUnsupported = 0;
 static uint64_t gRenderWrongBus = 0;
 
-static NSString *IVCAMMediaActiveLogPath(void) {
-    NSString *logsDir = @"/var/mobile/Library/Logs";
-    NSError *error = nil;
-    [[NSFileManager defaultManager] createDirectoryAtPath:logsDir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:&error];
-    if (!error) {
-        return [logsDir stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG];
-    }
+static NSArray<NSString *> *IVCAMMediaActiveLogPaths(void) {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    [paths addObject:[@"/var/mobile/Library/Logs" stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG]];
+    [paths addObject:[@"/var/tmp" stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG]];
 
     NSString *tmp = NSTemporaryDirectory();
     if (tmp.length > 0) {
-        return [tmp stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG];
+        [paths addObject:[tmp stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG]];
     }
-    return [@"/tmp" stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG];
+    [paths addObject:[@"/tmp" stringByAppendingPathComponent:IVCAM_MEDIA_ACTIVE_LOG]];
+    return paths;
 }
 
 static void IVCAMMediaActiveRotateIfNeeded(NSString *path) {
@@ -63,6 +58,32 @@ static void IVCAMMediaActiveRotateIfNeeded(NSString *path) {
     NSNumber *size = attrs[NSFileSize];
     if (size && [size unsignedLongLongValue] > 131072) {
         [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    }
+}
+
+static BOOL IVCAMMediaActiveAppendLog(NSString *path, NSData *data) {
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    IVCAMMediaActiveRotateIfNeeded(path);
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        return [data writeToFile:path atomically:NO];
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!handle) return NO;
+
+    @try {
+        [handle seekToEndOfFile];
+        [handle writeData:data];
+        [handle closeFile];
+        return YES;
+    } @catch (NSException *exception) {
+        @try { [handle closeFile]; } @catch (NSException *closeException) { }
+        return NO;
     }
 }
 
@@ -74,18 +95,8 @@ static void IVCAMMediaActiveLog(NSString *format, ...) {
 
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *path = IVCAMMediaActiveLogPath();
-    IVCAMMediaActiveRotateIfNeeded(path);
-
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [data writeToFile:path atomically:NO];
-    } else {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (handle) {
-            [handle seekToEndOfFile];
-            [handle writeData:data];
-            [handle closeFile];
-        }
+    for (NSString *path in IVCAMMediaActiveLogPaths()) {
+        if (IVCAMMediaActiveAppendLog(path, data)) break;
     }
 
     NSLog(@"[iOSVCAMAudioBridgeMediaActive] %@", message);
@@ -470,7 +481,6 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
 
     IVCAMMediaActiveAudioClient *client = [IVCAMMediaActiveAudioClient sharedClient];
     if (!client.enabled) return status;
-    [client ensureStarted];
 
     AudioStreamBasicDescription asbd;
     UInt32 size = sizeof(asbd);
@@ -492,6 +502,10 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         }
         IVCAMMediaActiveLogStatsIfNeeded();
         return status;
+    }
+
+    if (asbd.mFormatID == kAudioFormatLinearPCM && asbd.mSampleRate == (Float64)client.sampleRate) {
+        [client ensureStarted];
     }
 
     BOOL replaced = [client fillAudioBufferList:ioData frames:inNumberFrames bus:inOutputBusNumber asbd:&asbd];
@@ -544,9 +558,8 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
 
         IVCAMMediaActiveAudioClient *client = [IVCAMMediaActiveAudioClient sharedClient];
         [client reloadPrefs];
-        [client ensureStarted];
 
         MSHookFunction((void *)AudioUnitRender, (void *)IVCAMMediaActiveAudioUnitRender, (void **)&gOriginalAudioUnitRender);
-        IVCAMMediaActiveLog(@"MEDIA_ACTIVE_READY AudioUnitRender hook installed; experimental mediaserverd audio replacement active");
+        IVCAMMediaActiveLog(@"MEDIA_ACTIVE_READY AudioUnitRender hook installed; client starts lazily on first matching input render");
     }
 }
