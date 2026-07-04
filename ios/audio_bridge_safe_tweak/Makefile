@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME := iOSVCAMAudioBridgeSafe
 iOSVCAMAudioBridgeSafe_FILES := Tweak.x
 iOSVCAMAudioBridgeSafe_CFLAGS := -fobjc-arc -Wall -Wextra
-iOSVCAMAudioBridgeSafe_FRAMEWORKS := Foundation AVFoundation CoreMedia AudioToolbox AudioUnit
+iOSVCAMAudioBridgeSafe_FRAMEWORKS := Foundation AVFoundation CoreMedia AudioToolbox
 
 after-install::
 	@echo "Installed iOSVCAMAudioBridgeSafe. Restart the target app only; no respring required."
