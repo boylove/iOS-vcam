@@ -1,9 +1,8 @@
 Package: com.iosvcam.audiobridge.safe
 Name: iOS-VCAM Audio Bridge Safe
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64e
 Description: Restricted iOS-VCAM audio bridge test tweak for selected apps only. Disabled by default until preferences enable it.
 Maintainer: iOS-VCAM
 Author: iOS-VCAM
 Section: Tweaks
-Depends: ellekit
