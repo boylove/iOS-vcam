@@ -10,20 +10,12 @@ DYLIB="$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib"
 PLIST="$TWEAK_DIR/iOSVCAMAudioBridgeSafe.plist"
 PATCH_LINK="$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib.roothidepatch"
 PATCH_TARGET="/usr/lib/DynamicPatches/AutoPatches.dylib"
+PKGMIRROR_DIR="/var/mobile/Library/pkgmirror/Library/MobileSubstrate/DynamicLibraries"
+PKGMIRROR_DYLIB="$PKGMIRROR_DIR/iOSVCAMAudioBridgeSafe.dylib"
+PKGMIRROR_PLIST="$PKGMIRROR_DIR/iOSVCAMAudioBridgeSafe.plist"
 
-if [ -d "$TWEAK_DIR" ]; then
-    SOURCE_DYLIB="$ROOTLESS_DYLIB"
-    if [ ! -f "$SOURCE_DYLIB" ] && [ -f "$BACKUP_DYLIB" ]; then
-        SOURCE_DYLIB="$BACKUP_DYLIB"
-    fi
-
-    if [ -f "$SOURCE_DYLIB" ]; then
-        cp -f "$SOURCE_DYLIB" "$DYLIB" 2>/dev/null || true
-        chmod 755 "$DYLIB" 2>/dev/null || true
-        chown root:wheel "$DYLIB" 2>/dev/null || true
-    fi
-
-    cat > "$PLIST" <<'EOF' 2>/dev/null || true
+write_filter_xml() {
+    cat > "$1" <<'EOF' 2>/dev/null || true
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,6 +34,32 @@ if [ -d "$TWEAK_DIR" ]; then
 </dict>
 </plist>
 EOF
+}
+
+write_filter_openstep() {
+    cat > "$1" <<'EOF' 2>/dev/null || true
+{
+    Filter = {
+        Bundles = ("com.zhiliaoapp.musically");
+        Executables = ("TikTok");
+    };
+}
+EOF
+}
+
+SOURCE_DYLIB="$ROOTLESS_DYLIB"
+if [ ! -f "$SOURCE_DYLIB" ] && [ -f "$BACKUP_DYLIB" ]; then
+    SOURCE_DYLIB="$BACKUP_DYLIB"
+fi
+
+if [ -d "$TWEAK_DIR" ]; then
+    if [ -f "$SOURCE_DYLIB" ]; then
+        cp -f "$SOURCE_DYLIB" "$DYLIB" 2>/dev/null || true
+        chmod 755 "$DYLIB" 2>/dev/null || true
+        chown root:wheel "$DYLIB" 2>/dev/null || true
+    fi
+
+    write_filter_xml "$PLIST"
     chmod 644 "$PLIST" 2>/dev/null || true
     chown root:wheel "$PLIST" 2>/dev/null || true
 
@@ -49,6 +67,18 @@ EOF
         rm -f "$PATCH_LINK" 2>/dev/null || true
         ln -s "$PATCH_TARGET" "$PATCH_LINK" 2>/dev/null || true
     fi
+fi
+
+if [ -d "$PKGMIRROR_DIR" ]; then
+    if [ -f "$SOURCE_DYLIB" ]; then
+        cp -f "$SOURCE_DYLIB" "$PKGMIRROR_DYLIB" 2>/dev/null || true
+        chmod 755 "$PKGMIRROR_DYLIB" 2>/dev/null || true
+        chown mobile:mobile "$PKGMIRROR_DYLIB" 2>/dev/null || true
+    fi
+
+    write_filter_openstep "$PKGMIRROR_PLIST"
+    chmod 755 "$PKGMIRROR_PLIST" 2>/dev/null || true
+    chown mobile:mobile "$PKGMIRROR_PLIST" 2>/dev/null || true
 fi
 
 exit 0

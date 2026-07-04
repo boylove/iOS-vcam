@@ -114,14 +114,17 @@ def validate_safe_package(control_fields, control_entries, data_entries):
     )
     ok &= require(ROOTLESS_TWEAK_DIR in postinst, "postinst missing rootless source path")
     ok &= require("BACKUP_DYLIB" in postinst, "postinst missing backup dylib restore path")
+    ok &= require("PKGMIRROR_DIR" in postinst, "postinst missing RootHide pkgmirror support")
     ok &= require("cp -f" in postinst, "postinst must mirror rootless/backup dylib for RootHide")
     ok &= require("<!DOCTYPE plist" in postinst, "postinst must write an XML RootHide filter plist")
+    ok &= require("write_filter_openstep" in postinst, "postinst must write pkgmirror OpenStep filter plist")
     ok &= require("<string>TikTok</string>" in postinst, "postinst XML filter missing TikTok executable")
     ok &= require('case "$1"' in postrm, "postrm must guard cleanup by maintainer-script action")
     ok &= require("remove|purge" in postrm, "postrm cleanup must be limited to remove/purge")
     ok &= require("iOSVCAMAudioBridgeSafe.dylib" in postrm, "postrm missing dylib cleanup")
     ok &= require("iOSVCAMAudioBridgeSafe.plist" in postrm, "postrm missing plist cleanup")
     ok &= require("roothidepatch" in postrm, "postrm missing roothidepatch cleanup")
+    ok &= require("PKGMIRROR_DIR" in postrm, "postrm missing pkgmirror cleanup")
 
     forbidden = [
         r"\bmediaserverd\b",

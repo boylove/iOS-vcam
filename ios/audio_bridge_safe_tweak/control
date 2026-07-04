@@ -1,8 +1,8 @@
 Package: com.iosvcam.audiobridge.safe
 Name: iOS-VCAM Audio Bridge Safe
-Version: 0.3.8
+Version: 0.3.9
 Architecture: iphoneos-arm64e
-Description: RootHide-compatible restricted iOS-VCAM audio bridge tweak with XML filter and upgrade-safe dylib restore.
+Description: RootHide-compatible restricted iOS-VCAM audio bridge tweak with pkgmirror support.
 Maintainer: iOS-VCAM
 Author: iOS-VCAM
 Section: Tweaks
