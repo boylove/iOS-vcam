@@ -4,16 +4,22 @@ Use this command when the user wants to rebuild the experimental iOS-VCAM Audio 
 
 ## What to do
 
-Run the reusable PowerShell wrapper from the repository root:
+Use the repository Python virtual environment. If it does not exist, create it first:
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File scripts/github_build_audio_bridge_deb.ps1
+python -m venv .venv
 ```
 
-If there are local changes to the workflow or `ios/audio_bridge_tweak/` that should be included in the build, run:
+Run the reusable Python wrapper from the repository root:
 
 ```powershell
-pwsh -ExecutionPolicy Bypass -File scripts/github_build_audio_bridge_deb.ps1 -CommitChanges
+.\.venv\Scripts\python.exe scripts\github_build_audio_bridge_deb.py
+```
+
+If there are local changes to the workflow, wrapper, command, or `ios/audio_bridge_tweak/` that should be included in the build, run:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\github_build_audio_bridge_deb.py --commit-changes
 ```
 
 ## Expected behavior
@@ -38,7 +44,7 @@ Ask the user to run this in their local PowerShell terminal:
 & "D:\Temp\gh-cli-portable\bin\gh.exe" auth login -h github.com -p https -w
 ```
 
-If the portable `gh.exe` path is different or absent, the wrapper can download it automatically; rerun the wrapper after login.
+If the portable `gh.exe` path is different or absent, the Python wrapper can download it automatically; rerun the wrapper after login.
 
 ## Success output
 
