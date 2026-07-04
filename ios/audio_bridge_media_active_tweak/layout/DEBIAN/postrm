@@ -1,0 +1,15 @@
+#!/bin/sh
+
+case "$1" in
+    remove|purge)
+        TWEAK_DIR="/usr/lib/TweakInject"
+        PKGMIRROR_DIR="/var/mobile/Library/pkgmirror/Library/MobileSubstrate/DynamicLibraries"
+        rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeMediaActive.dylib.roothidepatch" 2>/dev/null || true
+        rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeMediaActive.dylib" 2>/dev/null || true
+        rm -f "$TWEAK_DIR/iOSVCAMAudioBridgeMediaActive.plist" 2>/dev/null || true
+        rm -f "$PKGMIRROR_DIR/iOSVCAMAudioBridgeMediaActive.dylib" 2>/dev/null || true
+        rm -f "$PKGMIRROR_DIR/iOSVCAMAudioBridgeMediaActive.plist" 2>/dev/null || true
+        ;;
+esac
+
+exit 0

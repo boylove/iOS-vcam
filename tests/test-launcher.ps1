@@ -244,6 +244,65 @@ if ($mediaProbePostrm -and (
     $success += "✓ Media probe postrm cleans only media probe RootHide files on remove/purge"
 }
 
+$mediaActiveFiles = @(
+    "ios\audio_bridge_media_active_tweak\control",
+    "ios\audio_bridge_media_active_tweak\iOSVCAMAudioBridgeMediaActive.plist",
+    "ios\audio_bridge_media_active_tweak\layout\DEBIAN\postinst",
+    "ios\audio_bridge_media_active_tweak\layout\DEBIAN\postrm",
+    "ios\audio_bridge_media_active_tweak\Tweak.x"
+)
+foreach ($file in $mediaActiveFiles) {
+    $text = Get-FileText $file
+    if ($null -eq $text) {
+        $errors += "✗ Media-active file not found: $file"
+        continue
+    }
+    if ($text -match 'Package:\s*com\.iosvcam\.audiobridge\s*(?:$|\r?\n)') {
+        $errors += "✗ Media-active must not use quarantined package id: $file"
+    }
+    if ($text -match 'com\.apple\.camera|Camera\.app|com\.apple\.springboard|SpringBoard|com\.zhiliaoapp\.musically|\bTikTok\b') {
+        $errors += "✗ Media-active must not target Camera.app, SpringBoard, or TikTok: $file"
+    }
+}
+$mediaActiveControl = Get-FileText "ios\audio_bridge_media_active_tweak\control"
+$mediaActiveTweak = Get-FileText "ios\audio_bridge_media_active_tweak\Tweak.x"
+$mediaActivePostinst = Get-FileText "ios\audio_bridge_media_active_tweak\layout\DEBIAN\postinst"
+$mediaActivePostrm = Get-FileText "ios\audio_bridge_media_active_tweak\layout\DEBIAN\postrm"
+if ($mediaActiveControl -and $mediaActiveControl -notmatch 'Package:\s*com\.iosvcam\.audiobridge\.media-active') {
+    $errors += "✗ Media-active package id must be com.iosvcam.audiobridge.media-active"
+}
+if ($mediaActiveTweak -and (
+    $mediaActiveTweak -notmatch 'MEDIA_ACTIVE_LOADED' -or
+    $mediaActiveTweak -notmatch 'MEDIA_ACTIVE_READY' -or
+    $mediaActiveTweak -notmatch 'media-active\.disabled' -or
+    $mediaActiveTweak -notmatch 'IAF1' -or
+    $mediaActiveTweak -notmatch 'AudioUnitRender' -or
+    $mediaActiveTweak -notmatch '127\.10\.10\.10')) {
+    $errors += "✗ Media-active must include load/ready/disable markers, IAF1 client, AudioUnitRender hook, and default tunnel host"
+} elseif ($mediaActiveTweak) {
+    $success += "✓ Media-active includes active AudioBridge markers and disable controls"
+}
+if ($mediaActivePostinst -and (
+    $mediaActivePostinst -notmatch '/usr/lib/TweakInject' -or
+    $mediaActivePostinst -notmatch '/usr/lib/DynamicPatches/AutoPatches\.dylib' -or
+    $mediaActivePostinst -notmatch 'BACKUP_DYLIB' -or
+    $mediaActivePostinst -notmatch 'PKGMIRROR_DIR' -or
+    $mediaActivePostinst -notmatch 'com\.apple\.mediaserverd' -or
+    $mediaActivePostinst -notmatch 'write_filter_openstep')) {
+    $errors += "✗ Media-active postinst must support TweakInject/AutoPatches/pkgmirror mediaserverd active loading"
+} elseif ($mediaActivePostinst) {
+    $success += "✓ Media-active postinst supports TweakInject/AutoPatches/pkgmirror mediaserverd active loading"
+}
+if ($mediaActivePostrm -and (
+    $mediaActivePostrm -notmatch 'case "\$1"' -or
+    $mediaActivePostrm -notmatch 'remove\|purge' -or
+    $mediaActivePostrm -notmatch 'iOSVCAMAudioBridgeMediaActive\.dylib\.roothidepatch' -or
+    $mediaActivePostrm -notmatch 'PKGMIRROR_DIR')) {
+    $errors += "✗ Media-active postrm must clean only media-active RootHide files on remove/purge"
+} elseif ($mediaActivePostrm) {
+    $success += "✓ Media-active postrm cleans only media-active RootHide files on remove/purge"
+}
+
 $testFiles = Get-ChildItem ".\tests" -Filter "*.ps1" -ErrorAction SilentlyContinue
 $noExitFlag = '-' + 'NoExit'
 $noExitMatches = @()

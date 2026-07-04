@@ -18,6 +18,8 @@ from pathlib import Path
 AR_MAGIC = b"!<arch>\n"
 SAFE_DYLIB = "var/jb/Library/MobileSubstrate/DynamicLibraries/iOSVCAMAudioBridgeSafe.dylib"
 SAFE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSafe.dylib"
+MEDIA_ACTIVE_DYLIB = "var/jb/Library/MobileSubstrate/DynamicLibraries/iOSVCAMAudioBridgeMediaActive.dylib"
+MEDIA_ACTIVE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeMediaActive.dylib"
 
 
 def read_ar(path: Path) -> list[tuple[str, bytes]]:
@@ -188,6 +190,7 @@ def main() -> int:
     parser.add_argument("--backup-dylib", default="", help="data.tar path to copy into --backup-dest")
     parser.add_argument("--backup-dest", default="", help="data.tar backup path to add")
     parser.add_argument("--add-safe-audiobridge-backup", action="store_true")
+    parser.add_argument("--add-media-active-backup", action="store_true")
     args = parser.parse_args()
 
     backup_dylib = args.backup_dylib
@@ -195,6 +198,9 @@ def main() -> int:
     if args.add_safe_audiobridge_backup:
         backup_dylib = SAFE_DYLIB
         backup_dest = SAFE_BACKUP_DYLIB
+    if args.add_media_active_backup:
+        backup_dylib = MEDIA_ACTIVE_DYLIB
+        backup_dest = MEDIA_ACTIVE_BACKUP_DYLIB
     if bool(backup_dylib) != bool(backup_dest):
         raise SystemExit("--backup-dylib and --backup-dest must be provided together")
 

@@ -16,6 +16,10 @@ MEDIA_PROBE_PACKAGE = "com.iosvcam.audiobridge.media-probe"
 MEDIA_PROBE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaProbe.dylib"
 MEDIA_PROBE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaProbe.plist"
 MEDIA_PROBE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeMediaProbe.dylib"
+MEDIA_ACTIVE_PACKAGE = "com.iosvcam.audiobridge.media-active"
+MEDIA_ACTIVE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaActive.dylib"
+MEDIA_ACTIVE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaActive.plist"
+MEDIA_ACTIVE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeMediaActive.dylib"
 VCAM_DYLIB = f"{ROOTLESS_TWEAK_DIR}/vcamera.dylib"
 VCAM_PLIST = f"{ROOTLESS_TWEAK_DIR}/vcamera.plist"
 VCAM_PREF_PAYLOAD_PATH = "var/mobile/vc.plist"
@@ -195,6 +199,57 @@ def validate_media_probe_package(control_fields, control_entries, data_entries):
     return ok
 
 
+def validate_media_active_package(control_fields, control_entries, data_entries):
+    ok = True
+    package = control_fields.get("Package", "")
+    if package != MEDIA_ACTIVE_PACKAGE:
+        return True
+
+    ok &= require(
+        control_fields.get("Architecture") == "iphoneos-arm64e",
+        "media-active Architecture must be iphoneos-arm64e",
+    )
+    ok &= require(MEDIA_ACTIVE_DYLIB in data_entries, f"missing {MEDIA_ACTIVE_DYLIB}")
+    ok &= require(MEDIA_ACTIVE_PLIST in data_entries, f"missing {MEDIA_ACTIVE_PLIST}")
+    ok &= require(MEDIA_ACTIVE_BACKUP_DYLIB in data_entries, f"missing {MEDIA_ACTIVE_BACKUP_DYLIB}")
+
+    postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
+    postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
+    plist = data_entries.get(MEDIA_ACTIVE_PLIST, b"").decode("utf-8", errors="replace")
+    dylib = data_entries.get(MEDIA_ACTIVE_DYLIB, b"")
+
+    ok &= require("/usr/lib/TweakInject" in postinst, "media-active postinst missing TweakInject handling")
+    ok &= require(
+        "/usr/lib/DynamicPatches/AutoPatches.dylib" in postinst,
+        "media-active postinst missing RootHide AutoPatches link target",
+    )
+    ok &= require(ROOTLESS_TWEAK_DIR in postinst, "media-active postinst missing rootless source path")
+    ok &= require("BACKUP_DYLIB" in postinst, "media-active postinst missing backup dylib restore path")
+    ok &= require("PKGMIRROR_DIR" in postinst, "media-active postinst missing RootHide pkgmirror support")
+    ok &= require("com.apple.mediaserverd" in postinst, "media-active postinst missing mediaserverd filter")
+    ok &= require("mediaserverd" in plist, "media-active plist missing mediaserverd filter")
+    ok &= require("com.zhiliaoapp.musically" not in plist, "media-active plist must not target TikTok")
+    ok &= require('case "$1"' in postrm, "media-active postrm must guard cleanup by maintainer-script action")
+    ok &= require("remove|purge" in postrm, "media-active cleanup must be limited to remove/purge")
+    ok &= require("iOSVCAMAudioBridgeMediaActive.dylib" in postrm, "media-active postrm missing dylib cleanup")
+    ok &= require("iOSVCAMAudioBridgeMediaActive.plist" in postrm, "media-active postrm missing plist cleanup")
+    ok &= require("roothidepatch" in postrm, "media-active postrm missing roothidepatch cleanup")
+    ok &= require(b"MEDIA_ACTIVE_LOADED" in dylib, "media-active dylib missing load marker")
+    ok &= require(b"MEDIA_ACTIVE_READY" in dylib, "media-active dylib missing ready marker")
+    ok &= require(b"media-active.disabled" in dylib, "media-active dylib missing disable flag")
+    ok &= require(b"IAF1" in dylib, "media-active dylib missing AudioBridge protocol marker")
+    ok &= require(b"AudioUnitRender" in dylib, "media-active dylib missing AudioUnitRender marker")
+    ok &= require(b"127.10.10.10" in dylib, "media-active dylib missing default tunnel host")
+
+    forbidden_text = "\n".join([postinst, postrm, plist, control_fields.get("Package", "")])
+    ok &= require("Package: com.iosvcam.audiobridge\n" not in forbidden_text, "media-active must not use quarantined package id")
+    for pattern in [r"com\.apple\.camera", r"com\.apple\.springboard", r"com\.zhiliaoapp\.musically", r"\bTikTok\b"]:
+        ok &= require(not re.search(pattern, forbidden_text, re.I), f"forbidden media-active target content: {pattern}")
+
+    print("OK: Media-active package invariants")
+    return ok
+
+
 def validate_vcamera_rtmp_seed(expected_rtmp, control_entries, data_entries):
     ok = True
     postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
@@ -266,6 +321,8 @@ def validate(path, expected_vcamera_rtmp=None):
     if not validate_safe_package(control_fields, control_entries, data_entries):
         return 1
     if not validate_media_probe_package(control_fields, control_entries, data_entries):
+        return 1
+    if not validate_media_active_package(control_fields, control_entries, data_entries):
         return 1
     if expected_vcamera_rtmp and not validate_vcamera_rtmp_seed(expected_vcamera_rtmp, control_entries, data_entries):
         return 1
