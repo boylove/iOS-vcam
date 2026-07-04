@@ -12,11 +12,10 @@
 
 #define IVCAM_SAFE_PREFS @"/var/mobile/Library/Preferences/com.iosvcam.audiobridge.safe.plist"
 #define IVCAM_SAFE_DISABLE_FLAG @"/var/mobile/Library/Preferences/com.iosvcam.audiobridge.safe.disabled"
-#define IVCAM_SAFE_LOG @"/var/mobile/Library/Logs/iOSVCAMAudioBridgeSafe.log"
+#define IVCAM_SAFE_PREFS_DOMAIN CFSTR("com.iosvcam.audiobridge.safe")
+#define IVCAM_SAFE_LOG @"iOSVCAMAudioBridgeSafe.log"
 #define IVCAM_SAFE_MAGIC "IAF1"
 #define IVCAM_SAFE_TARGET_BUNDLE @"com.zhiliaoapp.musically"
-#define IVCAM_SAFE_MEDIA_BUNDLE @"com.apple.mediaserverd"
-#define IVCAM_SAFE_MEDIA_PROCESS @"mediaserverd"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -42,6 +41,20 @@ static uint64_t gRenderReplaced = 0;
 static uint64_t gRenderNoData = 0;
 static uint64_t gRenderUnsupported = 0;
 
+static NSString *IVCAMSafeLogPath(void) {
+    NSString *tmp = NSTemporaryDirectory();
+    if (tmp.length > 0) {
+        return [tmp stringByAppendingPathComponent:IVCAM_SAFE_LOG];
+    }
+    return [@"/tmp" stringByAppendingPathComponent:IVCAM_SAFE_LOG];
+}
+
+static id IVCAMSafeCopyPref(NSString *key) {
+    CFPreferencesAppSynchronize(IVCAM_SAFE_PREFS_DOMAIN);
+    CFTypeRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)key, IVCAM_SAFE_PREFS_DOMAIN);
+    return CFBridgingRelease(value);
+}
+
 static void IVCAMSafeLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -50,17 +63,16 @@ static void IVCAMSafeLog(NSString *format, ...) {
 
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    [[NSFileManager defaultManager] createDirectoryAtPath:[IVCAM_SAFE_LOG stringByDeletingLastPathComponent]
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:IVCAM_SAFE_LOG]) {
-        [data writeToFile:IVCAM_SAFE_LOG atomically:NO];
+    NSString *logPath = IVCAMSafeLogPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:logPath]) {
+        [data writeToFile:logPath atomically:NO];
     } else {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:IVCAM_SAFE_LOG];
-        [handle seekToEndOfFile];
-        [handle writeData:data];
-        [handle closeFile];
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (handle) {
+            [handle seekToEndOfFile];
+            [handle writeData:data];
+            [handle closeFile];
+        }
     }
 
     NSLog(@"[iOSVCAMAudioBridgeSafe] %@", message);
@@ -111,25 +123,33 @@ static void IVCAMSafeLog(NSString *format, ...) {
 }
 
 - (void)reloadPrefs {
-    if ([[NSFileManager defaultManager] fileExistsAtPath:IVCAM_SAFE_DISABLE_FLAG]) {
+    id disabledPref = IVCAMSafeCopyPref(@"Disabled");
+    if ([disabledPref respondsToSelector:@selector(boolValue)] && [disabledPref boolValue]) {
         self.enabled = NO;
-        IVCAMSafeLog(@"prefs disabled by flag");
+        IVCAMSafeLog(@"prefs disabled by CFPreferences flag");
         return;
     }
 
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:IVCAM_SAFE_PREFS];
-    self.enabled = [prefs[@"Enabled"] boolValue];
-    NSString *host = prefs[@"Host"];
-    NSNumber *port = prefs[@"Port"];
-    NSNumber *sampleRate = prefs[@"SampleRate"];
-    NSNumber *channels = prefs[@"Channels"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:IVCAM_SAFE_DISABLE_FLAG]) {
+        self.enabled = NO;
+        IVCAMSafeLog(@"prefs disabled by file flag");
+        return;
+    }
 
-    if (host.length > 0) self.host = host;
-    if (port.intValue > 0) self.port = port.intValue;
-    if (sampleRate.intValue > 0) self.sampleRate = sampleRate.intValue;
-    if (channels.intValue == 1 || channels.intValue == 2) self.channels = channels.intValue;
+    NSDictionary *filePrefs = [NSDictionary dictionaryWithContentsOfFile:IVCAM_SAFE_PREFS];
+    id enabledValue = IVCAMSafeCopyPref(@"Enabled") ?: filePrefs[@"Enabled"];
+    id hostValue = IVCAMSafeCopyPref(@"Host") ?: filePrefs[@"Host"];
+    id portValue = IVCAMSafeCopyPref(@"Port") ?: filePrefs[@"Port"];
+    id sampleRateValue = IVCAMSafeCopyPref(@"SampleRate") ?: filePrefs[@"SampleRate"];
+    id channelsValue = IVCAMSafeCopyPref(@"Channels") ?: filePrefs[@"Channels"];
 
-    IVCAMSafeLog(@"prefs enabled=%d host=%@ port=%d rate=%d channels=%d", self.enabled, self.host, self.port, self.sampleRate, self.channels);
+    self.enabled = [enabledValue respondsToSelector:@selector(boolValue)] ? [enabledValue boolValue] : NO;
+    if ([hostValue isKindOfClass:[NSString class]] && [hostValue length] > 0) self.host = hostValue;
+    if ([portValue respondsToSelector:@selector(intValue)] && [portValue intValue] > 0) self.port = [portValue intValue];
+    if ([sampleRateValue respondsToSelector:@selector(intValue)] && [sampleRateValue intValue] > 0) self.sampleRate = [sampleRateValue intValue];
+    if ([channelsValue respondsToSelector:@selector(intValue)] && ([channelsValue intValue] == 1 || [channelsValue intValue] == 2)) self.channels = [channelsValue intValue];
+
+    IVCAMSafeLog(@"prefs enabled=%d host=%@ port=%d rate=%d channels=%d source=%@", self.enabled, self.host, self.port, self.sampleRate, self.channels, enabledValue ? @"cfprefs" : @"file");
 }
 
 static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
@@ -405,36 +425,14 @@ static OSStatus IVCAMSafeAudioUnitRender(AudioUnit inUnit,
 
     if (formatStatus != noErr) {
         gRenderUnsupported++;
-        if (gRenderUnsupported <= 5 || (gRenderUnsupported % 200) == 0) {
-            IVCAMSafeLog(@"AudioUnitRender unsupported: cannot read stream format status=%d bus=%u", (int)formatStatus, (unsigned)inOutputBusNumber);
-        }
         return status;
     }
 
     BOOL replaced = [client fillAudioBufferList:ioData frames:inNumberFrames asbd:&asbd];
     if (replaced) {
         gRenderReplaced++;
-        if (gRenderReplaced <= 5 || (gRenderReplaced % 200) == 0) {
-            IVCAMSafeLog(@"AudioUnitRender replaced frames=%u rate=%.0f channels=%u flags=0x%x replaced=%llu calls=%llu",
-                         (unsigned)inNumberFrames,
-                         asbd.mSampleRate,
-                         (unsigned)asbd.mChannelsPerFrame,
-                         (unsigned)asbd.mFormatFlags,
-                         gRenderReplaced,
-                         gRenderCalls);
-        }
     } else {
         gRenderNoData++;
-        if (gRenderNoData <= 5 || (gRenderNoData % 200) == 0) {
-            IVCAMSafeLog(@"AudioUnitRender no replacement frames=%u rate=%.0f channels=%u bits=%u flags=0x%x nodata=%llu calls=%llu",
-                         (unsigned)inNumberFrames,
-                         asbd.mSampleRate,
-                         (unsigned)asbd.mChannelsPerFrame,
-                         (unsigned)asbd.mBitsPerChannel,
-                         (unsigned)asbd.mFormatFlags,
-                         gRenderNoData,
-                         gRenderCalls);
-        }
     }
 
     return status;
@@ -507,9 +505,8 @@ static void IVCAMSafeHookDelegateIfNeeded(id delegate) {
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
         BOOL targetApp = [bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE];
-        BOOL targetMediaServer = [bundleID isEqualToString:IVCAM_SAFE_MEDIA_BUNDLE] || [processName isEqualToString:IVCAM_SAFE_MEDIA_PROCESS];
         IVCAMSafeLog(@"loaded into bundle=%@ process=%@", bundleID, processName);
-        if (!targetApp && !targetMediaServer) {
+        if (!targetApp) {
             IVCAMSafeLog(@"bundle/process not target; inactive");
             return;
         }
