@@ -44,7 +44,7 @@ jobs:
 
       - name: Retag safe package architecture
         run: |
-          python3 ios/retag_deb_architecture.py --architecture iphoneos-arm64e ios/audio_bridge_safe_tweak/packages/*.deb
+          python3 ios/retag_deb_architecture.py --architecture iphoneos-arm64e --add-safe-audiobridge-backup ios/audio_bridge_safe_tweak/packages/*.deb
 
       - name: Validate safe audio bridge package
         run: |

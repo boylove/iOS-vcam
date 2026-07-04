@@ -37,7 +37,7 @@ This method uses SSH reverse tunneling and requires the special `.deb` package w
 
 The stable VCAM path is primarily a **virtual camera/video** path. OBS audio inside RTMP does not automatically become an iPhone microphone.
 
-For explicit safe-audio experiments, enable AudioBridge in launcher configuration before Option [U]. When the PC bridge starts, the USB tunnel also exposes `127.10.10.10:1936` on the iPhone for the restricted `com.iosvcam.audiobridge.safe` target-app tweak. Safe AudioBridge 0.3.7 supports the normal rootless path and guarded RootHide `TweakInject` mirroring with an XML RootHide filter, but it is still a manually installed target-app package and not a global system Camera microphone replacement.
+For explicit safe-audio experiments, enable AudioBridge in launcher configuration before Option [U]. When the PC bridge starts, the USB tunnel also exposes `127.10.10.10:1936` on the iPhone for the restricted `com.iosvcam.audiobridge.safe` target-app tweak. Safe AudioBridge 0.3.8 supports the normal rootless path and guarded RootHide `TweakInject` mirroring/restoration with an XML RootHide filter, but it is still a manually installed target-app package and not a global system Camera microphone replacement.
 
 The previously built experimental package `com.iosvcam.audiobridge` is not safe to use on the tested Dopamine iOS 16.1.2 setup and should not be installed.
 

@@ -10,6 +10,7 @@ SAFE_PACKAGE = "com.iosvcam.audiobridge.safe"
 ROOTLESS_TWEAK_DIR = "var/jb/Library/MobileSubstrate/DynamicLibraries"
 SAFE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSafe.dylib"
 SAFE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSafe.plist"
+SAFE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSafe.dylib"
 
 
 def read_members(f):
@@ -100,6 +101,7 @@ def validate_safe_package(control_fields, control_entries, data_entries):
     )
     ok &= require(SAFE_DYLIB in data_entries, f"missing {SAFE_DYLIB}")
     ok &= require(SAFE_PLIST in data_entries, f"missing {SAFE_PLIST}")
+    ok &= require(SAFE_BACKUP_DYLIB in data_entries, f"missing {SAFE_BACKUP_DYLIB}")
 
     postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
     postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
@@ -111,9 +113,12 @@ def validate_safe_package(control_fields, control_entries, data_entries):
         "postinst missing RootHide AutoPatches link target",
     )
     ok &= require(ROOTLESS_TWEAK_DIR in postinst, "postinst missing rootless source path")
-    ok &= require("cp -f" in postinst, "postinst must mirror rootless dylib for RootHide")
+    ok &= require("BACKUP_DYLIB" in postinst, "postinst missing backup dylib restore path")
+    ok &= require("cp -f" in postinst, "postinst must mirror rootless/backup dylib for RootHide")
     ok &= require("<!DOCTYPE plist" in postinst, "postinst must write an XML RootHide filter plist")
     ok &= require("<string>TikTok</string>" in postinst, "postinst XML filter missing TikTok executable")
+    ok &= require('case "$1"' in postrm, "postrm must guard cleanup by maintainer-script action")
+    ok &= require("remove|purge" in postrm, "postrm cleanup must be limited to remove/purge")
     ok &= require("iOSVCAMAudioBridgeSafe.dylib" in postrm, "postrm missing dylib cleanup")
     ok &= require("iOSVCAMAudioBridgeSafe.plist" in postrm, "postrm missing plist cleanup")
     ok &= require("roothidepatch" in postrm, "postrm missing roothidepatch cleanup")

@@ -9,7 +9,7 @@ Safety differences from the quarantined `com.iosvcam.audiobridge` package:
 - It does not inject into Camera.app, SpringBoard, system media daemons, or AVFoundation globally.
 - Runtime has CFPreferences/file disable controls under `com.iosvcam.audiobridge.safe`.
 - If the bridge is unavailable or the target format is unsupported, it forwards the original microphone buffer.
-- Version 0.3.7 mirrors the same restricted dylib into `/usr/lib/TweakInject` when RootHide is present and writes the RootHide filter as XML, while keeping the normal rootless `/var/jb/Library/MobileSubstrate/DynamicLibraries` install path unchanged.
+- Version 0.3.8 mirrors/restores the same restricted dylib into `/usr/lib/TweakInject` when RootHide is present, writes the RootHide filter as XML, and avoids deleting the dylib during package upgrades.
 
 Build:
 

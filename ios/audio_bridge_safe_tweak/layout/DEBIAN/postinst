@@ -3,6 +3,7 @@
 ROOTLESS_DIR="/var/jb/Library/MobileSubstrate/DynamicLibraries"
 ROOTLESS_DYLIB="$ROOTLESS_DIR/iOSVCAMAudioBridgeSafe.dylib"
 ROOTLESS_PLIST="$ROOTLESS_DIR/iOSVCAMAudioBridgeSafe.plist"
+BACKUP_DYLIB="/var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSafe.dylib"
 
 TWEAK_DIR="/usr/lib/TweakInject"
 DYLIB="$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib"
@@ -11,8 +12,13 @@ PATCH_LINK="$TWEAK_DIR/iOSVCAMAudioBridgeSafe.dylib.roothidepatch"
 PATCH_TARGET="/usr/lib/DynamicPatches/AutoPatches.dylib"
 
 if [ -d "$TWEAK_DIR" ]; then
-    if [ -f "$ROOTLESS_DYLIB" ]; then
-        cp -f "$ROOTLESS_DYLIB" "$DYLIB" 2>/dev/null || true
+    SOURCE_DYLIB="$ROOTLESS_DYLIB"
+    if [ ! -f "$SOURCE_DYLIB" ] && [ -f "$BACKUP_DYLIB" ]; then
+        SOURCE_DYLIB="$BACKUP_DYLIB"
+    fi
+
+    if [ -f "$SOURCE_DYLIB" ]; then
+        cp -f "$SOURCE_DYLIB" "$DYLIB" 2>/dev/null || true
         chmod 755 "$DYLIB" 2>/dev/null || true
         chown root:wheel "$DYLIB" 2>/dev/null || true
     fi

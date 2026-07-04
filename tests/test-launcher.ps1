@@ -167,21 +167,24 @@ $postrmText = Get-FileText "ios\audio_bridge_safe_tweak\layout\DEBIAN\postrm"
 if ($postinstText -and $postinstText -match '/usr/lib/TweakInject') {
     if ($postinstText -notmatch '/var/jb/Library/MobileSubstrate/DynamicLibraries' -or
         $postinstText -notmatch 'ROOTLESS_DYLIB' -or
+        $postinstText -notmatch 'BACKUP_DYLIB' -or
         $postinstText -notmatch 'cp\s+-f' -or
         $postinstText -notmatch '<!DOCTYPE plist' -or
         $postinstText -notmatch '<string>TikTok</string>') {
-        $errors += "✗ Safe AudioBridge RootHide postinst must mirror the rootless dylib and write an XML TweakInject plist"
+        $errors += "✗ Safe AudioBridge RootHide postinst must mirror rootless/backup dylib and write an XML TweakInject plist"
     } else {
-        $success += "✓ Safe AudioBridge RootHide postinst mirrors dylib and writes XML TweakInject plist"
+        $success += "✓ Safe AudioBridge RootHide postinst mirrors rootless/backup dylib and writes XML TweakInject plist"
     }
 }
 if ($postrmText -and (
+    $postrmText -notmatch 'case "\$1"' -or
+    $postrmText -notmatch 'remove\|purge' -or
     $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.dylib\.roothidepatch' -or
     $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.dylib' -or
     $postrmText -notmatch 'iOSVCAMAudioBridgeSafe\.plist')) {
-    $errors += "✗ Safe AudioBridge postrm must clean RootHide mirror files and roothidepatch link"
+    $errors += "✗ Safe AudioBridge postrm must clean RootHide mirror files only on remove/purge"
 } elseif ($postrmText) {
-    $success += "✓ Safe AudioBridge postrm cleans RootHide mirror files and roothidepatch link"
+    $success += "✓ Safe AudioBridge postrm cleans RootHide mirror files only on remove/purge"
 }
 
 $testFiles = Get-ChildItem ".\tests" -Filter "*.ps1" -ErrorAction SilentlyContinue
