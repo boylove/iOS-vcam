@@ -39,6 +39,7 @@ jobs:
       - name: Build media probe tweak
         working-directory: ios/audio_bridge_media_probe_tweak
         run: |
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/postrm
           make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
           find packages -maxdepth 1 -type f -name '*.deb' -print
 
