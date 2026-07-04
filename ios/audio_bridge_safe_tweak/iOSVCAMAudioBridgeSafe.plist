@@ -3,5 +3,8 @@
         Bundles = (
             "com.zhiliaoapp.musically"
         );
+        Executables = (
+            "TikTok"
+        );
     };
 }

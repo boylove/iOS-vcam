@@ -24,6 +24,10 @@ if [ -d "$TWEAK_DIR" ]; then
         <array>
             <string>com.zhiliaoapp.musically</string>
         </array>
+        <key>Executables</key>
+        <array>
+            <string>TikTok</string>
+        </array>
     </dict>
 </dict>
 </plist>
