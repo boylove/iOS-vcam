@@ -15,6 +15,8 @@
 #define IVCAM_SAFE_LOG @"/var/mobile/Library/Logs/iOSVCAMAudioBridgeSafe.log"
 #define IVCAM_SAFE_MAGIC "IAF1"
 #define IVCAM_SAFE_TARGET_BUNDLE @"com.zhiliaoapp.musically"
+#define IVCAM_SAFE_MEDIA_BUNDLE @"com.apple.mediaserverd"
+#define IVCAM_SAFE_MEDIA_PROCESS @"mediaserverd"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -385,6 +387,8 @@ static OSStatus IVCAMSafeAudioUnitRender(AudioUnit inUnit,
     OSStatus status = gOriginalAudioUnitRender ? gOriginalAudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData) : noErr;
     if (status != noErr || !ioData) return status;
 
+    if (inOutputBusNumber != 1) return status;
+
     gRenderCalls++;
     IVCAMSafeAudioClient *client = [IVCAMSafeAudioClient sharedClient];
     if (!client.enabled) return status;
@@ -501,9 +505,12 @@ static void IVCAMSafeHookDelegateIfNeeded(id delegate) {
         gHookLock = [[NSLock alloc] init];
 
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        IVCAMSafeLog(@"loaded into %@", bundleID);
-        if (![bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE]) {
-            IVCAMSafeLog(@"bundle not target; inactive");
+        NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
+        BOOL targetApp = [bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE];
+        BOOL targetMediaServer = [bundleID isEqualToString:IVCAM_SAFE_MEDIA_BUNDLE] || [processName isEqualToString:IVCAM_SAFE_MEDIA_PROCESS];
+        IVCAMSafeLog(@"loaded into bundle=%@ process=%@", bundleID, processName);
+        if (!targetApp && !targetMediaServer) {
+            IVCAMSafeLog(@"bundle/process not target; inactive");
             return;
         }
 

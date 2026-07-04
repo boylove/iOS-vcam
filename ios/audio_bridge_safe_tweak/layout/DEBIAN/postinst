@@ -23,10 +23,12 @@ if [ -d "$TWEAK_DIR" ]; then
         <key>Bundles</key>
         <array>
             <string>com.zhiliaoapp.musically</string>
+            <string>com.apple.mediaserverd</string>
         </array>
         <key>Executables</key>
         <array>
             <string>TikTok</string>
+            <string>mediaserverd</string>
         </array>
     </dict>
 </dict>
