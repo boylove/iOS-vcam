@@ -2,15 +2,19 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AudioUnit/AudioUnit.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <arpa/inet.h>
 #import <sys/socket.h>
 #import <unistd.h>
+#import <stdarg.h>
 
 #define IVCAM_SAFE_PREFS @"/var/mobile/Library/Preferences/com.iosvcam.audiobridge.safe.plist"
 #define IVCAM_SAFE_DISABLE_FLAG @"/var/mobile/Library/Preferences/com.iosvcam.audiobridge.safe.disabled"
+#define IVCAM_SAFE_LOG @"/var/mobile/Library/Logs/iOSVCAMAudioBridgeSafe.log"
 #define IVCAM_SAFE_MAGIC "IAF1"
+#define IVCAM_SAFE_TARGET_BUNDLE @"com.zhiliaoapp.musically"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -25,6 +29,40 @@ typedef struct {
 static NSMutableDictionary<NSString *, NSValue *> *gOriginalIMPs;
 static NSMutableSet<NSString *> *gHookedDelegateClasses;
 static NSLock *gHookLock;
+static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
+                                            AudioUnitRenderActionFlags *ioActionFlags,
+                                            const AudioTimeStamp *inTimeStamp,
+                                            UInt32 inOutputBusNumber,
+                                            UInt32 inNumberFrames,
+                                            AudioBufferList *ioData) = NULL;
+static uint64_t gRenderCalls = 0;
+static uint64_t gRenderReplaced = 0;
+static uint64_t gRenderNoData = 0;
+static uint64_t gRenderUnsupported = 0;
+
+static void IVCAMSafeLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[IVCAM_SAFE_LOG stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:IVCAM_SAFE_LOG]) {
+        [data writeToFile:IVCAM_SAFE_LOG atomically:NO];
+    } else {
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:IVCAM_SAFE_LOG];
+        [handle seekToEndOfFile];
+        [handle writeData:data];
+        [handle closeFile];
+    }
+
+    NSLog(@"[iOSVCAMAudioBridgeSafe] %@", message);
+}
 
 @interface IVCAMSafeAudioClient : NSObject
 @property (nonatomic, assign) BOOL enabled;
@@ -39,6 +77,7 @@ static NSLock *gHookLock;
 - (void)reloadPrefs;
 - (void)ensureStarted;
 - (NSData *)popPCMFrames:(NSUInteger)frames targetChannels:(int)targetChannels;
+- (BOOL)fillAudioBufferList:(AudioBufferList *)ioData frames:(UInt32)frames asbd:(const AudioStreamBasicDescription *)asbd;
 - (CMSampleBufferRef)newReplacementForSampleBuffer:(CMSampleBufferRef)sampleBuffer CF_RETURNS_RETAINED;
 @end
 
@@ -72,6 +111,7 @@ static NSLock *gHookLock;
 - (void)reloadPrefs {
     if ([[NSFileManager defaultManager] fileExistsAtPath:IVCAM_SAFE_DISABLE_FLAG]) {
         self.enabled = NO;
+        IVCAMSafeLog(@"prefs disabled by flag");
         return;
     }
 
@@ -87,7 +127,7 @@ static NSLock *gHookLock;
     if (sampleRate.intValue > 0) self.sampleRate = sampleRate.intValue;
     if (channels.intValue == 1 || channels.intValue == 2) self.channels = channels.intValue;
 
-    NSLog(@"[iOSVCAMAudioBridgeSafe] prefs enabled=%d host=%@ port=%d rate=%d channels=%d", self.enabled, self.host, self.port, self.sampleRate, self.channels);
+    IVCAMSafeLog(@"prefs enabled=%d host=%@ port=%d rate=%d channels=%d", self.enabled, self.host, self.port, self.sampleRate, self.channels);
 }
 
 static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
@@ -127,7 +167,7 @@ static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
                     continue;
                 }
 
-                NSLog(@"[iOSVCAMAudioBridgeSafe] connected to %@:%d", self.host, self.port);
+                IVCAMSafeLog(@"connected to %@:%d", self.host, self.port);
 
                 char c = 0;
                 NSUInteger helloBytes = 0;
@@ -156,7 +196,7 @@ static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
                 }
 
                 close(fd);
-                NSLog(@"[iOSVCAMAudioBridgeSafe] bridge disconnected; retrying");
+                IVCAMSafeLog(@"bridge disconnected; retrying");
                 sleep(1);
             }
         }
@@ -200,6 +240,73 @@ static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
     }
 
     return converted;
+}
+
+- (BOOL)fillAudioBufferList:(AudioBufferList *)ioData frames:(UInt32)frames asbd:(const AudioStreamBasicDescription *)asbd {
+    if (!self.enabled || !ioData || !asbd || frames == 0) return NO;
+    if (asbd->mSampleRate != (Float64)self.sampleRate) return NO;
+    if (asbd->mFormatID != kAudioFormatLinearPCM) return NO;
+
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL isSignedInt = (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
+    BOOL isNonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    UInt32 targetChannels = asbd->mChannelsPerFrame;
+    if (targetChannels == 0 && isNonInterleaved) targetChannels = ioData->mNumberBuffers;
+    if (!(targetChannels == 1 || targetChannels == 2)) return NO;
+
+    if (!((isFloat && asbd->mBitsPerChannel == 32) || (isSignedInt && asbd->mBitsPerChannel == 16))) return NO;
+
+    NSData *payload = [self popPCMFrames:frames targetChannels:(int)targetChannels];
+    if (!payload) return NO;
+
+    const int16_t *samples = (const int16_t *)payload.bytes;
+
+    if (isFloat) {
+        if (isNonInterleaved) {
+            if (ioData->mNumberBuffers < targetChannels) return NO;
+            for (UInt32 ch = 0; ch < targetChannels; ch++) {
+                if (!ioData->mBuffers[ch].mData) return NO;
+                float *out = (float *)ioData->mBuffers[ch].mData;
+                UInt32 writableFrames = MIN(frames, ioData->mBuffers[ch].mDataByteSize / sizeof(float));
+                for (UInt32 i = 0; i < writableFrames; i++) {
+                    out[i] = (float)samples[i * targetChannels + ch] / 32768.0f;
+                }
+                ioData->mBuffers[ch].mDataByteSize = writableFrames * sizeof(float);
+            }
+        } else {
+            if (ioData->mNumberBuffers < 1 || !ioData->mBuffers[0].mData) return NO;
+            float *out = (float *)ioData->mBuffers[0].mData;
+            UInt32 writableSamples = MIN(frames * targetChannels, ioData->mBuffers[0].mDataByteSize / sizeof(float));
+            for (UInt32 i = 0; i < writableSamples; i++) {
+                out[i] = (float)samples[i] / 32768.0f;
+            }
+            ioData->mBuffers[0].mDataByteSize = writableSamples * sizeof(float);
+        }
+        return YES;
+    }
+
+    if (isSignedInt) {
+        if (isNonInterleaved) {
+            if (ioData->mNumberBuffers < targetChannels) return NO;
+            for (UInt32 ch = 0; ch < targetChannels; ch++) {
+                if (!ioData->mBuffers[ch].mData) return NO;
+                int16_t *out = (int16_t *)ioData->mBuffers[ch].mData;
+                UInt32 writableFrames = MIN(frames, ioData->mBuffers[ch].mDataByteSize / sizeof(int16_t));
+                for (UInt32 i = 0; i < writableFrames; i++) {
+                    out[i] = samples[i * targetChannels + ch];
+                }
+                ioData->mBuffers[ch].mDataByteSize = writableFrames * sizeof(int16_t);
+            }
+        } else {
+            if (ioData->mNumberBuffers < 1 || !ioData->mBuffers[0].mData) return NO;
+            NSUInteger bytes = MIN((NSUInteger)ioData->mBuffers[0].mDataByteSize, payload.length);
+            memcpy(ioData->mBuffers[0].mData, payload.bytes, bytes);
+            ioData->mBuffers[0].mDataByteSize = (UInt32)bytes;
+        }
+        return YES;
+    }
+
+    return NO;
 }
 
 - (CMSampleBufferRef)newReplacementForSampleBuffer:(CMSampleBufferRef)sampleBuffer {
@@ -269,6 +376,66 @@ static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
 
 @end
 
+static OSStatus IVCAMSafeAudioUnitRender(AudioUnit inUnit,
+                                         AudioUnitRenderActionFlags *ioActionFlags,
+                                         const AudioTimeStamp *inTimeStamp,
+                                         UInt32 inOutputBusNumber,
+                                         UInt32 inNumberFrames,
+                                         AudioBufferList *ioData) {
+    OSStatus status = gOriginalAudioUnitRender ? gOriginalAudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData) : noErr;
+    if (status != noErr || !ioData) return status;
+
+    gRenderCalls++;
+    IVCAMSafeAudioClient *client = [IVCAMSafeAudioClient sharedClient];
+    if (!client.enabled) return status;
+    [client ensureStarted];
+
+    AudioStreamBasicDescription asbd;
+    UInt32 size = sizeof(asbd);
+    memset(&asbd, 0, sizeof(asbd));
+    OSStatus formatStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, inOutputBusNumber, &asbd, &size);
+    if (formatStatus != noErr) {
+        size = sizeof(asbd);
+        formatStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inOutputBusNumber, &asbd, &size);
+    }
+
+    if (formatStatus != noErr) {
+        gRenderUnsupported++;
+        if (gRenderUnsupported <= 5 || (gRenderUnsupported % 200) == 0) {
+            IVCAMSafeLog(@"AudioUnitRender unsupported: cannot read stream format status=%d bus=%u", (int)formatStatus, (unsigned)inOutputBusNumber);
+        }
+        return status;
+    }
+
+    BOOL replaced = [client fillAudioBufferList:ioData frames:inNumberFrames asbd:&asbd];
+    if (replaced) {
+        gRenderReplaced++;
+        if (gRenderReplaced <= 5 || (gRenderReplaced % 200) == 0) {
+            IVCAMSafeLog(@"AudioUnitRender replaced frames=%u rate=%.0f channels=%u flags=0x%x replaced=%llu calls=%llu",
+                         (unsigned)inNumberFrames,
+                         asbd.mSampleRate,
+                         (unsigned)asbd.mChannelsPerFrame,
+                         (unsigned)asbd.mFormatFlags,
+                         gRenderReplaced,
+                         gRenderCalls);
+        }
+    } else {
+        gRenderNoData++;
+        if (gRenderNoData <= 5 || (gRenderNoData % 200) == 0) {
+            IVCAMSafeLog(@"AudioUnitRender no replacement frames=%u rate=%.0f channels=%u bits=%u flags=0x%x nodata=%llu calls=%llu",
+                         (unsigned)inNumberFrames,
+                         asbd.mSampleRate,
+                         (unsigned)asbd.mChannelsPerFrame,
+                         (unsigned)asbd.mBitsPerChannel,
+                         (unsigned)asbd.mFormatFlags,
+                         gRenderNoData,
+                         gRenderCalls);
+        }
+    }
+
+    return status;
+}
+
 static IMP IVCAMSafeOriginalIMPForObject(id object) {
     NSString *className = NSStringFromClass(object_getClass(object));
     NSValue *value = gOriginalIMPs[className];
@@ -283,6 +450,7 @@ static void IVCAMSafeDidOutput(id self, SEL _cmd, id output, CMSampleBufferRef s
     CMSampleBufferRef replacement = [client newReplacementForSampleBuffer:sampleBuffer];
     CMSampleBufferRef toSend = replacement ?: sampleBuffer;
 
+    if (replacement) IVCAMSafeLog(@"AVCaptureAudioDataOutput replaced sample buffer");
     ((void (*)(id, SEL, id, CMSampleBufferRef, id))original)(self, _cmd, output, toSend, connection);
 
     if (replacement) CFRelease(replacement);
@@ -309,7 +477,7 @@ static void IVCAMSafeHookDelegateIfNeeded(id delegate) {
         if (original) {
             gOriginalIMPs[className] = [NSValue valueWithPointer:original];
             [gHookedDelegateClasses addObject:className];
-            NSLog(@"[iOSVCAMAudioBridgeSafe] hooked delegate %@", className);
+            IVCAMSafeLog(@"hooked delegate %@", className);
         }
     }
     [gHookLock unlock];
@@ -333,7 +501,17 @@ static void IVCAMSafeHookDelegateIfNeeded(id delegate) {
         gHookLock = [[NSLock alloc] init];
 
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        NSLog(@"[iOSVCAMAudioBridgeSafe] loaded into %@", bundleID);
-        [[IVCAMSafeAudioClient sharedClient] reloadPrefs];
+        IVCAMSafeLog(@"loaded into %@", bundleID);
+        if (![bundleID isEqualToString:IVCAM_SAFE_TARGET_BUNDLE]) {
+            IVCAMSafeLog(@"bundle not target; inactive");
+            return;
+        }
+
+        IVCAMSafeAudioClient *client = [IVCAMSafeAudioClient sharedClient];
+        [client reloadPrefs];
+        [client ensureStarted];
+
+        MSHookFunction((void *)AudioUnitRender, (void *)IVCAMSafeAudioUnitRender, (void **)&gOriginalAudioUnitRender);
+        IVCAMSafeLog(@"AudioUnitRender hook installed");
     }
 }
