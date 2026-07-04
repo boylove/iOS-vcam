@@ -9,7 +9,7 @@ Safety rules:
 - Package id is `com.iosvcam.audiobridge.media-active`.
 - It targets `mediaserverd` only (`com.apple.mediaserverd` / executable `mediaserverd`).
 - It connects to the PC AudioBridge at `127.10.10.10:1936` by default.
-- Version 0.1.1 starts that TCP client lazily on the first matching input render instead of in the constructor.
+- Version 0.1.2 starts that TCP client at load time for connection diagnostics and mirrors logs to syslog when file logs are blocked.
 - It hooks `AudioUnitRender` only inside `mediaserverd` and fails open to the original audio when unsupported.
 - It does not inject into Camera.app, SpringBoard, TikTok, or AVFoundation globally.
 - It only installs when the user manually installs the .deb; launcher code must not install, reload, or restart iPhone services automatically.

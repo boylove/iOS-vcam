@@ -8,6 +8,7 @@
 #import <stdarg.h>
 #import <string.h>
 #import <sys/socket.h>
+#import <syslog.h>
 #import <unistd.h>
 
 #define IVCAM_MEDIA_ACTIVE_PREFS @"/var/mobile/Library/Preferences/com.iosvcam.audiobridge.media-active.plist"
@@ -99,6 +100,10 @@ static void IVCAMMediaActiveLog(NSString *format, ...) {
         if (IVCAMMediaActiveAppendLog(path, data)) break;
     }
 
+    const char *utf8 = [message UTF8String];
+    if (utf8) {
+        syslog(LOG_NOTICE, "[iOSVCAMAudioBridgeMediaActive] %s", utf8);
+    }
     NSLog(@"[iOSVCAMAudioBridgeMediaActive] %@", message);
 }
 
@@ -558,8 +563,9 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
 
         IVCAMMediaActiveAudioClient *client = [IVCAMMediaActiveAudioClient sharedClient];
         [client reloadPrefs];
+        [client ensureStarted];
 
         MSHookFunction((void *)AudioUnitRender, (void *)IVCAMMediaActiveAudioUnitRender, (void **)&gOriginalAudioUnitRender);
-        IVCAMMediaActiveLog(@"MEDIA_ACTIVE_READY AudioUnitRender hook installed; client starts lazily on first matching input render");
+        IVCAMMediaActiveLog(@"MEDIA_ACTIVE_READY AudioUnitRender hook installed; startup client enabled for connection diagnostics");
     }
 }
