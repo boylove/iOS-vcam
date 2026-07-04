@@ -143,13 +143,14 @@ static void IVCAMSafeLog(NSString *format, ...) {
     id sampleRateValue = IVCAMSafeCopyPref(@"SampleRate") ?: filePrefs[@"SampleRate"];
     id channelsValue = IVCAMSafeCopyPref(@"Channels") ?: filePrefs[@"Channels"];
 
-    self.enabled = [enabledValue respondsToSelector:@selector(boolValue)] ? [enabledValue boolValue] : NO;
+    BOOL hasEnabledValue = [enabledValue respondsToSelector:@selector(boolValue)];
+    self.enabled = hasEnabledValue ? [enabledValue boolValue] : YES;
     if ([hostValue isKindOfClass:[NSString class]] && [hostValue length] > 0) self.host = hostValue;
     if ([portValue respondsToSelector:@selector(intValue)] && [portValue intValue] > 0) self.port = [portValue intValue];
     if ([sampleRateValue respondsToSelector:@selector(intValue)] && [sampleRateValue intValue] > 0) self.sampleRate = [sampleRateValue intValue];
     if ([channelsValue respondsToSelector:@selector(intValue)] && ([channelsValue intValue] == 1 || [channelsValue intValue] == 2)) self.channels = [channelsValue intValue];
 
-    IVCAMSafeLog(@"prefs enabled=%d host=%@ port=%d rate=%d channels=%d source=%@", self.enabled, self.host, self.port, self.sampleRate, self.channels, enabledValue ? @"cfprefs" : @"file");
+    IVCAMSafeLog(@"prefs enabled=%d host=%@ port=%d rate=%d channels=%d source=%@", self.enabled, self.host, self.port, self.sampleRate, self.channels, hasEnabledValue ? @"prefs" : @"default");
 }
 
 static BOOL IVCAMSafeReadExact(int fd, void *buffer, size_t length) {
