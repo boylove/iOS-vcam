@@ -40,6 +40,7 @@ COMMIT_PATHS = [
     "ios/audio_bridge_daemon/Makefile",
     "ios/audio_bridge_daemon/audio_bridge_daemon.c",
     "ios/audio_bridge_daemon/control",
+    "ios/audio_bridge_daemon/daemon.entitlements",
     "ios/audio_bridge_daemon/README.md",
     "ios/audio_bridge_daemon/layout/DEBIAN/postinst",
     "ios/audio_bridge_daemon/layout/DEBIAN/postrm",

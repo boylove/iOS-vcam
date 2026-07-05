@@ -8,6 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TOOL_NAME := iosvcam_audio_bridge_daemon
 iosvcam_audio_bridge_daemon_FILES := audio_bridge_daemon.c
 iosvcam_audio_bridge_daemon_CFLAGS := -Wall -Wextra -std=c11
+iosvcam_audio_bridge_daemon_CODESIGN_FLAGS := -Sdaemon.entitlements
 iosvcam_audio_bridge_daemon_INSTALL_PATH := /usr/libexec/iosvcam
 
 after-install::
