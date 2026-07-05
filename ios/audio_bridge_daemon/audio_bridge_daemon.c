@@ -90,11 +90,12 @@ static IVCAMAudioBridgeSharedState *IVCAMOpenSharedState(void) {
         return NULL;
     }
 
-    int fd = open(IVCAM_AB_SHARED_PATH, O_RDWR | O_CREAT, 0644);
+    int fd = open(IVCAM_AB_SHARED_PATH, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
         IVCAMLogErrno("failed to open shared state");
         return NULL;
     }
+    fchmod(fd, 0666);
 
     size_t size = IVCAMAudioBridgeSharedSize();
     if (ftruncate(fd, (off_t)size) != 0) {

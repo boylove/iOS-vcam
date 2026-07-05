@@ -1,6 +1,6 @@
 Package: com.iosvcam.audiobridge.daemon
 Name: iOS-VCAM Audio Bridge Daemon
-Version: 0.1.2
+Version: 0.1.3
 Architecture: iphoneos-arm64e
 Description: Passive iOS-VCAM AudioBridge system daemon. Receives PC audio frames and publishes shared state for a realtime-safe hook.
 Maintainer: iOS-VCAM

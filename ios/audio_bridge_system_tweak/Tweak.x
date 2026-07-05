@@ -14,7 +14,7 @@
 #define IVCAM_SYSTEM_HOOK_TARGET_BUNDLE @"com.apple.mediaserverd"
 #define IVCAM_SYSTEM_HOOK_TARGET_PROCESS @"mediaserverd"
 
-static const IVCAMAudioBridgeSharedState *gSharedState = NULL;
+static IVCAMAudioBridgeSharedState *gSharedState = NULL;
 static size_t gSharedStateSize = 0;
 
 static NSString *IVCAMSystemHookLogPath(void) {
@@ -81,21 +81,21 @@ static uint64_t IVCAMSystemHookLoad64(const uint64_t *field) {
 }
 
 static BOOL IVCAMSystemHookMapSharedState(void) {
-    int fd = open(IVCAM_AB_SHARED_PATH, O_RDONLY);
+    int fd = open(IVCAM_AB_SHARED_PATH, O_RDWR);
     if (fd < 0) {
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_ABSENT path=%s", IVCAM_AB_SHARED_PATH);
         return NO;
     }
 
     size_t size = IVCAMAudioBridgeSharedSize();
-    void *mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_MAP_FAILED path=%s", IVCAM_AB_SHARED_PATH);
         return NO;
     }
 
-    const IVCAMAudioBridgeSharedState *shared = (const IVCAMAudioBridgeSharedState *)mapped;
+    IVCAMAudioBridgeSharedState *shared = (IVCAMAudioBridgeSharedState *)mapped;
     if (IVCAMSystemHookLoad32(&shared->magic) != IVCAM_AB_SHARED_MAGIC ||
         IVCAMSystemHookLoad32(&shared->version) != IVCAM_AB_SHARED_VERSION ||
         IVCAMSystemHookLoad32(&shared->total_size) != (uint32_t)size) {
@@ -106,14 +106,16 @@ static BOOL IVCAMSystemHookMapSharedState(void) {
 
     gSharedState = shared;
     gSharedStateSize = size;
-    IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_READY capacity=%u state=%u sequence=%llu",
+    __atomic_add_fetch(&shared->input_render_seen, 1, __ATOMIC_RELEASE);
+    IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_READY capacity=%u state=%u sequence=%llu hookLoads=%llu",
                        IVCAMSystemHookLoad32(&shared->ring_capacity_bytes),
                        IVCAMSystemHookLoad32(&shared->state),
-                       IVCAMSystemHookLoad64(&shared->ring_write_sequence));
+                       IVCAMSystemHookLoad64(&shared->ring_write_sequence),
+                       IVCAMSystemHookLoad64(&shared->input_render_seen));
     return YES;
 }
 
-%ctor {
+__attribute__((constructor)) static void IVCAMSystemHookConstructor(void) {
     @autoreleasepool {
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
