@@ -1,0 +1,29 @@
+#!/bin/sh
+
+DAEMON="/var/jb/usr/libexec/iosvcam/iosvcam_audio_bridge_daemon"
+PLIST="/var/jb/Library/LaunchDaemons/com.iosvcam.audiobridge.daemon.plist"
+SHARED_DIR="/var/mobile/Library/Caches/com.iosvcam.audiobridge.system"
+
+if [ -f "$DAEMON" ]; then
+    chmod 755 "$DAEMON" 2>/dev/null || true
+    chown root:wheel "$DAEMON" 2>/dev/null || true
+fi
+
+if [ -f "$PLIST" ]; then
+    chmod 644 "$PLIST" 2>/dev/null || true
+    chown root:wheel "$PLIST" 2>/dev/null || true
+fi
+
+if [ -d "/var/mobile/Library/Caches" ]; then
+    mkdir -p "$SHARED_DIR" 2>/dev/null || true
+    chmod 755 "$SHARED_DIR" 2>/dev/null || true
+    chown mobile:mobile "$SHARED_DIR" 2>/dev/null || true
+fi
+
+cat <<'MSG'
+iOS-VCAM Audio Bridge daemon payload installed.
+It is disabled by default and no services were started automatically.
+Start it manually only after explicit approval during Phase 1 testing.
+MSG
+
+exit 0

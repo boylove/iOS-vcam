@@ -1,0 +1,9 @@
+Package: com.iosvcam.audiobridge.system-hook
+Name: iOS-VCAM Audio Bridge System Hook
+Version: 0.1.0
+Architecture: iphoneos-arm64e
+Description: Passive realtime-safe iOS-VCAM mediaserverd hook for AudioBridge System v0.1. Does not replace audio in Phase 1.
+Maintainer: iOS-VCAM
+Author: iOS-VCAM
+Section: Tweaks
+Conflicts: com.iosvcam.audiobridge, com.iosvcam.audiobridge.media-active

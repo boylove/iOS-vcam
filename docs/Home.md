@@ -4,7 +4,7 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 
 ## 🆕 What's New (v3.2+)
 
-*   **SSH Installation Tool (Option [9]):** Directly install or update `.deb` packages to your iPhone from the launcher. No more manual file copying! [Read more](Advanced-Features.md#automated-installation-option-9)
+*   **USB Setup Validation (Option [9]):** Check local USB streaming prerequisites without installing `.deb` packages from the launcher. [Read more](Advanced-Features.md#usb-setup-validation-option-9)
 *   **Enhanced Debranding:** Improved tools for customizing the iOS package identity.
 *   **Stability Fixes:** Solved PowerShell parser errors and improved USB tunneling stability.
 
@@ -25,11 +25,17 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 *   **WiFi Streaming** (Best practices)
 *   **USB Streaming** (High reliability, low latency)
 *   **OBS Integration** (Streaming from PC to iPhone)
+*   **Experimental Audio Bridge** (PC-side OBS audio plus manual daemon/system-hook tests)
 
 ### [🔧 Troubleshooting](Troubleshooting.md)
 *   **Common Issues** (Connection failed, Choppy stream)
 *   **Diagnostics** (Using the launcher diagnostics)
 *   **Crash Fixes** (Known solutions)
+
+### [🎙️ Audio Bridge / DiCoy Notes](Audio-Bridge-DiCoy-Integration.md)
+*   **Safety Warning** (`com.iosvcam.audiobridge` is quarantined)
+*   **DiCoy Findings** (research reference only)
+*   **Current Support** (video-only stable path; manual AudioBridge System v0.1 experiments)
 
 ### [🔄 Post-Reboot Checklist](Post-Reboot-Checklist.md)
 *   **What Gets Lost** (sshd config, host keys, aliases)
@@ -43,7 +49,7 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 *   **Lessons Learned** (Avoid repeating mistakes)
 
 ### [🧠 Advanced Features](Advanced-Features.md)
-*   **SSH & .deb Installation** (Automated package management)
+*   **USB Setup Validation** (Read-only diagnostics and manual SSH references)
 *   **Debranding** (Customizing the iOS package)
 *   **Frida & Hooks** (Application analysis)
 *   **Architecture** (SRS, Monibuca, Flask)

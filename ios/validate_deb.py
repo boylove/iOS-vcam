@@ -20,6 +20,13 @@ MEDIA_ACTIVE_PACKAGE = "com.iosvcam.audiobridge.media-active"
 MEDIA_ACTIVE_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaActive.dylib"
 MEDIA_ACTIVE_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeMediaActive.plist"
 MEDIA_ACTIVE_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeMediaActive.dylib"
+AUDIO_DAEMON_PACKAGE = "com.iosvcam.audiobridge.daemon"
+AUDIO_DAEMON_BINARY = "var/jb/usr/libexec/iosvcam/iosvcam_audio_bridge_daemon"
+AUDIO_DAEMON_LAUNCHD = "var/jb/Library/LaunchDaemons/com.iosvcam.audiobridge.daemon.plist"
+SYSTEM_HOOK_PACKAGE = "com.iosvcam.audiobridge.system-hook"
+SYSTEM_HOOK_DYLIB = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSystemHook.dylib"
+SYSTEM_HOOK_PLIST = f"{ROOTLESS_TWEAK_DIR}/iOSVCAMAudioBridgeSystemHook.plist"
+SYSTEM_HOOK_BACKUP_DYLIB = "var/jb/usr/lib/iosvcam/iOSVCAMAudioBridgeSystemHook.dylib"
 VCAM_DYLIB = f"{ROOTLESS_TWEAK_DIR}/vcamera.dylib"
 VCAM_PLIST = f"{ROOTLESS_TWEAK_DIR}/vcamera.plist"
 VCAM_PREF_PAYLOAD_PATH = "var/mobile/vc.plist"
@@ -250,6 +257,102 @@ def validate_media_active_package(control_fields, control_entries, data_entries)
     return ok
 
 
+def validate_audio_daemon_package(control_fields, control_entries, data_entries):
+    ok = True
+    package = control_fields.get("Package", "")
+    if package != AUDIO_DAEMON_PACKAGE:
+        return True
+
+    ok &= require(
+        control_fields.get("Architecture") == "iphoneos-arm64e",
+        "audio daemon Architecture must be iphoneos-arm64e",
+    )
+    ok &= require(AUDIO_DAEMON_BINARY in data_entries, f"missing {AUDIO_DAEMON_BINARY}")
+    ok &= require(AUDIO_DAEMON_LAUNCHD in data_entries, f"missing {AUDIO_DAEMON_LAUNCHD}")
+
+    postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
+    postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
+    launchd = data_entries.get(AUDIO_DAEMON_LAUNCHD, b"").decode("utf-8", errors="replace")
+    binary = data_entries.get(AUDIO_DAEMON_BINARY, b"")
+
+    ok &= require("iosvcam_audio_bridge_daemon" in launchd, "daemon launchd missing binary path")
+    ok &= require("<key>Disabled</key>" in launchd and "<true/>" in launchd, "daemon launchd must be disabled by default")
+    ok &= require("<key>RunAtLoad</key>" in launchd and "<false/>" in launchd, "daemon launchd must not run at load by default")
+    ok &= require('case "$1"' in postrm, "daemon postrm must guard cleanup by maintainer-script action")
+    ok &= require("remove|purge" in postrm, "daemon cleanup must be limited to remove/purge")
+    ok &= require(b"AUDIO_DAEMON_READY" in binary, "daemon binary missing ready marker")
+    ok &= require(b"IAF1" in binary, "daemon binary missing AudioBridge frame marker")
+    ok &= require(b"127.10.10.10" in binary, "daemon binary missing default tunnel host")
+
+    forbidden_text = "\n".join([postinst, postrm, launchd, control_fields.get("Package", "")])
+    ok &= require("Package: com.iosvcam.audiobridge\n" not in forbidden_text, "daemon must not use quarantined package id")
+    for pattern in [
+        r"\blaunchctl\b",
+        r"\bkillall\b",
+        r"\bsbreload\b",
+        r"\brespring\b",
+        r"/etc/ssh/sshd_config",
+        r"ifconfig\s+lo0\s+alias",
+    ]:
+        ok &= require(not re.search(pattern, forbidden_text, re.I), f"forbidden daemon package content: {pattern}")
+
+    print("OK: Audio daemon package invariants")
+    return ok
+
+
+def validate_system_hook_package(control_fields, control_entries, data_entries):
+    ok = True
+    package = control_fields.get("Package", "")
+    if package != SYSTEM_HOOK_PACKAGE:
+        return True
+
+    ok &= require(
+        control_fields.get("Architecture") == "iphoneos-arm64e",
+        "system-hook Architecture must be iphoneos-arm64e",
+    )
+    ok &= require(SYSTEM_HOOK_DYLIB in data_entries, f"missing {SYSTEM_HOOK_DYLIB}")
+    ok &= require(SYSTEM_HOOK_PLIST in data_entries, f"missing {SYSTEM_HOOK_PLIST}")
+    ok &= require(SYSTEM_HOOK_BACKUP_DYLIB in data_entries, f"missing {SYSTEM_HOOK_BACKUP_DYLIB}")
+
+    postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
+    postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
+    plist = data_entries.get(SYSTEM_HOOK_PLIST, b"").decode("utf-8", errors="replace")
+    dylib = data_entries.get(SYSTEM_HOOK_DYLIB, b"")
+
+    ok &= require("/usr/lib/TweakInject" in postinst, "system-hook postinst missing TweakInject handling")
+    ok &= require(
+        "/usr/lib/DynamicPatches/AutoPatches.dylib" in postinst,
+        "system-hook postinst missing RootHide AutoPatches link target",
+    )
+    ok &= require(ROOTLESS_TWEAK_DIR in postinst, "system-hook postinst missing rootless source path")
+    ok &= require("BACKUP_DYLIB" in postinst, "system-hook postinst missing backup dylib restore path")
+    ok &= require("PKGMIRROR_DIR" in postinst, "system-hook postinst missing RootHide pkgmirror support")
+    ok &= require("com.apple.mediaserverd" in postinst, "system-hook postinst missing mediaserverd filter")
+    ok &= require("mediaserverd" in plist, "system-hook plist missing mediaserverd filter")
+    ok &= require('case "$1"' in postrm, "system-hook postrm must guard cleanup by maintainer-script action")
+    ok &= require("remove|purge" in postrm, "system-hook cleanup must be limited to remove/purge")
+    ok &= require("iOSVCAMAudioBridgeSystemHook.dylib" in postrm, "system-hook postrm missing dylib cleanup")
+    ok &= require("iOSVCAMAudioBridgeSystemHook.plist" in postrm, "system-hook postrm missing plist cleanup")
+    ok &= require("roothidepatch" in postrm, "system-hook postrm missing roothidepatch cleanup")
+    ok &= require(b"AUDIO_SYSTEM_HOOK_LOADED" in dylib, "system-hook dylib missing load marker")
+    ok &= require(b"AUDIO_SYSTEM_HOOK_READY" in dylib, "system-hook dylib missing ready marker")
+    ok &= require(b"AUDIO_SYSTEM_HOOK_PASSIVE" in dylib, "system-hook dylib missing passive marker")
+    ok &= require(b"system-hook.disabled" in dylib, "system-hook dylib missing disable flag")
+    ok &= require(b"AudioUnitRender" in dylib, "system-hook dylib missing AudioUnitRender marker")
+
+    forbidden_text = "\n".join([postinst, postrm, plist, control_fields.get("Package", "")])
+    ok &= require("Package: com.iosvcam.audiobridge\n" not in forbidden_text, "system-hook must not use quarantined package id")
+    for pattern in [r"com\.apple\.camera", r"com\.apple\.springboard", r"com\.zhiliaoapp\.musically", r"\bTikTok\b"]:
+        ok &= require(not re.search(pattern, forbidden_text, re.I), f"forbidden system-hook target content: {pattern}")
+    for marker in [b"IAF1", b"connected to %@:%d", b"MEDIA_ACTIVE_REPLACED"]:
+        ok &= require(marker not in dylib, f"system-hook phase 1 must stay passive; found {marker!r}")
+    for marker in [b"socket", b"connect", b"recv", b"send"]:
+        ok &= require(marker not in dylib, f"system-hook must not contain network marker {marker!r}")
+
+    print("OK: System-hook package invariants")
+    return ok
+
+
 def validate_vcamera_rtmp_seed(expected_rtmp, control_entries, data_entries):
     ok = True
     postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
@@ -310,6 +413,9 @@ def validate(path, expected_vcamera_rtmp=None):
         return 1
 
     control_fields, _control_text = parse_control_fields(control_entries["control"])
+    if control_fields.get("Package") == "com.iosvcam.audiobridge":
+        print("FAIL: quarantined package id com.iosvcam.audiobridge is not allowed")
+        return 1
 
     data_bytes = next(d for n, d in members if n == data_name)
     try:
@@ -323,6 +429,10 @@ def validate(path, expected_vcamera_rtmp=None):
     if not validate_media_probe_package(control_fields, control_entries, data_entries):
         return 1
     if not validate_media_active_package(control_fields, control_entries, data_entries):
+        return 1
+    if not validate_audio_daemon_package(control_fields, control_entries, data_entries):
+        return 1
+    if not validate_system_hook_package(control_fields, control_entries, data_entries):
         return 1
     if expected_vcamera_rtmp and not validate_vcamera_rtmp_seed(expected_vcamera_rtmp, control_entries, data_entries):
         return 1

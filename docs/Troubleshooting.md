@@ -16,11 +16,23 @@
     *   Verify Stream Key matches (`srs`).
     *   Restart the SRS server (Option [1] in Launcher).
 
+### No OBS Audio on iPhone / Target App
+*   **Cause:** The existing VCAM path mainly replaces the camera/video feed. OBS audio in RTMP is not automatically injected as the iPhone microphone.
+*   **Fix/checks:**
+    *   In OBS, enable AAC audio and make sure the expected sources are assigned to the streaming track.
+    *   Verify the PC-side RTMP stream actually contains audio before debugging the phone.
+    *   Check `logs/audio-bridge-*.out.log`: `client connected:` means an iOS audio client reached the PC bridge. PC bridge/tunnel readiness alone is not enough.
+    *   AudioBridge System v0.1 Phase 1 uses `com.iosvcam.audiobridge.daemon` plus `com.iosvcam.audiobridge.system-hook`; the hook is passive and must not replace microphone audio yet.
+    *   `com.iosvcam.audiobridge.media-probe` is passive and will never connect to port `1936` or replace microphone audio.
+    *   Avoid treating `com.iosvcam.audiobridge.media-active` as the main stability path; it is the older direct-network mediaserverd experiment.
+    *   Only use reviewed manual experiments after explicit approval, and keep disable flags available.
+    *   Do not install `com.iosvcam.audiobridge`; it affected the tested Dopamine iOS 16.1.2 jailbreak/camera environment and is quarantined.
+
 ### iPhone Can't Connect via USB
 *   **Cause:** `iproxy` not running or cable issue.
 *   **Fix:**
     *   Run `idevice_id -l` to confirm detection.
-    *   For **Option [U]**: Check all three windows (iProxy, SSH, Monibuca) for errors.
+    *   For **Option [U]**: Check iProxy, SSH tunnel, Flask, and SRS USB logs/windows for errors.
     *   For manual setup: Ensure `iproxy 2222 22` (for SSH) or `iproxy 1935 1935` is running.
     *   Re-plug USB cable and accept "Trust This Computer" on iPhone.
 
@@ -50,7 +62,7 @@
 
 ### "PowerShell Parser Error" (Crash on Start)
 *   **Status:** Fixed in v3.2.1.
-*   **Fix:** If using an old version, update to v3.2.1+. Use the latest `iOS-VCAM-Launcher.exe`.
+*   **Fix:** Run the canonical PS1 launcher: `powershell -ExecutionPolicy Bypass -File .\iOS-VCAM-Launcher.ps1`.
 
 ### "Port 1935 in use"
 *   **Cause:** Another instance of SRS or another server is running.
@@ -62,11 +74,12 @@
 
 ## 🔐 SSH & Installation Issues
 
-### SSH Connection Fails (Option [9])
-*   **Cause:** Tunnel not active or wrong credentials.
+### SSH Connection Fails (USB / Option [U])
+*   **Cause:** USB SSH forwarding is not active, credentials are wrong, or the iPhone is missing post-reboot tunnel prerequisites.
 *   **Fix:**
-    *   **3uTools:** Ensure "SSH Tunnel" is OPEN in Toolbox. Port 22 should be mapped to local port (usually 22 or 2222).
-    *   **Credentials:** If you changed the root password from `alpine`, choose "No" when asked to use defaults, and enter your custom password.
+    *   **Validation:** Run Option [9] to check local USB setup prerequisites.
+    *   **3uTools:** Ensure "SSH Tunnel" is OPEN in Toolbox if you use it instead of bundled `iproxy.exe`. Port 22 should be mapped to local port 2222.
+    *   **Credentials:** If you changed the root password from `alpine`, enter your custom password when prompted.
     *   **USB:** Disconnect and reconnect the Lightning cable.
 
 ### "dpkg: error processing archive"
@@ -89,8 +102,8 @@
 ### App Crashes when Camera Opens
 *   **Cause:** Tweak incompatibility or bad config.
 *   **Fix:**
-    *   Reinstall the VCAM tweak.
-    *   Restart `mediaserverd` on iPhone (`killall -9 mediaserverd`).
+    *   Confirm the installed VCAM tweak matches the generated package/IP you intend to use.
+    *   Use launcher diagnostics and logs first; avoid device-modifying recovery commands unless you intentionally choose a manual recovery step.
     *   Ensure the stream resolution matches what the app expects (optional but helpful).
 
 ### Frida "Failed to spawn"

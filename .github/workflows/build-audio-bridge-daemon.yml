@@ -1,0 +1,66 @@
+name: Build iOS Audio Bridge Daemon
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'build/**'
+      - 'feature/**'
+    paths:
+      - '.github/workflows/build-audio-bridge-daemon.yml'
+      - 'ios/audio_bridge_common/**'
+      - 'ios/audio_bridge_daemon/**'
+      - 'ios/retag_deb_architecture.py'
+      - 'ios/validate_deb.py'
+
+jobs:
+  build-daemon:
+    name: Build passive AudioBridge daemon .deb
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install packaging tools
+        run: |
+          brew update
+          brew install dpkg ldid xz
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Build AudioBridge daemon
+        working-directory: ios/audio_bridge_daemon
+        run: |
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/postrm
+          make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+          find packages -maxdepth 1 -type f -name '*.deb' -print
+
+      - name: Retag daemon architecture
+        run: |
+          python3 ios/retag_deb_architecture.py \
+            --architecture iphoneos-arm64e \
+            ios/audio_bridge_daemon/packages/*.deb
+
+      - name: Validate daemon package
+        run: |
+          for deb in ios/audio_bridge_daemon/packages/*.deb; do
+            python3 ios/validate_deb.py "$deb"
+            dpkg-deb -I "$deb"
+            dpkg-deb -c "$deb"
+          done
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iosvcam-audio-bridge-daemon-rootless-deb
+          path: ios/audio_bridge_daemon/packages/*.deb
+          if-no-files-found: error

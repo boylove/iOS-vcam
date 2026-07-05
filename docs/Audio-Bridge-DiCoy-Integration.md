@@ -33,7 +33,7 @@ However:
 - Copying GPL DiCoy code has license implications.
 - The attempted clean-room `com.iosvcam.audiobridge` companion proved unsafe on the user's device.
 
-## Experimental safe AudioBridge status
+## AudioBridge System v0.1 status
 
 `scripts/audio_bridge.py` can decode OBS/SRS audio to framed PCM on `127.0.0.1:1936`. When launcher AudioBridge is enabled and starts successfully, Option [U] adds an optional SSH reverse tunnel:
 
@@ -41,7 +41,28 @@ However:
 127.10.10.10:1936 -> PC 127.0.0.1:1936
 ```
 
-This is only for the experimental `com.iosvcam.audiobridge.safe` target-app path. Version 0.3.9 keeps the normal rootless install path and mirrors/restores the same restricted dylib into RootHide's `/usr/lib/TweakInject` and hidden-app `pkgmirror` with compatible filter plists when that environment is present. It is not a global system microphone replacement, and system Camera may still record the real iPhone microphone.
+The new system-audio route is intentionally split into two packages:
+
+- `com.iosvcam.audiobridge.daemon` owns TCP client work, `IAF1` parsing, reconnects, buffering, and shared-state counters.
+- `com.iosvcam.audiobridge.system-hook` targets `mediaserverd` but Phase 1 is passive: it reads already-mapped shared state and always returns original audio untouched.
+
+This replaces the old direction of putting network/reconnect/buffering directly inside the mediaserverd dylib. The old `com.iosvcam.audiobridge.media-active` package remains a high-risk experiment and should not be the main path for further stability work. The passive `com.iosvcam.audiobridge.media-probe` still only logs load state and never connects to `1936`.
+
+## Phase plan
+
+### Phase 1: probe only, no replacement
+
+Expected behavior:
+
+- PC bridge listens on `127.0.0.1:1936`.
+- USB mode tunnels `127.10.10.10:1936` to the PC bridge.
+- The iPhone daemon can consume `IAF1` frames and publish shared counters.
+- The mediaserverd system hook remains realtime-safe and does not write microphone buffers.
+- Camera preview/recording stability is the only success criterion.
+
+### Phase 2: replacement behind gates only
+
+Do not enable replacement until Phase 1 is stable. Replacement must require real input render, exact supported Linear PCM format, fresh daemon state, enough buffered frames, watchdog health, and an explicit enable flag. Unsupported or stale states must fail open immediately.
 
 ## Safe recommendation
 
@@ -51,4 +72,4 @@ For stable use, keep the supported setup to:
 - USB reverse tunnel for ports `80` and `1935`
 - OBS video over RTMP
 
-For explicit virtual microphone experiments, use only reviewed iOS-VCAM packages. The restricted `com.iosvcam.audiobridge.safe` path remains TikTok-targeted and requires AudioBridge enabled so port `1936` is tunneled. The new `com.iosvcam.audiobridge.media-probe` package is only a passive `mediaserverd` load probe for testing a future video-style media-layer path; it does not replace microphone audio. All iPhone packages must still be installed manually after explicit approval. Do not install the quarantined `com.iosvcam.audiobridge` package again.
+For explicit virtual microphone experiments, use only reviewed iOS-VCAM packages. `com.iosvcam.audiobridge.daemon` and `com.iosvcam.audiobridge.system-hook` are manual Phase 1 system-audio artifacts; installing or starting them on the iPhone requires explicit approval. All iPhone packages must still be installed manually after approval. Do not install the quarantined `com.iosvcam.audiobridge` package again.

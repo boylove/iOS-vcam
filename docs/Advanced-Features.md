@@ -1,37 +1,31 @@
 # Advanced Features
 
-## 🔐 SSH & .deb Installation
+## 🔐 USB Setup Validation
 
-> **Security Note:** This tool is designed for **personal use on your own devices** over a direct USB connection. The SSH credentials (default: `alpine`) connect only to your locally-attached iPhone—there is no network exposure. Password-based authentication is used for simplicity; advanced users who prefer key-based auth can configure their iPhone's OpenSSH accordingly and disable the password prompt in `config.ini`.
+> **Safety Note:** The launcher defaults to read-only iPhone handling. It checks local tools, ports, and tunnel prerequisites, but it does not install packages or change iPhone files/settings during normal validation.
 
-The launcher includes a powerful feature (**Option [9]**) to install `.deb` packages directly to your iPhone without manual file transfer.
+### USB Setup Validation (Option [9])
+Option [9] runs prerequisite checks for USB streaming. It is not the old SSH `.deb` installer.
 
-### Automated Installation (Option [9])
-This feature streamlines the process of updating your VCAM tweak or installing modified packages.
+**What it checks:**
+1.  **Local tools:** `iproxy.exe`, `idevice_id.exe`, `plink.exe`, and Python availability.
+2.  **Project files:** SRS/Flask/config files required by Option [U].
+3.  **Ports:** Whether local streaming/auth ports are free or already bound.
+4.  **Device visibility:** Whether libimobiledevice can see the attached iPhone.
 
-**How it works:**
-1.  **Discovery:** Scans `ios/modified_debs/` for available packages.
-2.  **Connection Test:** Automatically verifies SSH connectivity to the device before attempting transfer.
-3.  **Transport:** Uses `pscp.exe` (PuTTY SCP) to securely copy the selected file to `/var/mobile/Documents/`.
-4.  **Installation:** Uses `plink.exe` to execute `dpkg --force-architecture --force-depends -i [file]` on the device.
-5.  **Respring:** Can optionally restart SpringBoard or `mediaserverd` to apply changes immediately.
+If you need to install or update an iOS `.deb`, generate the package with the tools in `ios/` and perform the install deliberately outside Option [9]. Do not use or install the quarantined `com.iosvcam.audiobridge` package.
 
 ### Customizing SSH
-The launcher uses default credentials but fully supports custom configurations.
+The launcher can prompt for SSH credentials when Option [U] needs to establish a tunnel.
 
-*   **Default:** `localhost:22` (via USB tunnel) or local IP, User: `root`, Password: `alpine`.
-*   **Custom:** If you have changed your root password (highly recommended) or use a non-standard port:
-    *   The launcher will prompt for credentials if the default fails.
-    *   Your custom password and port settings are saved to `config.ini` for future use.
+*   **Default:** USB-forwarded SSH on local port `2222`, User: `root`, Password: `alpine`.
+*   **Custom:** If you changed the root password, enter the custom password when prompted. The password is stored in `config.ini` for future local sessions.
 
 ### Manual SSH Tools
-The distribution includes `plink.exe` and `pscp.exe` in the root directory. You can use these for your own scripting:
+The distribution includes `plink.exe` and `pscp.exe`. Prefer read-only diagnostic commands unless you intentionally choose a manual recovery/install step:
 ```powershell
-# Run a command
-.\plink.exe -ssh root@localhost -P 2222 -pw alpine "ls -la"
-
-# Copy a file
-.\pscp.exe -P 2222 -pw alpine myfile.deb root@localhost:/var/mobile/Documents/
+# Read-only connectivity check
+.\plink.exe -ssh root@localhost -P 2222 -pw alpine "uname -a"
 ```
 
 ---
@@ -98,6 +92,7 @@ This makes the iPhone "think" it has a local service on 1935, which is actually 
 2.  **Flask (Python)**: Provides a lightweight API and authentication endpoint (`/auth`).
 3.  **Nginx (Optional)**: Can be used as a reverse proxy (bundled in some distributions).
 4.  **Launcher (PowerShell)**: Orchestrator. Checks network, updates configs, manages processes.
+5.  **AudioBridge System v0.1 (Experimental)**: PC bridge prepares OBS audio; manual iOS daemon/system-hook packages are Phase 1 passive test artifacts.
 
 ### Data Flow
 1.  **PC (OBS)** --[RTMP]--> **SRS (Port 1935)**

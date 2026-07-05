@@ -1,0 +1,6 @@
+{
+    Filter = {
+        Bundles = ("com.apple.mediaserverd");
+        Executables = ("mediaserverd");
+    };
+}

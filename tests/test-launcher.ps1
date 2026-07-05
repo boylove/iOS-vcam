@@ -303,6 +303,124 @@ if ($mediaActivePostrm -and (
     $success += "✓ Media-active postrm cleans only media-active RootHide files on remove/purge"
 }
 
+$audioDaemonFiles = @(
+    "ios\audio_bridge_common\AudioBridgeShared.h",
+    "ios\audio_bridge_daemon\control",
+    "ios\audio_bridge_daemon\Makefile",
+    "ios\audio_bridge_daemon\audio_bridge_daemon.c",
+    "ios\audio_bridge_daemon\layout\DEBIAN\postinst",
+    "ios\audio_bridge_daemon\layout\DEBIAN\postrm",
+    "ios\audio_bridge_daemon\layout\Library\LaunchDaemons\com.iosvcam.audiobridge.daemon.plist"
+)
+foreach ($file in $audioDaemonFiles) {
+    if (-not (Test-Path $file)) {
+        $errors += "✗ Audio daemon file not found: $file"
+    }
+}
+$audioDaemonControl = Get-FileText "ios\audio_bridge_daemon\control"
+$audioDaemonSource = Get-FileText "ios\audio_bridge_daemon\audio_bridge_daemon.c"
+$audioDaemonPostinst = Get-FileText "ios\audio_bridge_daemon\layout\DEBIAN\postinst"
+$audioDaemonPostrm = Get-FileText "ios\audio_bridge_daemon\layout\DEBIAN\postrm"
+$audioDaemonLaunchd = Get-FileText "ios\audio_bridge_daemon\layout\Library\LaunchDaemons\com.iosvcam.audiobridge.daemon.plist"
+if ($audioDaemonControl -and $audioDaemonControl -notmatch 'Package:\s*com\.iosvcam\.audiobridge\.daemon') {
+    $errors += "✗ Audio daemon package id must be com.iosvcam.audiobridge.daemon"
+}
+if ($audioDaemonSource -and (
+    $audioDaemonSource -notmatch 'AUDIO_DAEMON_READY' -or
+    $audioDaemonSource -notmatch 'IAF1' -or
+    $audioDaemonSource -notmatch '127\.10\.10\.10' -or
+    $audioDaemonSource -notmatch 'IVCAM_AB_HOOK_PASSIVE')) {
+    $errors += "✗ Audio daemon must include passive shared-state markers, IAF1 parsing, and default tunnel host"
+} elseif ($audioDaemonSource) {
+    $success += "✓ Audio daemon includes passive shared-state and IAF1 bridge markers"
+}
+if ($audioDaemonLaunchd -and (
+    $audioDaemonLaunchd -notmatch '<key>Disabled</key>\s*<true/>' -or
+    $audioDaemonLaunchd -notmatch '<key>RunAtLoad</key>\s*<false/>')) {
+    $errors += "✗ Audio daemon LaunchDaemon must be disabled and not RunAtLoad by default"
+} elseif ($audioDaemonLaunchd) {
+    $success += "✓ Audio daemon LaunchDaemon is disabled by default"
+}
+if (($audioDaemonPostinst + "`n" + $audioDaemonPostrm + "`n" + $audioDaemonLaunchd) -match '\blaunchctl\b|\bkillall\b|\bsbreload\b|\brespring\b|/etc/ssh/sshd_config|ifconfig\s+lo0\s+alias') {
+    $errors += "✗ Audio daemon package must not auto-load services, restart processes, respring, or change device recovery settings"
+} elseif ($audioDaemonPostinst -or $audioDaemonPostrm -or $audioDaemonLaunchd) {
+    $success += "✓ Audio daemon package avoids automatic device-side service/recovery changes"
+}
+
+$systemHookFiles = @(
+    "ios\audio_bridge_system_tweak\control",
+    "ios\audio_bridge_system_tweak\Makefile",
+    "ios\audio_bridge_system_tweak\Tweak.x",
+    "ios\audio_bridge_system_tweak\iOSVCAMAudioBridgeSystemHook.plist",
+    "ios\audio_bridge_system_tweak\layout\DEBIAN\postinst",
+    "ios\audio_bridge_system_tweak\layout\DEBIAN\postrm"
+)
+foreach ($file in $systemHookFiles) {
+    if (-not (Test-Path $file)) {
+        $errors += "✗ System hook file not found: $file"
+    }
+}
+$systemHookControl = Get-FileText "ios\audio_bridge_system_tweak\control"
+$systemHookTweak = Get-FileText "ios\audio_bridge_system_tweak\Tweak.x"
+$systemHookPostinst = Get-FileText "ios\audio_bridge_system_tweak\layout\DEBIAN\postinst"
+$systemHookPostrm = Get-FileText "ios\audio_bridge_system_tweak\layout\DEBIAN\postrm"
+if ($systemHookControl -and $systemHookControl -notmatch 'Package:\s*com\.iosvcam\.audiobridge\.system-hook') {
+    $errors += "✗ System hook package id must be com.iosvcam.audiobridge.system-hook"
+}
+if ($systemHookTweak -and (
+    $systemHookTweak -notmatch 'AUDIO_SYSTEM_HOOK_LOADED' -or
+    $systemHookTweak -notmatch 'AUDIO_SYSTEM_HOOK_READY' -or
+    $systemHookTweak -notmatch 'AUDIO_SYSTEM_HOOK_PASSIVE' -or
+    $systemHookTweak -notmatch 'system-hook\.disabled' -or
+    $systemHookTweak -notmatch 'AudioUnitRender')) {
+    $errors += "✗ System hook must include load/ready/passive/disable markers and AudioUnitRender hook"
+} elseif ($systemHookTweak) {
+    $success += "✓ System hook includes passive AudioUnitRender markers"
+}
+if ($systemHookTweak -and $systemHookTweak -match '\b(socket|connect|recv|send)\s*\(|arpa/inet|sys/socket|MEDIA_ACTIVE_REPLACED|connected to %@:%d') {
+    $errors += "✗ System hook Phase 1 must not contain direct network client code or active replacement markers"
+} elseif ($systemHookTweak) {
+    $success += "✓ System hook Phase 1 source has no direct network client or active replacement markers"
+}
+if ($systemHookTweak -and $systemHookTweak -match 'com\.apple\.camera|Camera\.app|com\.apple\.springboard|SpringBoard|com\.zhiliaoapp\.musically|\bTikTok\b') {
+    $errors += "✗ System hook must not target Camera.app, SpringBoard, or TikTok"
+}
+if ($systemHookPostinst -and (
+    $systemHookPostinst -notmatch '/usr/lib/TweakInject' -or
+    $systemHookPostinst -notmatch '/usr/lib/DynamicPatches/AutoPatches\.dylib' -or
+    $systemHookPostinst -notmatch 'BACKUP_DYLIB' -or
+    $systemHookPostinst -notmatch 'PKGMIRROR_DIR' -or
+    $systemHookPostinst -notmatch 'com\.apple\.mediaserverd' -or
+    $systemHookPostinst -notmatch 'write_filter_openstep')) {
+    $errors += "✗ System hook postinst must support TweakInject/AutoPatches/pkgmirror mediaserverd probing"
+} elseif ($systemHookPostinst) {
+    $success += "✓ System hook postinst supports TweakInject/AutoPatches/pkgmirror mediaserverd probing"
+}
+if ($systemHookPostrm -and (
+    $systemHookPostrm -notmatch 'case "\$1"' -or
+    $systemHookPostrm -notmatch 'remove\|purge' -or
+    $systemHookPostrm -notmatch 'iOSVCAMAudioBridgeSystemHook\.dylib\.roothidepatch' -or
+    $systemHookPostrm -notmatch 'PKGMIRROR_DIR')) {
+    $errors += "✗ System hook postrm must clean only system-hook RootHide files on remove/purge"
+} elseif ($systemHookPostrm) {
+    $success += "✓ System hook postrm cleans only system-hook RootHide files on remove/purge"
+}
+
+$systemBuildScripts = @(
+    "scripts\github_build_audio_bridge_daemon_deb.py",
+    "scripts\github_build_audio_bridge_system_hook_deb.py"
+)
+foreach ($file in $systemBuildScripts) {
+    $text = Get-FileText $file
+    if ($null -eq $text) {
+        $errors += "✗ AudioBridge system build wrapper not found: $file"
+        continue
+    }
+    if ($text -match 'dpkg\s+-i|\blaunchctl\b|\bkillall\b|\bsbreload\b|\brespring\b|/etc/ssh/sshd_config|ifconfig\s+lo0\s+alias') {
+        $errors += "✗ AudioBridge system build wrapper must not install or mutate the iPhone: $file"
+    }
+}
+
 $testFiles = Get-ChildItem ".\tests" -Filter "*.ps1" -ErrorAction SilentlyContinue
 $noExitFlag = '-' + 'NoExit'
 $noExitMatches = @()
