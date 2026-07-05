@@ -276,8 +276,14 @@ def validate_audio_daemon_package(control_fields, control_entries, data_entries)
     binary = data_entries.get(AUDIO_DAEMON_BINARY, b"")
 
     ok &= require("iosvcam_audio_bridge_daemon" in launchd, "daemon launchd missing binary path")
-    ok &= require("<key>Disabled</key>" in launchd and "<true/>" in launchd, "daemon launchd must be disabled by default")
-    ok &= require("<key>RunAtLoad</key>" in launchd and "<false/>" in launchd, "daemon launchd must not run at load by default")
+    ok &= require(
+        re.search(r"<key>Disabled</key>\s*<true\s*/>", launchd) is not None,
+        "daemon launchd must be disabled by default",
+    )
+    ok &= require(
+        re.search(r"<key>RunAtLoad</key>\s*<false\s*/>", launchd) is not None,
+        "daemon launchd must not run at load by default",
+    )
     ok &= require('case "$1"' in postrm, "daemon postrm must guard cleanup by maintainer-script action")
     ok &= require("remove|purge" in postrm, "daemon cleanup must be limited to remove/purge")
     ok &= require(b"AUDIO_DAEMON_READY" in binary, "daemon binary missing ready marker")
