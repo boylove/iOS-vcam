@@ -475,7 +475,7 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
     if (status != noErr || !ioData) return status;
 
     gRenderCalls++;
-    if (inOutputBusNumber != 1) {
+    if (inOutputBusNumber > 1) {
         gRenderWrongBus++;
         if (IVCAMMediaActiveShouldLogCount(gRenderWrongBus)) {
             IVCAMMediaActiveLog(@"MEDIA_ACTIVE_SKIP_BUS bus=%u frames=%u wrongBus=%llu", (unsigned int)inOutputBusNumber, (unsigned int)inNumberFrames, gRenderWrongBus);
