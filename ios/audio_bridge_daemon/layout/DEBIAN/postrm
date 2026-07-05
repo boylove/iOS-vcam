@@ -2,7 +2,7 @@
 
 case "$1" in
     remove|purge)
-        rm -f /var/mobile/Library/Caches/com.iosvcam.audiobridge.system/shared.bin 2>/dev/null || true
+        rm -f /var/tmp/iOSVCAMAudioBridgeSystem.shared.bin 2>/dev/null || true
         ;;
 esac
 

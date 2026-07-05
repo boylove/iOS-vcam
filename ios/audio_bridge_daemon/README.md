@@ -8,7 +8,7 @@ This package is intentionally separate from the quarantined `com.iosvcam.audiobr
 
 - Package id: `com.iosvcam.audiobridge.daemon`
 - Binary: `/var/jb/usr/libexec/iosvcam/iosvcam_audio_bridge_daemon`
-- Shared state: `/var/mobile/Library/Caches/com.iosvcam.audiobridge.system/shared.bin`
+- Shared state: `/var/tmp/iOSVCAMAudioBridgeSystem.shared.bin`
 - Default PC endpoint: `127.10.10.10:1936`
 
 ## Phase 1 behavior

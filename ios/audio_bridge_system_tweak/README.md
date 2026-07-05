@@ -13,7 +13,7 @@ This package is intentionally separate from both:
 - Dylib: `iOSVCAMAudioBridgeSystemHook.dylib`
 - Filter: `com.apple.mediaserverd` / `mediaserverd`
 - Disable flag: `/var/mobile/Library/Preferences/com.iosvcam.audiobridge.system-hook.disabled`
-- Shared state path: `/var/mobile/Library/Caches/com.iosvcam.audiobridge.system/shared.bin`
+- Shared state path: `/var/tmp/iOSVCAMAudioBridgeSystem.shared.bin`
 
 ## Phase 1 behavior
 

@@ -21,8 +21,8 @@ extern "C" {
 #define IVCAM_AB_BYTES_PER_SAMPLE 2u
 #define IVCAM_AB_SAMPLE_FORMAT_S16LE 1u
 
-#define IVCAM_AB_SHARED_DIR "/var/mobile/Library/Caches/com.iosvcam.audiobridge.system"
-#define IVCAM_AB_SHARED_PATH IVCAM_AB_SHARED_DIR "/shared.bin"
+#define IVCAM_AB_SHARED_DIR "/var/tmp"
+#define IVCAM_AB_SHARED_PATH IVCAM_AB_SHARED_DIR "/iOSVCAMAudioBridgeSystem.shared.bin"
 #define IVCAM_AB_RING_SECONDS 2u
 #define IVCAM_AB_RING_BYTES \
     (IVCAM_AB_DEFAULT_SAMPLE_RATE * IVCAM_AB_DEFAULT_CHANNELS * \

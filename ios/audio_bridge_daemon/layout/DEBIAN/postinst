@@ -2,7 +2,7 @@
 
 DAEMON="/var/jb/usr/libexec/iosvcam/iosvcam_audio_bridge_daemon"
 PLIST="/var/jb/Library/LaunchDaemons/com.iosvcam.audiobridge.daemon.plist"
-SHARED_DIR="/var/mobile/Library/Caches/com.iosvcam.audiobridge.system"
+SHARED_DIR="/var/tmp"
 
 if [ -f "$DAEMON" ]; then
     chmod 755 "$DAEMON" 2>/dev/null || true
