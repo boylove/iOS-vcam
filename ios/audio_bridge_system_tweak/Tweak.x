@@ -340,6 +340,7 @@ __attribute__((constructor)) static void IVCAMSystemHookConstructor(void) {
         IVCAMSystemHookMapSharedState();
         MSHookFunction((void *)AudioUnitRender, (void *)IVCAMSystemHookAudioUnitRender, (void **)&gOriginalAudioUnitRender);
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_READY AudioUnitRender hook installed; network remains in daemon");
+        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_PASSIVE network/decode/reconnect remain in daemon; hook fails open when unsupported");
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_PHASE2 active shared-ring replacement enabled fail-open=1");
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_REPLACED counter increments only after supported input renders");
         (void)gSharedStateSize;
