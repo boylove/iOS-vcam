@@ -16,23 +16,7 @@ PKGMIRROR_PLIST="$PKGMIRROR_DIR/iOSVCAMAudioBridgeSystemHook.plist"
 
 write_filter_xml() {
     cat > "$1" <<'EOF' 2>/dev/null || true
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Filter</key>
-    <dict>
-        <key>Bundles</key>
-        <array>
-            <string>com.apple.mediaserverd</string>
-        </array>
-        <key>Executables</key>
-        <array>
-            <string>mediaserverd</string>
-        </array>
-    </dict>
-</dict>
-</plist>
+{ Filter = { Bundles = ("com.apple.mediaserverd"); Executables = ("mediaserverd"); }; }
 EOF
 }
 
