@@ -1,10 +1,14 @@
 #import <Foundation/Foundation.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <AudioUnit/AudioUnit.h>
+#import <substrate.h>
 #import <fcntl.h>
 #import <stdarg.h>
 #import <stdint.h>
 #import <string.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
+#import <time.h>
 #import <unistd.h>
 
 #import "../audio_bridge_common/AudioBridgeShared.h"
@@ -13,7 +17,14 @@
 #define IVCAM_SYSTEM_HOOK_LOG @"iOSVCAMAudioBridgeSystemHook.log"
 #define IVCAM_SYSTEM_HOOK_TARGET_BUNDLE @"com.apple.mediaserverd"
 #define IVCAM_SYSTEM_HOOK_TARGET_PROCESS @"mediaserverd"
+#define IVCAM_SYSTEM_HOOK_STALE_US 1000000ull
 
+static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
+                                            AudioUnitRenderActionFlags *ioActionFlags,
+                                            const AudioTimeStamp *inTimeStamp,
+                                            UInt32 inOutputBusNumber,
+                                            UInt32 inNumberFrames,
+                                            AudioBufferList *ioData) = NULL;
 static IVCAMAudioBridgeSharedState *gSharedState = NULL;
 static size_t gSharedStateSize = 0;
 
@@ -80,6 +91,16 @@ static uint64_t IVCAMSystemHookLoad64(const uint64_t *field) {
     return __atomic_load_n(field, __ATOMIC_ACQUIRE);
 }
 
+static uint64_t IVCAMSystemHookAdd64(uint64_t *field, uint64_t amount) {
+    return __atomic_add_fetch(field, amount, __ATOMIC_RELEASE);
+}
+
+static uint64_t IVCAMSystemHookNowUS(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return ((uint64_t)ts.tv_sec * 1000000ull) + ((uint64_t)ts.tv_nsec / 1000ull);
+}
+
 static BOOL IVCAMSystemHookMapSharedState(void) {
     int fd = open(IVCAM_AB_SHARED_PATH, O_RDWR);
     if (fd < 0) {
@@ -106,13 +127,182 @@ static BOOL IVCAMSystemHookMapSharedState(void) {
 
     gSharedState = shared;
     gSharedStateSize = size;
-    __atomic_add_fetch(&shared->input_render_seen, 1, __ATOMIC_RELEASE);
+    IVCAMSystemHookAdd64(&shared->input_render_seen, 1);
     IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_READY capacity=%u state=%u sequence=%llu hookLoads=%llu",
                        IVCAMSystemHookLoad32(&shared->ring_capacity_bytes),
                        IVCAMSystemHookLoad32(&shared->state),
                        IVCAMSystemHookLoad64(&shared->ring_write_sequence),
                        IVCAMSystemHookLoad64(&shared->input_render_seen));
     return YES;
+}
+
+static BOOL IVCAMSystemHookSharedReady(IVCAMAudioBridgeSharedState *shared) {
+    if (!shared) return NO;
+    if (IVCAMSystemHookLoad32(&shared->magic) != IVCAM_AB_SHARED_MAGIC) return NO;
+    if (IVCAMSystemHookLoad32(&shared->version) != IVCAM_AB_SHARED_VERSION) return NO;
+    if (IVCAMSystemHookLoad32(&shared->state) != IVCAM_AB_STATE_STREAMING) return NO;
+    if (IVCAMSystemHookLoad32(&shared->format.sample_format) != IVCAM_AB_SAMPLE_FORMAT_S16LE) return NO;
+    uint64_t updated = IVCAMSystemHookLoad64(&shared->updated_at_us);
+    uint64_t now = IVCAMSystemHookNowUS();
+    if (now > updated && now - updated > IVCAM_SYSTEM_HOOK_STALE_US) {
+        IVCAMSystemHookAdd64(&shared->stale_reads, 1);
+        return NO;
+    }
+    return YES;
+}
+
+static int16_t IVCAMSystemHookReadS16(const IVCAMAudioBridgeSharedState *shared,
+                                      uint32_t start,
+                                      uint32_t byteOffset) {
+    uint32_t capacity = IVCAMSystemHookLoad32(&shared->ring_capacity_bytes);
+    if (capacity < 2) return 0;
+    uint32_t pos = (start + byteOffset) % capacity;
+    uint8_t lo = shared->ring[pos];
+    uint8_t hi = shared->ring[(pos + 1) % capacity];
+    return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+}
+
+static int16_t IVCAMSystemHookSampleAt(const IVCAMAudioBridgeSharedState *shared,
+                                       uint32_t start,
+                                       UInt32 frame,
+                                       UInt32 channel,
+                                       UInt32 sourceChannels,
+                                       UInt32 targetChannels) {
+    UInt32 sourceChannel = 0;
+    if (sourceChannels == targetChannels) {
+        sourceChannel = channel;
+    } else if (sourceChannels == 2 && targetChannels == 1) {
+        int16_t left = IVCAMSystemHookReadS16(shared, start, (frame * 2u) * 2u);
+        int16_t right = IVCAMSystemHookReadS16(shared, start, (frame * 2u + 1u) * 2u);
+        return (int16_t)(((int32_t)left + (int32_t)right) / 2);
+    }
+    return IVCAMSystemHookReadS16(shared, start, (frame * sourceChannels + sourceChannel) * 2u);
+}
+
+static BOOL IVCAMSystemHookFillBuffers(AudioBufferList *ioData,
+                                       UInt32 frames,
+                                       const AudioStreamBasicDescription *asbd,
+                                       IVCAMAudioBridgeSharedState *shared) {
+    if (!ioData || !asbd || !shared || frames == 0) return NO;
+    UInt32 sourceChannels = IVCAMSystemHookLoad32(&shared->format.channels);
+    UInt32 targetChannels = asbd->mChannelsPerFrame;
+    BOOL isNonInterleaved = (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    if (targetChannels == 0 && isNonInterleaved) targetChannels = ioData->mNumberBuffers;
+    if (!((sourceChannels == 1 || sourceChannels == 2) && (targetChannels == 1 || targetChannels == 2))) {
+        IVCAMSystemHookAdd64(&shared->unsupported_formats, 1);
+        return NO;
+    }
+    if (asbd->mSampleRate != (Float64)IVCAMSystemHookLoad32(&shared->format.sample_rate) ||
+        asbd->mFormatID != kAudioFormatLinearPCM) {
+        IVCAMSystemHookAdd64(&shared->unsupported_formats, 1);
+        return NO;
+    }
+
+    BOOL isFloat = (asbd->mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    BOOL isSignedInt = (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
+    if (!((isFloat && asbd->mBitsPerChannel == 32) || (isSignedInt && asbd->mBitsPerChannel == 16))) {
+        IVCAMSystemHookAdd64(&shared->unsupported_formats, 1);
+        return NO;
+    }
+
+    uint32_t bytesNeeded = frames * sourceChannels * 2u;
+    uint32_t capacity = IVCAMSystemHookLoad32(&shared->ring_capacity_bytes);
+    uint32_t valid = IVCAMSystemHookLoad32(&shared->ring_valid_bytes);
+    uint32_t writeOffset = IVCAMSystemHookLoad32(&shared->ring_write_offset);
+    if (capacity == 0 || bytesNeeded == 0 || bytesNeeded > capacity || valid < bytesNeeded) {
+        IVCAMSystemHookAdd64(&shared->underruns, 1);
+        return NO;
+    }
+    uint32_t start = (writeOffset + capacity - bytesNeeded) % capacity;
+
+    if (isSignedInt && !isNonInterleaved && sourceChannels == targetChannels && ioData->mNumberBuffers >= 1 && ioData->mBuffers[0].mData) {
+        uint32_t writable = MIN((uint32_t)ioData->mBuffers[0].mDataByteSize, bytesNeeded);
+        uint32_t first = writable;
+        if (start + writable > capacity) first = capacity - start;
+        memcpy(ioData->mBuffers[0].mData, shared->ring + start, first);
+        if (first < writable) {
+            memcpy((uint8_t *)ioData->mBuffers[0].mData + first, shared->ring, writable - first);
+        }
+        ioData->mBuffers[0].mDataByteSize = writable;
+        return YES;
+    }
+
+    if (isFloat) {
+        if (isNonInterleaved) {
+            if (ioData->mNumberBuffers < targetChannels) return NO;
+            for (UInt32 ch = 0; ch < targetChannels; ch++) {
+                if (!ioData->mBuffers[ch].mData) return NO;
+                float *out = (float *)ioData->mBuffers[ch].mData;
+                UInt32 writableFrames = MIN(frames, ioData->mBuffers[ch].mDataByteSize / sizeof(float));
+                for (UInt32 i = 0; i < writableFrames; i++) {
+                    int16_t sample = IVCAMSystemHookSampleAt(shared, start, i, ch, sourceChannels, targetChannels);
+                    out[i] = (float)sample / 32768.0f;
+                }
+                ioData->mBuffers[ch].mDataByteSize = writableFrames * sizeof(float);
+            }
+            return YES;
+        }
+        if (ioData->mNumberBuffers < 1 || !ioData->mBuffers[0].mData) return NO;
+        float *out = (float *)ioData->mBuffers[0].mData;
+        UInt32 writableSamples = MIN(frames * targetChannels, ioData->mBuffers[0].mDataByteSize / sizeof(float));
+        for (UInt32 i = 0; i < writableSamples; i++) {
+            UInt32 frame = i / targetChannels;
+            UInt32 ch = i % targetChannels;
+            int16_t sample = IVCAMSystemHookSampleAt(shared, start, frame, ch, sourceChannels, targetChannels);
+            out[i] = (float)sample / 32768.0f;
+        }
+        ioData->mBuffers[0].mDataByteSize = writableSamples * sizeof(float);
+        return YES;
+    }
+
+    if (isSignedInt && isNonInterleaved) {
+        if (ioData->mNumberBuffers < targetChannels) return NO;
+        for (UInt32 ch = 0; ch < targetChannels; ch++) {
+            if (!ioData->mBuffers[ch].mData) return NO;
+            int16_t *out = (int16_t *)ioData->mBuffers[ch].mData;
+            UInt32 writableFrames = MIN(frames, ioData->mBuffers[ch].mDataByteSize / sizeof(int16_t));
+            for (UInt32 i = 0; i < writableFrames; i++) {
+                out[i] = IVCAMSystemHookSampleAt(shared, start, i, ch, sourceChannels, targetChannels);
+            }
+            ioData->mBuffers[ch].mDataByteSize = writableFrames * sizeof(int16_t);
+        }
+        return YES;
+    }
+
+    return NO;
+}
+
+static OSStatus IVCAMSystemHookAudioUnitRender(AudioUnit inUnit,
+                                               AudioUnitRenderActionFlags *ioActionFlags,
+                                               const AudioTimeStamp *inTimeStamp,
+                                               UInt32 inOutputBusNumber,
+                                               UInt32 inNumberFrames,
+                                               AudioBufferList *ioData) {
+    OSStatus status = gOriginalAudioUnitRender ? gOriginalAudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData) : noErr;
+    if (status != noErr || !ioData) return status;
+
+    IVCAMAudioBridgeSharedState *shared = gSharedState;
+    if (!IVCAMSystemHookSharedReady(shared)) return status;
+    IVCAMSystemHookAdd64(&shared->render_calls, 1);
+    if (inOutputBusNumber > 1) return status;
+
+    AudioStreamBasicDescription asbd;
+    UInt32 size = sizeof(asbd);
+    memset(&asbd, 0, sizeof(asbd));
+    OSStatus formatStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, inOutputBusNumber, &asbd, &size);
+    if (formatStatus != noErr) {
+        size = sizeof(asbd);
+        formatStatus = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inOutputBusNumber, &asbd, &size);
+    }
+    if (formatStatus != noErr) {
+        IVCAMSystemHookAdd64(&shared->unsupported_formats, 1);
+        return status;
+    }
+
+    if (IVCAMSystemHookFillBuffers(ioData, inNumberFrames, &asbd, shared)) {
+        IVCAMSystemHookAdd64(&shared->replacement_count, 1);
+    }
+    return status;
 }
 
 __attribute__((constructor)) static void IVCAMSystemHookConstructor(void) {
@@ -148,9 +338,10 @@ __attribute__((constructor)) static void IVCAMSystemHookConstructor(void) {
         }
 
         IVCAMSystemHookMapSharedState();
-        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_READY passive shared-state probe installed; AudioUnitRender hook deferred to Phase 2");
-        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_PASSIVE phase=1 no audio writes replacement=off");
-        (void)gSharedState;
+        MSHookFunction((void *)AudioUnitRender, (void *)IVCAMSystemHookAudioUnitRender, (void **)&gOriginalAudioUnitRender);
+        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_READY AudioUnitRender hook installed; network remains in daemon");
+        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_PHASE2 active shared-ring replacement enabled fail-open=1");
+        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_REPLACED counter increments only after supported input renders");
         (void)gSharedStateSize;
     }
 }
