@@ -2,6 +2,7 @@
 import argparse
 import io
 import lzma
+import plistlib
 import re
 import sys
 import tarfile
@@ -257,6 +258,16 @@ def validate_media_active_package(control_fields, control_entries, data_entries)
     return ok
 
 
+def plist_bool(plist_bytes, text, key, expected):
+    if re.search(rf"<key>{re.escape(key)}</key>\s*<{'true' if expected else 'false'}\s*/>", text):
+        return True
+    try:
+        parsed = plistlib.loads(plist_bytes)
+    except Exception:
+        return False
+    return parsed.get(key) is expected
+
+
 def validate_audio_daemon_package(control_fields, control_entries, data_entries):
     ok = True
     package = control_fields.get("Package", "")
@@ -272,16 +283,17 @@ def validate_audio_daemon_package(control_fields, control_entries, data_entries)
 
     postinst = control_entries.get("postinst", b"").decode("utf-8", errors="replace")
     postrm = control_entries.get("postrm", b"").decode("utf-8", errors="replace")
-    launchd = data_entries.get(AUDIO_DAEMON_LAUNCHD, b"").decode("utf-8", errors="replace")
+    launchd_bytes = data_entries.get(AUDIO_DAEMON_LAUNCHD, b"")
+    launchd = launchd_bytes.decode("utf-8", errors="replace")
     binary = data_entries.get(AUDIO_DAEMON_BINARY, b"")
 
-    ok &= require("iosvcam_audio_bridge_daemon" in launchd, "daemon launchd missing binary path")
+    ok &= require("iosvcam_audio_bridge_daemon" in launchd or b"iosvcam_audio_bridge_daemon" in launchd_bytes, "daemon launchd missing binary path")
     ok &= require(
-        re.search(r"<key>Disabled</key>\s*<true\s*/>", launchd) is not None,
+        plist_bool(launchd_bytes, launchd, "Disabled", True),
         "daemon launchd must be disabled by default",
     )
     ok &= require(
-        re.search(r"<key>RunAtLoad</key>\s*<false\s*/>", launchd) is not None,
+        plist_bool(launchd_bytes, launchd, "RunAtLoad", False),
         "daemon launchd must not run at load by default",
     )
     ok &= require('case "$1"' in postrm, "daemon postrm must guard cleanup by maintainer-script action")
