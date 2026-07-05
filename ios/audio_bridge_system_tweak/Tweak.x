@@ -27,6 +27,8 @@ static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
                                             AudioBufferList *ioData) = NULL;
 static IVCAMAudioBridgeSharedState *gSharedState = NULL;
 static size_t gSharedStateSize = 0;
+static uint32_t gHookReadOffset = 0;
+static BOOL gHookReadPrimed = NO;
 
 static NSString *IVCAMSystemHookLogPath(void) {
     NSString *logsDir = @"/var/mobile/Library/Logs";
@@ -151,6 +153,20 @@ static BOOL IVCAMSystemHookSharedReady(IVCAMAudioBridgeSharedState *shared) {
     return YES;
 }
 
+static uint32_t IVCAMSystemHookRingDistance(uint32_t readOffset, uint32_t writeOffset, uint32_t capacity) {
+    if (capacity == 0) return 0;
+    if (writeOffset >= readOffset) return writeOffset - readOffset;
+    return capacity - readOffset + writeOffset;
+}
+
+static uint32_t IVCAMSystemHookPrimeReadOffset(uint32_t writeOffset, uint32_t capacity, uint32_t valid, uint32_t bytesNeeded) {
+    uint32_t preroll = bytesNeeded * 4u;
+    if (preroll < bytesNeeded) preroll = bytesNeeded;
+    if (preroll > valid) preroll = valid;
+    if (preroll < bytesNeeded) return writeOffset;
+    return (writeOffset + capacity - preroll) % capacity;
+}
+
 static int16_t IVCAMSystemHookReadS16(const IVCAMAudioBridgeSharedState *shared,
                                       uint32_t start,
                                       uint32_t byteOffset) {
@@ -211,9 +227,24 @@ static BOOL IVCAMSystemHookFillBuffers(AudioBufferList *ioData,
     uint32_t writeOffset = IVCAMSystemHookLoad32(&shared->ring_write_offset);
     if (capacity == 0 || bytesNeeded == 0 || bytesNeeded > capacity || valid < bytesNeeded) {
         IVCAMSystemHookAdd64(&shared->underruns, 1);
+        gHookReadPrimed = NO;
         return NO;
     }
-    uint32_t start = (writeOffset + capacity - bytesNeeded) % capacity;
+
+    if (!gHookReadPrimed || gHookReadOffset >= capacity) {
+        gHookReadOffset = IVCAMSystemHookPrimeReadOffset(writeOffset, capacity, valid, bytesNeeded);
+        gHookReadPrimed = YES;
+    }
+
+    uint32_t available = IVCAMSystemHookRingDistance(gHookReadOffset, writeOffset, capacity);
+    if (available < bytesNeeded || available > valid) {
+        IVCAMSystemHookAdd64(&shared->underruns, 1);
+        gHookReadOffset = IVCAMSystemHookPrimeReadOffset(writeOffset, capacity, valid, bytesNeeded);
+        available = IVCAMSystemHookRingDistance(gHookReadOffset, writeOffset, capacity);
+        if (available < bytesNeeded) return NO;
+    }
+    uint32_t start = gHookReadOffset;
+    gHookReadOffset = (gHookReadOffset + bytesNeeded) % capacity;
 
     if (isSignedInt && !isNonInterleaved && sourceChannels == targetChannels && ioData->mNumberBuffers >= 1 && ioData->mBuffers[0].mData) {
         uint32_t writable = MIN((uint32_t)ioData->mBuffers[0].mDataByteSize, bytesNeeded);
