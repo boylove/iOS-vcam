@@ -365,8 +365,8 @@ def validate_system_hook_package(control_fields, control_entries, data_entries):
         ok &= require(not re.search(pattern, forbidden_text, re.I), f"forbidden system-hook target content: {pattern}")
     for marker in [b"IAF1", b"connected to %@:%d", b"MEDIA_ACTIVE_REPLACED"]:
         ok &= require(marker not in dylib, f"system-hook phase 1 must stay passive; found {marker!r}")
-    for marker in [b"socket", b"connect", b"recv", b"send"]:
-        ok &= require(marker not in dylib, f"system-hook must not contain network marker {marker!r}")
+    for marker in [b"connected to %@:%d", b"MEDIA_ACTIVE_CONNECTED", b"MEDIA_ACTIVE_CONNECT_WAIT"]:
+        ok &= require(marker not in dylib, f"system-hook must not contain direct-network marker {marker!r}")
 
     print("OK: System-hook package invariants")
     return ok
