@@ -1,7 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <AudioToolbox/AudioToolbox.h>
-#import <AudioUnit/AudioUnit.h>
-#import <substrate.h>
 #import <fcntl.h>
 #import <stdarg.h>
 #import <stdint.h>
@@ -17,16 +14,8 @@
 #define IVCAM_SYSTEM_HOOK_TARGET_BUNDLE @"com.apple.mediaserverd"
 #define IVCAM_SYSTEM_HOOK_TARGET_PROCESS @"mediaserverd"
 
-static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
-                                            AudioUnitRenderActionFlags *ioActionFlags,
-                                            const AudioTimeStamp *inTimeStamp,
-                                            UInt32 inOutputBusNumber,
-                                            UInt32 inNumberFrames,
-                                            AudioBufferList *ioData) = NULL;
 static const IVCAMAudioBridgeSharedState *gSharedState = NULL;
 static size_t gSharedStateSize = 0;
-static uint64_t gLocalRenderCalls = 0;
-static uint64_t gLastObservedSequence = 0;
 
 static NSString *IVCAMSystemHookLogPath(void) {
     NSString *logsDir = @"/var/mobile/Library/Logs";
@@ -117,40 +106,11 @@ static BOOL IVCAMSystemHookMapSharedState(void) {
 
     gSharedState = shared;
     gSharedStateSize = size;
-    IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_READY capacity=%u", IVCAMSystemHookLoad32(&shared->ring_capacity_bytes));
+    IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_SHARED_READY capacity=%u state=%u sequence=%llu",
+                       IVCAMSystemHookLoad32(&shared->ring_capacity_bytes),
+                       IVCAMSystemHookLoad32(&shared->state),
+                       IVCAMSystemHookLoad64(&shared->ring_write_sequence));
     return YES;
-}
-
-static BOOL IVCAMSystemHookSharedLooksReady(const IVCAMAudioBridgeSharedState *shared) {
-    if (!shared) return NO;
-    if (IVCAMSystemHookLoad32(&shared->magic) != IVCAM_AB_SHARED_MAGIC) return NO;
-    if (IVCAMSystemHookLoad32(&shared->version) != IVCAM_AB_SHARED_VERSION) return NO;
-    if (IVCAMSystemHookLoad32(&shared->ring_capacity_bytes) == 0) return NO;
-    return YES;
-}
-
-static OSStatus IVCAMSystemHookAudioUnitRender(AudioUnit inUnit,
-                                               AudioUnitRenderActionFlags *ioActionFlags,
-                                               const AudioTimeStamp *inTimeStamp,
-                                               UInt32 inOutputBusNumber,
-                                               UInt32 inNumberFrames,
-                                               AudioBufferList *ioData) {
-    OSStatus status = gOriginalAudioUnitRender ? gOriginalAudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData) : noErr;
-    if (status != noErr || !ioData) return status;
-
-    gLocalRenderCalls++;
-    const IVCAMAudioBridgeSharedState *shared = gSharedState;
-    if (IVCAMSystemHookSharedLooksReady(shared)) {
-        gLastObservedSequence = IVCAMSystemHookLoad64(&shared->ring_write_sequence);
-    }
-
-    (void)inUnit;
-    (void)ioActionFlags;
-    (void)inTimeStamp;
-    (void)inOutputBusNumber;
-    (void)inNumberFrames;
-    (void)gLastObservedSequence;
-    return status;
 }
 
 %ctor {
@@ -186,8 +146,9 @@ static OSStatus IVCAMSystemHookAudioUnitRender(AudioUnit inUnit,
         }
 
         IVCAMSystemHookMapSharedState();
-        MSHookFunction((void *)AudioUnitRender, (void *)IVCAMSystemHookAudioUnitRender, (void **)&gOriginalAudioUnitRender);
-        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_READY AudioUnitRender hook installed");
+        IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_READY passive shared-state probe installed; AudioUnitRender hook deferred to Phase 2");
         IVCAMSystemHookLog(@"AUDIO_SYSTEM_HOOK_PASSIVE phase=1 no audio writes replacement=off");
+        (void)gSharedState;
+        (void)gSharedStateSize;
     }
 }

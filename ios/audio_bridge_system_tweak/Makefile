@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME := iOSVCAMAudioBridgeSystemHook
 iOSVCAMAudioBridgeSystemHook_FILES := Tweak.x
 iOSVCAMAudioBridgeSystemHook_CFLAGS := -fobjc-arc -Wall -Wextra
-iOSVCAMAudioBridgeSystemHook_FRAMEWORKS := Foundation AudioToolbox
+iOSVCAMAudioBridgeSystemHook_FRAMEWORKS := Foundation
 
 after-install::
 	@echo "Installed iOSVCAMAudioBridgeSystemHook. Restart only the target media process after explicit approval."

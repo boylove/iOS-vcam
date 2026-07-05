@@ -356,7 +356,7 @@ def validate_system_hook_package(control_fields, control_entries, data_entries):
     ok &= require(b"AUDIO_SYSTEM_HOOK_READY" in dylib, "system-hook dylib missing ready marker")
     ok &= require(b"AUDIO_SYSTEM_HOOK_PASSIVE" in dylib, "system-hook dylib missing passive marker")
     ok &= require(b"system-hook.disabled" in dylib, "system-hook dylib missing disable flag")
-    ok &= require(b"AudioUnitRender" in dylib, "system-hook dylib missing AudioUnitRender marker")
+    ok &= require(b"AudioUnitRender hook deferred to Phase 2" in dylib, "system-hook dylib missing Phase 2 hook deferral marker")
 
     forbidden_text = "\n".join([postinst, postrm, plist, control_fields.get("Package", "")])
     ok &= require("Package: com.iosvcam.audiobridge\n" not in forbidden_text, "system-hook must not use quarantined package id")

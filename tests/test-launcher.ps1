@@ -372,10 +372,10 @@ if ($systemHookTweak -and (
     $systemHookTweak -notmatch 'AUDIO_SYSTEM_HOOK_READY' -or
     $systemHookTweak -notmatch 'AUDIO_SYSTEM_HOOK_PASSIVE' -or
     $systemHookTweak -notmatch 'system-hook\.disabled' -or
-    $systemHookTweak -notmatch 'AudioUnitRender')) {
-    $errors += "✗ System hook must include load/ready/passive/disable markers and AudioUnitRender hook"
+    $systemHookTweak -notmatch 'AudioUnitRender hook deferred to Phase 2')) {
+    $errors += "✗ System hook must include load/ready/passive/disable markers and Phase 2 hook deferral marker"
 } elseif ($systemHookTweak) {
-    $success += "✓ System hook includes passive AudioUnitRender markers"
+    $success += "✓ System hook includes passive shared-state markers"
 }
 if ($systemHookTweak -and $systemHookTweak -match '\b(socket|connect|recv|send)\s*\(|arpa/inet|sys/socket|MEDIA_ACTIVE_REPLACED|connected to %@:%d') {
     $errors += "✗ System hook Phase 1 must not contain direct network client code or active replacement markers"
