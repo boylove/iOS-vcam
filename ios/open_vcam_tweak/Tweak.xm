@@ -193,10 +193,10 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // Terminal emit path.
         VCamHook("BWNodeOutput", emitSel, (IMP)VCamEmit, gEmitOrigs);
 
-        // Video render nodes (same set the closed vcamera hooks).
+        // Video-carrying render nodes only (metadata/orientation nodes skipped
+        // to minimise pipeline interference).
         const char *renderClasses[] = {
             "BWNode", "BWUBNode", "BWPixelTransferNode",
-            "BWVideoOrientationMetadataNode", "BWMetadataDetectorGatingNode",
         };
         for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
             VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);

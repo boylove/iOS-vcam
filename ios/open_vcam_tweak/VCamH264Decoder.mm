@@ -118,24 +118,32 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         return NO;
     }
 
-    NSDictionary *destAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey:
-            @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),  // NV12, camera-native
-        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-
     VTDecompressionOutputCallbackRecord callback = {
         .decompressionOutputCallback = VCamDecodeOutput,
         .decompressionOutputRefCon = (__bridge void *)self,
     };
 
+    // Forcing a destination format (NV12 + IOSurface) can make
+    // VTDecompressionSessionCreate fail inside mediaserverd (observed err 1100).
+    // Try with no destination attributes first (native output), then fall back;
+    // CoreImage handles whatever pixel format the decoder yields.
     status = VTDecompressionSessionCreate(
-        kCFAllocatorDefault, _formatDesc, NULL,
-        (__bridge CFDictionaryRef)destAttrs, &callback, &_session);
+        kCFAllocatorDefault, _formatDesc, NULL, NULL, &callback, &_session);
     if (status != noErr || !_session) {
-        VCamLog(@"decoder: session create failed (%d)", (int)status);
+        VCamLog(@"decoder: create failed (%d); retry with NV12", (int)status);
         _session = NULL;
-        return NO;
+        NSDictionary *destAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey:
+                @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        };
+        status = VTDecompressionSessionCreate(
+            kCFAllocatorDefault, _formatDesc, NULL,
+            (__bridge CFDictionaryRef)destAttrs, &callback, &_session);
+        if (status != noErr || !_session) {
+            VCamLog(@"decoder: session create failed (%d)", (int)status);
+            _session = NULL;
+            return NO;
+        }
     }
 
     VCamLog(@"decoder: configured naluLen=%d sps=%lu pps=%lu",
