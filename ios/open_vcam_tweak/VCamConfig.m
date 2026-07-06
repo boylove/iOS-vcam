@@ -4,13 +4,20 @@
 // mediaserverd's sandbox blocks /var/mobile, so the primary config + kill-switch
 // live in /var/tmp (which mediaserverd can read — the audio system hook uses it).
 // /var/mobile is kept as a fallback for app-level contexts / the launcher's model.
+// mediaserverd's sandbox is restrictive but allows /var/mobile/Media (the
+// media store it manages — the closed vcamera reads /var/mobile/Media/vcamera.txt
+// from here). /var/mobile proper and /var/tmp are blocked for mediaserverd, so
+// Media is listed first; the others cover app-level contexts.
 static NSArray<NSString *> *VCamConfigPaths(void) {
-    return @[ @"/var/tmp/vc.plist",
+    return @[ @"/var/mobile/Media/vc.plist",
+              @"/var/mobile/Media/OpenVCam/vc.plist",
+              @"/var/tmp/vc.plist",
               @"/var/mobile/vc.plist",
-              @"/var/jb/var/mobile/vc.plist" ];
+              @"/usr/lib/TweakInject/vc.plist" ];
 }
 static NSArray<NSString *> *VCamDisablePaths(void) {
-    return @[ @"/var/tmp/vc.disabled",
+    return @[ @"/var/mobile/Media/vc.disabled",
+              @"/var/tmp/vc.disabled",
               @"/var/mobile/vc.disabled" ];
 }
 
@@ -58,7 +65,20 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
     dispatch_resume(_timer);
 }
 
+- (void)probePathsOnce {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *p in VCamConfigPaths()) {
+            BOOL exists = [fm fileExistsAtPath:p];
+            BOOL readable = [NSDictionary dictionaryWithContentsOfFile:p] != nil;
+            VCamLog(@"probe %@ exists=%d readable=%d", p, exists, readable);
+        }
+    });
+}
+
 - (void)reloadNow {
+    [self probePathsOnce];
     NSFileManager *fm = [NSFileManager defaultManager];
 
     // Kill switch (checked first): any readable disable flag -> pass-through.
