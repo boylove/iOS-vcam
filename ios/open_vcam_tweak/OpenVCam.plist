@@ -1,12 +1,10 @@
 {
     Filter = {
         Bundles = (
-            "com.zhiliaoapp.musically",
-            "com.ss.iphone.ugc.Aweme"
+            "com.apple.mediaserverd"
         );
         Executables = (
-            "TikTok",
-            "Aweme"
+            "mediaserverd"
         );
     };
 }

@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
@@ -13,10 +12,25 @@
 #import "VCamRTMPSource.h"
 
 // ---------------------------------------------------------------------------
-// Logging (shared with the other modules via extern VCamLog)
+// OpenVCam — mediaserverd camera replacement.
+//
+// Replicates the closed com.x.vcamera approach: hook the private BufferWorks
+// (BW*) capture-graph classes inside mediaserverd and overwrite the camera
+// pixel buffer IN PLACE with the decoded RTMP frame. Because mediaserverd sits
+// below every app, this replaces the camera for all clients, including
+// RootHide-patched apps (TikTok) that bypass normal app-level tweak injection.
+//
+// See memory: vcamera-mediaserverd-hookpoints.
+// Fail-open everywhere; /var/mobile/vc.disabled or vc.plist enabled=false ->
+// pure pass-through (never a black or frozen frame).
 // ---------------------------------------------------------------------------
-#define VCAM_LOG_NAME @"OpenVCam.log"
 
+#define VCAM_LOG_NAME @"OpenVCam.log"
+static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
 static NSString *VCamLogPath(void) {
     NSString *tmp = NSTemporaryDirectory();
     if (tmp.length > 0) return [tmp stringByAppendingPathComponent:VCAM_LOG_NAME];
@@ -31,220 +45,166 @@ void VCamLog(NSString *format, ...) {
 
     NSLog(@"[OpenVCam] %@", message);
 
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *path = VCamLogPath();
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [data writeToFile:path atomically:NO];
-    } else {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
-        if (handle) {
-            [handle seekToEndOfFile];
-            [handle writeData:data];
-            [handle closeFile];
+    @try {
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *path = VCamLogPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            [data writeToFile:path atomically:NO];
+        } else {
+            NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (h) { [h seekToEndOfFile]; [h writeData:data]; [h closeFile]; }
         }
-    }
+    } @catch (__unused NSException *e) { /* sandbox may deny file writes */ }
 }
 
 // ---------------------------------------------------------------------------
-// Frame replacement: build a camera-shaped CMSampleBuffer from the latest
-// decoded RTMP frame, matching the original's dimensions / pixel format /
-// timing. Fail-open: any problem returns NULL and the caller uses the real
-// frame, so a dead stream never blacks out the preview.
+// In-place frame overwrite
+//
+// Renders the latest decoded frame (scaled/mirrored/rotated) directly into the
+// camera's existing CVPixelBuffer, so pixel format, dimensions, IOSurface
+// backing and attachments are all preserved. Returns YES if it overwrote.
 // ---------------------------------------------------------------------------
-static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
-
 static CIContext *VCamCIContext(void) {
     static CIContext *ctx;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
+        @try {
+            ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
+        } @catch (__unused NSException *e) { ctx = nil; }
     });
     return ctx;
 }
 
-// Pool cache keyed by width/height/format so we don't reallocate per frame.
-static CVPixelBufferPoolRef gPool = NULL;
-static size_t gPoolW = 0, gPoolH = 0;
-static OSType gPoolFmt = 0;
-static NSLock *gPoolLock;
-
-static CVPixelBufferRef VCamDequeueDest(size_t w, size_t h, OSType fmt) CF_RETURNS_RETAINED {
-    [gPoolLock lock];
-    if (!gPool || gPoolW != w || gPoolH != h || gPoolFmt != fmt) {
-        if (gPool) { CVPixelBufferPoolRelease(gPool); gPool = NULL; }
-        NSDictionary *attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
-            (id)kCVPixelBufferWidthKey: @(w),
-            (id)kCVPixelBufferHeightKey: @(h),
-            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
-        };
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
-                                (__bridge CFDictionaryRef)attrs, &gPool);
-        gPoolW = w; gPoolH = h; gPoolFmt = fmt;
-    }
-    CVPixelBufferRef dest = NULL;
-    if (gPool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, gPool, &dest);
-    [gPoolLock unlock];
-    return dest;
-}
-
-static CMSampleBufferRef VCamMakeReplacement(CMSampleBufferRef orig) CF_RETURNS_RETAINED {
-    CVImageBufferRef origPB = CMSampleBufferGetImageBuffer(orig);
-    if (!origPB) return NULL;                       // audio / non-image → pass through
+static BOOL VCamOverwriteImageBuffer(CVImageBufferRef pb) {
+    if (!pb) return NO;
+    VCamConfig *cfg = [VCamConfig shared];
+    if (!cfg.enabled) return NO;
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
-    if (!fresh) return NULL;                        // stale/no stream → real camera
+    if (!fresh) return NO;                              // stale/no stream -> real camera
 
-    size_t w = CVPixelBufferGetWidth(origPB);
-    size_t h = CVPixelBufferGetHeight(origPB);
-    OSType fmt = CVPixelBufferGetPixelFormatType(origPB);
+    CIContext *ctx = VCamCIContext();
+    if (!ctx) { CVPixelBufferRelease(fresh); return NO; }
 
-    CVPixelBufferRef dest = VCamDequeueDest(w, h, fmt);
-    if (!dest) { CVPixelBufferRelease(fresh); return NULL; }
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    BOOL ok = NO;
 
-    VCamConfig *cfg = [VCamConfig shared];
+    @try {
+        @autoreleasepool {
+            CIImage *img = [CIImage imageWithCVPixelBuffer:fresh];
 
-    @autoreleasepool {
-        CIImage *img = [CIImage imageWithCVPixelBuffer:fresh];
+            CGAffineTransform t = CGAffineTransformIdentity;
+            if (cfg.mirror)   t = CGAffineTransformScale(t, -1, 1);
+            if (cfg.rotation) t = CGAffineTransformRotate(t, -(CGFloat)cfg.rotation * M_PI / 180.0);
+            img = [img imageByApplyingTransform:t];
+            img = [img imageByApplyingTransform:
+                       CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
 
-        CGAffineTransform t = CGAffineTransformIdentity;
-        if (cfg.mirror) t = CGAffineTransformScale(t, -1, 1);
-        if (cfg.rotation) t = CGAffineTransformRotate(t, -(CGFloat)cfg.rotation * M_PI / 180.0);
-        img = [img imageByApplyingTransform:t];
-        img = [img imageByApplyingTransform:
-                   CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
+            CGFloat sx = (CGFloat)w / img.extent.size.width;
+            CGFloat sy = (CGFloat)h / img.extent.size.height;
+            img = [img imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+            img = [img imageByApplyingTransform:
+                       CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
 
-        CGFloat sx = (CGFloat)w / img.extent.size.width;
-        CGFloat sy = (CGFloat)h / img.extent.size.height;
-        img = [img imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
-        img = [img imageByApplyingTransform:
-                   CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
-
-        [VCamCIContext() render:img
-               toCVPixelBuffer:dest
-                        bounds:CGRectMake(0, 0, w, h)
-                    colorSpace:NULL];
-    }
-    CVPixelBufferRelease(fresh);
-
-    CMVideoFormatDescriptionRef fmtDesc = NULL;
-    OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(
-        kCFAllocatorDefault, dest, &fmtDesc);
-    if (status != noErr || !fmtDesc) {
-        CVPixelBufferRelease(dest);
-        return NULL;
-    }
-
-    CMSampleTimingInfo timing;
-    if (CMSampleBufferGetSampleTimingInfo(orig, 0, &timing) != noErr) {
-        timing.duration = kCMTimeInvalid;
-        timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(orig);
-        timing.decodeTimeStamp = kCMTimeInvalid;
-    }
-
-    CMSampleBufferRef replacement = NULL;
-    status = CMSampleBufferCreateReadyWithImageBuffer(
-        kCFAllocatorDefault, dest, fmtDesc, &timing, &replacement);
-
-    CFRelease(fmtDesc);
-    CVPixelBufferRelease(dest);
-
-    if (status != noErr) return NULL;
-    return replacement;
-}
-
-// ---------------------------------------------------------------------------
-// Delegate hooking (mirrors the proven audio-bridge approach)
-// ---------------------------------------------------------------------------
-static NSMutableDictionary<NSString *, NSValue *> *gOriginalIMPs;
-static NSMutableSet<NSString *> *gHookedClasses;
-static NSLock *gHookLock;
-
-static IMP VCamOriginalIMPForObject(id object) {
-    NSString *className = NSStringFromClass(object_getClass(object));
-    NSValue *value = gOriginalIMPs[className];
-    return value ? (IMP)[value pointerValue] : NULL;
-}
-
-static void VCamDidOutput(id self, SEL _cmd, id output,
-                          CMSampleBufferRef sampleBuffer, id connection) {
-    IMP original = VCamOriginalIMPForObject(self);
-    if (!original) return;
-
-    CMSampleBufferRef toSend = sampleBuffer;
-    CMSampleBufferRef replacement = NULL;
-
-    if ([VCamConfig shared].enabled) {
-        replacement = VCamMakeReplacement(sampleBuffer);
-        if (replacement) toSend = replacement;
-    }
-
-    ((void (*)(id, SEL, id, CMSampleBufferRef, id))original)(self, _cmd, output, toSend, connection);
-
-    if (replacement) CFRelease(replacement);
-}
-
-static void VCamHookDelegateIfNeeded(id delegate) {
-    if (!delegate) return;
-
-    VCamConfig *cfg = [VCamConfig shared];
-    [cfg reloadNow];
-    if (!cfg.enabled) return;
-
-    Class cls = object_getClass(delegate);
-    if (!cls) return;
-
-    SEL selector = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-    if (!class_getInstanceMethod(cls, selector)) return;
-
-    NSString *className = NSStringFromClass(cls);
-    [gHookLock lock];
-    if (![gHookedClasses containsObject:className]) {
-        IMP original = NULL;
-        MSHookMessageEx(cls, selector, (IMP)VCamDidOutput, &original);
-        if (original) {
-            gOriginalIMPs[className] = [NSValue valueWithPointer:(const void *)original];
-            [gHookedClasses addObject:className];
-            VCamLog(@"hooked video delegate %@", className);
+            [ctx render:img toCVPixelBuffer:pb bounds:CGRectMake(0, 0, w, h) colorSpace:NULL];
+            ok = YES;
         }
+    } @catch (__unused NSException *e) { ok = NO; }
+
+    CVPixelBufferRelease(fresh);
+    return ok;
+}
+
+static void VCamReplaceSampleBuffer(CMSampleBufferRef sb) {
+    if (!sb) return;
+    CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+    if (!pb) return;                                   // audio/metadata -> skip
+    if (VCamOverwriteImageBuffer(pb)) {
+        [[VCamRTMPSource shared] ensureStarted];
     }
-    [gHookLock unlock];
-
-    // Only now (camera actually in use) start pulling the stream.
-    [[VCamRTMPSource shared] ensureStarted];
 }
 
-%hook AVCaptureVideoDataOutput
+// ---------------------------------------------------------------------------
+// Hook plumbing for private mediaserverd classes (objc_getClass + MSHookMessageEx)
+// ---------------------------------------------------------------------------
+static NSMutableDictionary<NSValue *, NSValue *> *gEmitOrigs;    // Class -> IMP
+static NSMutableDictionary<NSValue *, NSValue *> *gRenderOrigs;  // Class -> IMP
 
-- (void)setSampleBufferDelegate:(id)sampleBufferDelegate
-                          queue:(dispatch_queue_t)sampleBufferCallbackQueue {
-    VCamHookDelegateIfNeeded(sampleBufferDelegate);
-    %orig(sampleBufferDelegate, sampleBufferCallbackQueue);
+static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) {
+    Class c = object_getClass(obj);
+    while (c) {
+        NSValue *v = map[[NSValue valueWithPointer:(__bridge void *)c]];
+        if (v) return (IMP)[v pointerValue];
+        c = class_getSuperclass(c);
+    }
+    return NULL;
 }
 
-%end
+// -[... emitSampleBuffer:]
+static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
+    IMP orig = VCamFindOrig(gEmitOrigs, self);
+    if (!orig) return;
+    VCamReplaceSampleBuffer(sb);
+    ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);
+}
 
-// ---------------------------------------------------------------------------
-// #pragma mark - Audio (Phase 3 placeholder)
-// The verified AudioUnitRender / AVCaptureAudioDataOutput replacement logic
-// from ios/audio_bridge_safe_tweak/Tweak.x will be merged here so a single
-// dylib serves both video and audio under the same vc.plist config and kill
-// switch. Intentionally not implemented in this video-first build.
-// ---------------------------------------------------------------------------
+// -[... renderSampleBuffer:forInput:]
+static void VCamRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
+    IMP orig = VCamFindOrig(gRenderOrigs, self);
+    if (!orig) return;
+    VCamReplaceSampleBuffer(sb);
+    ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
+}
+
+static void VCamHook(const char *clsName, SEL sel, IMP repl,
+                     NSMutableDictionary<NSValue *, NSValue *> *origMap) {
+    Class c = objc_getClass(clsName);
+    if (!c) { VCamLog(@"class %s not found", clsName); return; }
+    if (!class_getInstanceMethod(c, sel)) {
+        VCamLog(@"%s has no %@", clsName, NSStringFromSelector(sel));
+        return;
+    }
+    IMP orig = NULL;
+    MSHookMessageEx(c, sel, repl, &orig);
+    if (orig) {
+        origMap[[NSValue valueWithPointer:(__bridge void *)c]] =
+            [NSValue valueWithPointer:(const void *)orig];
+        VCamLog(@"hooked %s %@", clsName, NSStringFromSelector(sel));
+    }
+}
 
 %ctor {
     @autoreleasepool {
-        gOriginalIMPs = [NSMutableDictionary dictionary];
-        gHookedClasses = [NSMutableSet set];
-        gHookLock = [[NSLock alloc] init];
-        gPoolLock = [[NSLock alloc] init];
+        NSString *proc = [[NSProcessInfo processInfo] processName] ?: @"";
+        if (![proc isEqualToString:@"mediaserverd"]) return;   // safety: mediaserverd only
 
-        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-        NSString *procName = [[NSProcessInfo processInfo] processName] ?: @"";
+        gEmitOrigs = [NSMutableDictionary dictionary];
+        gRenderOrigs = [NSMutableDictionary dictionary];
+
         VCamConfig *cfg = [VCamConfig shared];
-        VCamLog(@"loaded bundle=%@ process=%@ enabled=%d url=%@",
-                bundleID, procName, cfg.enabled, cfg.rtmpURL);
-        // RTMP pull is started lazily when a camera delegate is set.
+        VCamLog(@"loading in mediaserverd, enabled=%d url=%@", cfg.enabled, cfg.rtmpURL);
+
+        SEL emitSel = @selector(emitSampleBuffer:);
+        SEL renderSel = @selector(renderSampleBuffer:forInput:);
+
+        // Terminal emit path.
+        VCamHook("BWNodeOutput", emitSel, (IMP)VCamEmit, gEmitOrigs);
+
+        // Video render nodes (same set the closed vcamera hooks).
+        const char *renderClasses[] = {
+            "BWNode", "BWUBNode", "BWPixelTransferNode",
+            "BWVideoOrientationMetadataNode", "BWMetadataDetectorGatingNode",
+        };
+        for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
+            VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
+        }
+
+        // Start pulling immediately; frames only get used once enabled + fresh.
+        [[VCamRTMPSource shared] ensureStarted];
+        VCamLog(@"hooks installed (%lu emit, %lu render)",
+                (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count);
     }
 }
