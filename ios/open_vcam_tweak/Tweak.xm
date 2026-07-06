@@ -75,11 +75,18 @@ void VCamLog(NSString *format, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// In-place frame overwrite
+// Frame substitution (mirrors the closed vcamera's proven approach).
 //
-// Renders the latest decoded frame (scaled/mirrored/rotated) directly into the
-// camera's existing CVPixelBuffer, so pixel format, dimensions, IOSurface
-// backing and attachments are all preserved. Returns YES if it overwrote.
+// We do NOT mutate the camera's shared CVPixelBuffer in place. Doing that is
+// slow (the stock Camera routes a frame through several capture-graph nodes, so
+// hooking them overwrote each frame multiple times) and, worse, trips the
+// CMCapture PixelTransferSession assertion and crashes mediaserverd the moment
+// the stock Camera records (EXECUTION-PLAN §4.6). The closed vcamera instead
+// renders its frame into its OWN pool buffer and emits a brand-new sample
+// buffer downstream, never touching the camera's buffer — so it neither lags
+// nor crashes. We do the same: render the decoded RTMP frame into a pool buffer
+// matching the camera buffer, wrap it in a fresh CMSampleBuffer carrying the
+// original timing + attachments, and hand that to the original method.
 // ---------------------------------------------------------------------------
 static CIContext *VCamCIContext(void) {
     static CIContext *ctx;
@@ -92,21 +99,58 @@ static CIContext *VCamCIContext(void) {
     return ctx;
 }
 
-static BOOL VCamOverwriteImageBuffer(CVImageBufferRef pb) {
-    if (!pb) return NO;
+// Pool of replacement pixel buffers, matching the current camera buffer's pixel
+// format + dimensions (recreated only when those change).
+static CVPixelBufferPoolRef gPool;
+static size_t gPoolW, gPoolH;
+static OSType gPoolFmt;
+
+static CVPixelBufferRef VCamCopyPoolBuffer(size_t w, size_t h, OSType fmt) {
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
+
+    CVPixelBufferRef out = NULL;
+    [lock lock];
+    if (!gPool || gPoolW != w || gPoolH != h || gPoolFmt != fmt) {
+        if (gPool) { CVPixelBufferPoolRelease(gPool); gPool = NULL; }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey     : @(fmt),
+            (id)kCVPixelBufferWidthKey               : @(w),
+            (id)kCVPixelBufferHeightKey              : @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        };
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                                (__bridge CFDictionaryRef)attrs, &gPool);
+        gPoolW = w; gPoolH = h; gPoolFmt = fmt;
+    }
+    if (gPool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, gPool, &out);
+    [lock unlock];
+    return out;
+}
+
+// Renders the latest decoded frame (scaled/mirrored/rotated) into a fresh pool
+// buffer matching `templatePB`. Returns a retained buffer, or NULL when there
+// is no fresh frame (caller then passes the real camera frame through).
+static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
+    if (!templatePB) return NULL;
     VCamConfig *cfg = [VCamConfig shared];
-    if (!cfg.enabled) return NO;
+    if (!cfg.enabled) return NULL;
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
-    if (!fresh) return NO;                              // stale/no stream -> real camera
+    if (!fresh) return NULL;                              // stale/no stream -> real camera
 
     CIContext *ctx = VCamCIContext();
-    if (!ctx) { CVPixelBufferRelease(fresh); return NO; }
+    if (!ctx) { CVPixelBufferRelease(fresh); return NULL; }
 
-    size_t w = CVPixelBufferGetWidth(pb);
-    size_t h = CVPixelBufferGetHeight(pb);
+    size_t w = CVPixelBufferGetWidth(templatePB);
+    size_t h = CVPixelBufferGetHeight(templatePB);
+    OSType fmt = CVPixelBufferGetPixelFormatType(templatePB);
+
+    CVPixelBufferRef out = VCamCopyPoolBuffer(w, h, fmt);
+    if (!out) { CVPixelBufferRelease(fresh); return NULL; }
+
     BOOL ok = NO;
-
     @try {
         @autoreleasepool {
             CIImage *img = [CIImage imageWithCVPixelBuffer:fresh];
@@ -129,31 +173,67 @@ static BOOL VCamOverwriteImageBuffer(CVImageBufferRef pb) {
             img = [img imageByApplyingTransform:
                        CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
 
-            [ctx render:img toCVPixelBuffer:pb bounds:CGRectMake(0, 0, w, h) colorSpace:NULL];
+            [ctx render:img toCVPixelBuffer:out bounds:CGRectMake(0, 0, w, h) colorSpace:NULL];
             ok = YES;
         }
     } @catch (__unused NSException *e) { ok = NO; }
 
     CVPixelBufferRelease(fresh);
-    return ok;
+    if (!ok) { CVPixelBufferRelease(out); return NULL; }
+    return out;
 }
 
-static void VCamReplaceSampleBuffer(CMSampleBufferRef sb) {
-    if (!sb) return;
-    CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (!pb) return;                                   // audio/metadata -> skip
+// Builds a replacement CMSampleBuffer (fresh frame + original timing/attachments)
+// or NULL. Caller passes it to the original method and then CFReleases it.
+static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef origSB) {
+    CVImageBufferRef origPB = CMSampleBufferGetImageBuffer(origSB);
+    if (!origPB) return NULL;
 
-    BOOL did = VCamOverwriteImageBuffer(pb);
-    if (did) [[VCamRTMPSource shared] ensureStarted];
-#if VCAM_DEBUG
-    static uint64_t calls = 0, overwrote = 0;
-    calls++;
-    if (did) overwrote++;
-    if ((calls % 120) == 0) {
-        VCamDebugLog(@"stats: videoBuffers=%llu overwrote=%llu (fresh frames %@)",
-                     calls, overwrote, overwrote ? @"present" : @"MISSING");
+    CVPixelBufferRef out = VCamCopyReplacementBuffer(origPB);
+    if (!out) return NULL;
+
+    [[VCamRTMPSource shared] ensureStarted];
+
+    CMSampleBufferRef newSB = NULL;
+    CMVideoFormatDescriptionRef fd = NULL;
+    OSStatus s = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd);
+    if (s == noErr && fd) {
+        CMSampleTimingInfo timing;
+        if (CMSampleBufferGetSampleTimingInfo(origSB, 0, &timing) != noErr) {
+            timing.duration = kCMTimeInvalid;
+            timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(origSB);
+            timing.decodeTimeStamp = kCMTimeInvalid;
+        }
+        s = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, out, true, NULL, NULL,
+                                               fd, &timing, &newSB);
     }
-#endif
+    if (fd) CFRelease(fd);
+    CVPixelBufferRelease(out);
+    if (s != noErr || !newSB) return NULL;
+
+    // Propagate the per-sample attachments (orientation / dependency flags etc.)
+    // so downstream treats our frame exactly like the camera's.
+    CFArrayRef src = CMSampleBufferGetSampleAttachmentsArray(origSB, false);
+    if (src && CFArrayGetCount(src) > 0) {
+        CFArrayRef dst = CMSampleBufferGetSampleAttachmentsArray(newSB, true);
+        if (dst && CFArrayGetCount(dst) > 0) {
+            CFDictionaryRef s0 = (CFDictionaryRef)CFArrayGetValueAtIndex(src, 0);
+            CFMutableDictionaryRef d0 = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(dst, 0);
+            if (s0 && d0) {
+                CFIndex n = CFDictionaryGetCount(s0);
+                if (n > 0) {
+                    const void **keys = (const void **)malloc(sizeof(void *) * (size_t)n);
+                    const void **vals = (const void **)malloc(sizeof(void *) * (size_t)n);
+                    if (keys && vals) {
+                        CFDictionaryGetKeysAndValues(s0, keys, vals);
+                        for (CFIndex i = 0; i < n; i++) CFDictionarySetValue(d0, keys[i], vals[i]);
+                    }
+                    free(keys); free(vals);
+                }
+            }
+        }
+    }
+    return newSB;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,20 +252,31 @@ static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) 
     return NULL;
 }
 
-// -[... emitSampleBuffer:]
+// -[... emitSampleBuffer:] — substitute a fresh sample buffer, never mutate sb.
 static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     IMP orig = VCamFindOrig(gEmitOrigs, self);
     if (!orig) return;
-    VCamReplaceSampleBuffer(sb);
-    ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);
+    CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
+                                ? VCamCreateReplacementSampleBuffer(sb) : NULL;
+    ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, rep ?: sb);
+    if (rep) CFRelease(rep);
+#if VCAM_DEBUG
+    static uint64_t calls = 0, repl = 0;
+    calls++; if (rep) repl++;
+    if ((calls % 120) == 0) VCamDebugLog(@"stats: emits=%llu replaced=%llu", calls, repl);
+#endif
 }
 
-// -[... renderSampleBuffer:forInput:]
+// -[... renderSampleBuffer:forInput:] — only installed when VCAM_HOOK_RENDER_NODES
+// is set (off by default; emit-only is enough and avoids the record-path crash).
+__attribute__((unused))
 static void VCamRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     IMP orig = VCamFindOrig(gRenderOrigs, self);
     if (!orig) return;
-    VCamReplaceSampleBuffer(sb);
-    ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
+    CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
+                                ? VCamCreateReplacementSampleBuffer(sb) : NULL;
+    ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, rep ?: sb, input);
+    if (rep) CFRelease(rep);
 }
 
 // -[FigCaptureSourceConfiguration sourcePosition] — records which physical
@@ -238,19 +329,34 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         VCamLog(@"loading in mediaserverd, enabled=%d url=%@", cfg.enabled, cfg.rtmpURL);
 
         SEL emitSel = @selector(emitSampleBuffer:);
-        SEL renderSel = @selector(renderSampleBuffer:forInput:);
 
-        // Terminal emit path.
+        // Terminal emit path only. This is the single point where a node emits
+        // its finished frame to every downstream consumer (preview AND the movie
+        // recorder), so overwriting here replaces the frame for all of them with
+        // exactly ONE CIContext render per frame.
+        //
+        // We deliberately do NOT hook the intermediate renderSampleBuffer: nodes
+        // (BWNode/BWUBNode/BWPixelTransferNode) any more:
+        //   * The stock Camera routes each frame through several of them, so
+        //     hooking them overwrote the same frame 3-4x/frame -> GPU-bound,
+        //     choppy preview.
+        //   * BWPixelTransferNode is the recording-path format/resolution
+        //     converter; overwriting its buffer trips the CMCapture
+        //     PixelTransferSession assertion and crashes mediaserverd the moment
+        //     the stock Camera switches to video/record (EXECUTION-PLAN §4.6).
+        // Set VCAM_HOOK_RENDER_NODES=1 to restore the old behaviour for testing.
         VCamHook("BWNodeOutput", emitSel, (IMP)VCamEmit, gEmitOrigs);
 
-        // Video-carrying render nodes only (metadata/orientation nodes skipped
-        // to minimise pipeline interference).
-        const char *renderClasses[] = {
-            "BWNode", "BWUBNode", "BWPixelTransferNode",
-        };
+#ifndef VCAM_HOOK_RENDER_NODES
+#define VCAM_HOOK_RENDER_NODES 0
+#endif
+#if VCAM_HOOK_RENDER_NODES
+        SEL renderSel = @selector(renderSampleBuffer:forInput:);
+        const char *renderClasses[] = { "BWNode", "BWUBNode", "BWPixelTransferNode" };
         for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
             VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
         }
+#endif
 
         // Front/back detection for auto-mirror (config files unreadable here).
         VCamHookSourcePosition();

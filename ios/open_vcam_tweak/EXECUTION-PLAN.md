@@ -114,7 +114,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 - [ ] **6-e 沙盒可达的开关/配置(可选)**:用 Darwin notify(`notify_set_state`/`notify_get_state`,64 位可编码 enabled/mirror/rotation 等 flag)或 mach IPC,让配置/kill-switch 在 mediaserverd 里可控;或注入 SpringBoard 读 vc.plist 再经 IPC 传入(vcamera 疑似此法)。
 - [ ] **6-f 拍照替换**:hook `BWPhotoEncoderNode renderSampleBuffer:forInput:` 等。
 - [ ] **6-g 健壮性**:保宽高比选项(当前拉伸);CIContext 预热移出采集线程;拉流线程相机空闲时可停。
-- [x] **P3 音频并入**(v0.2.0):`VCamAudio.x`(移植自 `ios/audio_bridge_safe_tweak`,逐字保留已验证逻辑)并进同一 dylib。**只注入 TikTok**(其 `%ctor` 非 TikTok 即早退),绝不进 mediaserverd/原相机——所以不会引发 4.5 的原相机拍照→拍视频卡死。plist filter 加 `com.zhiliaoapp.musically`;Makefile 加 `AudioToolbox/AudioUnit`;control 升 0.2.0 并 `Conflicts` 掉会碰 mediaserverd 音频的系统包(`com.iosvcam.audiobridge` / `.system-hook` / `.media-active`)+ `Replaces` 独立 safe 包。**装前须先卸载会卡死原相机的系统音频包**(dpkg Conflicts 会强制)。
+- [x] **P3 音频并入 —— 全局 mediaserverd 版**(v0.3.0,当前方向):用户要求音频也像视频一样全局、原相机也生效,不只 TikTok。故 v0.2.0 的 app 级 `VCamAudio.x`(只注入 TikTok,靠 RootHide `.roothidepatch`+pkgmirror 才注入,已弃)**被替换**为 `VCamAudioMS.x`(移植自 `ios/audio_bridge_media_active_tweak`):在 **mediaserverd** 里全局 hook `AudioUnitRender`,无锁环形缓冲+抖动缓冲的实时安全实现,从 PC 音频桥 `127.10.10.10:1936` 拉 PCM(IAF1 协议,与视频的 1935/RTMP 独立),替换所有采集客户端(原相机/TikTok/全部 App)的麦克风。fail-open。plist 回到 **mediaserverd-only**(不再需要 TikTok app 注入 / RootHide 那套)。Makefile 用 `AudioToolbox`(AudioUnitRender/GetProperty 由它提供,**不要单独连 AudioUnit framework——iOS 无此独立 framework,会 ld 失败**)。postinst 额外 `killall videodecoderd`(重置解码池,避免装后首帧 1100,见 4.3)。control 升 0.3.0,`Conflicts/Replaces` 全套独立音频包。**风险**:原相机拍照→拍视频是黑屏/卡死最高危路径(4.5/4.6),上次卡死疑似多个音频包并存所致,现只留这一个 fail-open 钩子;万一卡死靠 `dpkg -r + killall mediaserverd` 恢复(沙盒可能读不到禁用开关)。**待装机验证原相机稳定性。**
 
 ---
 
@@ -153,6 +153,6 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
 | **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | ⬜ 待做(6-d 待肉眼确认) |
-| **M5** | 音频并入(视频+音频一个 deb) | ✅ 完成(v0.2.0,VCamAudio.x 仅 TikTok) |
+| **M5** | 音频并入(视频+音频一个 deb) | 🔶 v0.3.0 改全局 mediaserverd 音频(原相机也生效),待装机验证原相机稳定性 |
 
 **推进节奏**:每步验证、汇报;动设备的写操作先说明、可回退。

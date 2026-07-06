@@ -6,13 +6,14 @@ export THEOS_PACKAGE_ARCH := iphoneos-arm64e
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME := OpenVCam
-# All hooks live in one dylib, all gated to mediaserverd by their %ctor:
-#   Tweak.xm       - video: overwrite the capture-graph pixel buffer in place
-#   VCamAudioMS.x  - audio: global AudioUnitRender replacement (RT-safe, fail-open)
-OpenVCam_FILES := Tweak.xm VCamAudioMS.x VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
+# Video (Tweak.xm) hooks mediaserverd's capture graph and SUBSTITUTES a fresh
+# sample buffer downstream (never mutates the camera's buffer), like the closed
+# vcamera. Audio (VCamAudioMS.x) is temporarily OUT of the build while the video
+# substitution path is verified against stock-Camera recording — re-add it once
+# stock Camera records cleanly.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
-# AudioUnit has no standalone framework on iOS; AudioUnitRender/GetProperty come via AudioToolbox.
-OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo CoreImage VideoToolbox AudioToolbox
+OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo CoreImage VideoToolbox
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."
