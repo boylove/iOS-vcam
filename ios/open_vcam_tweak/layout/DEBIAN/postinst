@@ -1,5 +1,8 @@
 #!/bin/sh
-# OpenVCam hooks mediaserverd's capture graph (like the original vcamera).
-# Restart mediaserverd so the tweak loads; it respawns automatically.
+# Video: OpenVCam hooks mediaserverd's capture graph (like the original vcamera),
+# so restart mediaserverd to load it; it respawns automatically.
 killall -9 mediaserverd 2>/dev/null || true
+# Audio: the app-level bridge loads into TikTok on next launch. Close it so the
+# merged audio hook is picked up (harmless if TikTok isn't running).
+killall TikTok 2>/dev/null || true
 exit 0

@@ -1,11 +1,11 @@
 Package: com.iosvcam.opencam
 Name: iOS-VCAM OpenCam
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm64e
-Description: Open-source, editable virtual camera tweak. Video-first reimplementation of the closed com.x.vcamera: pulls an RTMP stream on-device, decodes H264 via VideoToolbox, and replaces AVCaptureVideoDataOutput frames. Fail-open with a /var/mobile/vc.disabled kill switch.
+Description: Open-source, editable virtual camera + audio tweak. Video: pulls an RTMP stream on-device, decodes H264 via VideoToolbox, and overwrites mediaserverd's capture-graph frames in place (works in RootHide-patched apps). Front camera auto-mirrors. Audio: app-level TikTok-only replacement merged in (never hooks the stock Camera / mediaserverd audio, so it cannot cause the photo->video freeze). Fail-open with a /var/mobile/vc.disabled kill switch.
 Maintainer: iOS-VCAM
 Author: iOS-VCAM
 Section: Tweaks
 Depends: mobilesubstrate (>= 0.9.5000)
-Conflicts: com.x.vcamera
-Replaces: com.x.vcamera
+Conflicts: com.x.vcamera, com.iosvcam.audiobridge, com.iosvcam.audiobridge.system-hook, com.iosvcam.audiobridge.media-active, com.iosvcam.audiobridge.safe
+Replaces: com.x.vcamera, com.iosvcam.audiobridge.safe

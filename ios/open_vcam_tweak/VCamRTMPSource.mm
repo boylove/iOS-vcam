@@ -53,15 +53,15 @@
     size_t bodyLen = len - 5;
 
     if (pktType == 0) {
+#if VCAM_DEBUG
         const uint8_t *b = body;
-        VCamLog(@"rtmp: seq header bodyLen=%zu bytes=%02x %02x %02x %02x %02x %02x",
-                bodyLen,
-                bodyLen>0?b[0]:0, bodyLen>1?b[1]:0, bodyLen>2?b[2]:0,
-                bodyLen>3?b[3]:0, bodyLen>4?b[4]:0, bodyLen>5?b[5]:0);
+        VCamDebugLog(@"rtmp: seq header bodyLen=%zu bytes=%02x %02x %02x %02x %02x %02x",
+                     bodyLen,
+                     bodyLen>0?b[0]:0, bodyLen>1?b[1]:0, bodyLen>2?b[2]:0,
+                     bodyLen>3?b[3]:0, bodyLen>4?b[4]:0, bodyLen>5?b[5]:0);
+#endif
         NSData *record = [NSData dataWithBytes:body length:bodyLen];
-        if ([self.decoder configureWithAVCDecoderConfigurationRecord:record]) {
-            VCamLog(@"rtmp: AVC sequence header applied");
-        } else {
+        if (![self.decoder configureWithAVCDecoderConfigurationRecord:record]) {
             VCamLog(@"rtmp: AVC sequence header parse failed");
         }
     } else if (pktType == 1) {

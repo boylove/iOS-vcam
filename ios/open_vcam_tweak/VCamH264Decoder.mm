@@ -83,6 +83,16 @@
         return NO;
     }
 
+    // Session reuse: many encoders re-send the AVC sequence header on every GOP.
+    // If SPS/PPS and the NAL length size are unchanged and we already have a live
+    // session, keep it — rebuilding each time is wasteful and repeatedly
+    // creating/destroying VT sessions risks the decoder-pool exhaustion (err 1100)
+    // documented in EXECUTION-PLAN §4.3.
+    if (_session && _formatDesc && naluLengthSize == _naluLengthSize &&
+        [sps isEqualToData:_sps] && [pps isEqualToData:_pps]) {
+        return YES;
+    }
+
     _sps = sps;
     _pps = pps;
     _naluLengthSize = naluLengthSize;
@@ -105,13 +115,15 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         VCamLog(@"decoder: output status=%d imageBuffer=%p", (int)status, imageBuffer);
         return;
     }
+#if VCAM_DEBUG
     static uint64_t produced = 0;
     produced++;
     if (produced == 1 || (produced % 120) == 0) {
-        VCamLog(@"decoder: produced %llu frames (%zux%zu)", produced,
-                CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
-                CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
+        VCamDebugLog(@"decoder: produced %llu frames (%zux%zu)", produced,
+                     CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
+                     CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
     }
+#endif
     [[VCamFrameStore shared] setLatestFrame:(CVPixelBufferRef)imageBuffer];
 }
 

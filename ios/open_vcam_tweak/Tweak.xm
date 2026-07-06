@@ -29,6 +29,20 @@
 #define VCAM_LOG_NAME @"OpenVCam.log"
 static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 
+// Front-camera auto-mirror. mediaserverd's sandbox blocks every config file
+// (EXECUTION-PLAN §4.4), so mirroring can't be driven by vc.plist. Instead we
+// track the active capture source position (hooked below) and mirror the
+// injected frame horizontally on the front camera, matching a real selfie.
+// Set to 0 (or -DVCAM_FRONT_AUTOMIRROR=0) if the desired orientation is the
+// opposite — this is the one knob to flip after a visual check.
+#ifndef VCAM_FRONT_AUTOMIRROR
+#define VCAM_FRONT_AUTOMIRROR 1
+#endif
+
+// AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
+// FigCaptureSourceConfiguration -sourcePosition hook; read on the capture path.
+static volatile long gSourcePosition = 0;
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -97,8 +111,13 @@ static BOOL VCamOverwriteImageBuffer(CVImageBufferRef pb) {
         @autoreleasepool {
             CIImage *img = [CIImage imageWithCVPixelBuffer:fresh];
 
+            // Mirror on the front camera automatically (config files are
+            // unreadable in mediaserverd), OR-ed with any explicit cfg.mirror.
+            BOOL frontCamera = (gSourcePosition == 2);
+            BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
+
             CGAffineTransform t = CGAffineTransformIdentity;
-            if (cfg.mirror)   t = CGAffineTransformScale(t, -1, 1);
+            if (shouldMirror) t = CGAffineTransformScale(t, -1, 1);
             if (cfg.rotation) t = CGAffineTransformRotate(t, -(CGFloat)cfg.rotation * M_PI / 180.0);
             img = [img imageByApplyingTransform:t];
             img = [img imageByApplyingTransform:
@@ -124,16 +143,17 @@ static void VCamReplaceSampleBuffer(CMSampleBufferRef sb) {
     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;                                   // audio/metadata -> skip
 
+    BOOL did = VCamOverwriteImageBuffer(pb);
+    if (did) [[VCamRTMPSource shared] ensureStarted];
+#if VCAM_DEBUG
     static uint64_t calls = 0, overwrote = 0;
     calls++;
-    if (VCamOverwriteImageBuffer(pb)) {
-        overwrote++;
-        [[VCamRTMPSource shared] ensureStarted];
-    }
+    if (did) overwrote++;
     if ((calls % 120) == 0) {
-        VCamLog(@"stats: videoBuffers=%llu overwrote=%llu (fresh frames %@)",
-                calls, overwrote, overwrote ? @"present" : @"MISSING");
+        VCamDebugLog(@"stats: videoBuffers=%llu overwrote=%llu (fresh frames %@)",
+                     calls, overwrote, overwrote ? @"present" : @"MISSING");
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +186,27 @@ static void VCamRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     if (!orig) return;
     VCamReplaceSampleBuffer(sb);
     ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
+}
+
+// -[FigCaptureSourceConfiguration sourcePosition] — records which physical
+// camera is active (front/back) so the overwrite path can auto-mirror the front
+// camera. Pure observer: always returns the original value, never fails the call.
+static long (*gSourcePositionOrig)(id, SEL) = NULL;
+static long VCamSourcePosition(id self, SEL _cmd) {
+    long pos = gSourcePositionOrig ? gSourcePositionOrig(self, _cmd) : 0;
+    gSourcePosition = pos;
+    return pos;
+}
+
+static void VCamHookSourcePosition(void) {
+    Class c = objc_getClass("FigCaptureSourceConfiguration");
+    SEL sel = @selector(sourcePosition);
+    if (!c || !class_getInstanceMethod(c, sel)) {
+        VCamLog(@"sourcePosition hook unavailable; front auto-mirror off");
+        return;
+    }
+    MSHookMessageEx(c, sel, (IMP)VCamSourcePosition, (IMP *)&gSourcePositionOrig);
+    if (gSourcePositionOrig) VCamLog(@"hooked FigCaptureSourceConfiguration sourcePosition");
 }
 
 static void VCamHook(const char *clsName, SEL sel, IMP repl,
@@ -210,6 +251,9 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
             VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
         }
+
+        // Front/back detection for auto-mirror (config files unreadable here).
+        VCamHookSourcePosition();
 
         // Start pulling immediately; frames only get used once enabled + fresh.
         [[VCamRTMPSource shared] ensureStarted];

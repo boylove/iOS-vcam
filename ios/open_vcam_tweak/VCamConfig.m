@@ -66,15 +66,17 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
 }
 
 - (void)probePathsOnce {
+#if VCAM_DEBUG
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         for (NSString *p in VCamConfigPaths()) {
             BOOL exists = [fm fileExistsAtPath:p];
             BOOL readable = [NSDictionary dictionaryWithContentsOfFile:p] != nil;
-            VCamLog(@"probe %@ exists=%d readable=%d", p, exists, readable);
+            VCamDebugLog(@"probe %@ exists=%d readable=%d", p, exists, readable);
         }
     });
+#endif
 }
 
 - (void)reloadNow {
