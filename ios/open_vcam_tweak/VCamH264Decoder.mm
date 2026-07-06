@@ -49,7 +49,7 @@
     //  then numOfPPS (1 byte) + PPS entries (2-byte len + data).
     const uint8_t *p = (const uint8_t *)record.bytes;
     NSUInteger len = record.length;
-    if (len < 7) return NO;
+    if (len < 7) { VCamLog(@"decoder: config record too short (%lu)", (unsigned long)len); return NO; }
 
     int naluLengthSize = (p[4] & 0x03) + 1;
     NSUInteger idx = 5;
@@ -60,24 +60,28 @@
     for (int i = 0; i < numSPS && idx + 2 <= len; i++) {
         int spsLen = (p[idx] << 8) | p[idx + 1];
         idx += 2;
-        if (idx + spsLen > len) return NO;
+        if (idx + spsLen > len) { VCamLog(@"decoder: SPS overrun len=%lu idx=%lu spsLen=%d", (unsigned long)len, (unsigned long)idx, spsLen); return NO; }
         if (!sps) sps = [NSData dataWithBytes:(p + idx) length:spsLen];
         idx += spsLen;
     }
 
-    if (idx >= len) return NO;
+    if (idx >= len) { VCamLog(@"decoder: no room for PPS len=%lu idx=%lu numSPS=%d", (unsigned long)len, (unsigned long)idx, numSPS); return NO; }
     int numPPS = p[idx];
     idx += 1;
     NSData *pps = nil;
     for (int i = 0; i < numPPS && idx + 2 <= len; i++) {
         int ppsLen = (p[idx] << 8) | p[idx + 1];
         idx += 2;
-        if (idx + ppsLen > len) return NO;
+        if (idx + ppsLen > len) { VCamLog(@"decoder: PPS overrun len=%lu idx=%lu ppsLen=%d", (unsigned long)len, (unsigned long)idx, ppsLen); return NO; }
         if (!pps) pps = [NSData dataWithBytes:(p + idx) length:ppsLen];
         idx += ppsLen;
     }
 
-    if (!sps || !pps) return NO;
+    if (!sps || !pps) {
+        VCamLog(@"decoder: missing sps=%d pps=%d numSPS=%d numPPS=%d len=%lu b0=%02x b4=%02x",
+                sps != nil, pps != nil, numSPS, (int)(idx < len ? p[5] : 0), (unsigned long)len, p[0], p[4]);
+        return NO;
+    }
 
     _sps = sps;
     _pps = pps;
@@ -194,9 +198,9 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     if (status != noErr || !sampleBuffer) return NO;
 
     VTDecodeInfoFlags infoOut = 0;
+    // Synchronous decode: callback fires before this returns — simpler/robust in mediaserverd.
     status = VTDecompressionSessionDecodeFrame(
-        _session, sampleBuffer,
-        kVTDecodeFrame_EnableAsynchronousDecompression, NULL, &infoOut);
+        _session, sampleBuffer, 0, NULL, &infoOut);
     CFRelease(sampleBuffer);
 
     if (status != noErr) {
