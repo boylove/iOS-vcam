@@ -1,8 +1,11 @@
 #!/bin/sh
-# Video: OpenVCam hooks mediaserverd's capture graph (like the original vcamera),
-# so restart mediaserverd to load it; it respawns automatically.
+# OpenVCam hooks mediaserverd's capture graph (video) and AudioUnitRender (audio),
+# both in mediaserverd, like the original vcamera. Restart mediaserverd so the
+# tweak loads; it respawns automatically.
+#
+# Also reset videodecoderd: repeated mediaserverd SIGKILLs can leave its H264
+# decode-session pool exhausted, which makes the first VTDecompressionSessionCreate
+# fail with err 1100 (no video overwrite until reset). See EXECUTION-PLAN §4.3.
+killall -9 videodecoderd 2>/dev/null || true
 killall -9 mediaserverd 2>/dev/null || true
-# Audio: the app-level bridge loads into TikTok on next launch. Close it so the
-# merged audio hook is picked up (harmless if TikTok isn't running).
-killall TikTok 2>/dev/null || true
 exit 0

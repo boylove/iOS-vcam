@@ -1,12 +1,10 @@
 {
     Filter = {
         Bundles = (
-            "com.apple.mediaserverd",
-            "com.zhiliaoapp.musically"
+            "com.apple.mediaserverd"
         );
         Executables = (
-            "mediaserverd",
-            "TikTok"
+            "mediaserverd"
         );
     };
 }
