@@ -1,0 +1,5 @@
+#!/bin/sh
+# OpenVCam installs as a standard rootless MobileSubstrate tweak.
+# Phase 1 is app-level (AVCaptureVideoDataOutput); no mediaserverd kill is needed.
+# Just restart the target camera app to load the tweak.
+exit 0

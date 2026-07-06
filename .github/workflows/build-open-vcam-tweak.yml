@@ -1,0 +1,62 @@
+name: Build OpenVCam Tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'build/**'
+      - 'feature/**'
+    paths:
+      - '.github/workflows/build-open-vcam-tweak.yml'
+      - 'ios/open_vcam_tweak/**'
+      - 'ios/retag_deb_architecture.py'
+      - 'ios/validate_deb.py'
+
+jobs:
+  build-rootless:
+    name: Build rootless arm64e .deb
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install packaging tools
+        run: |
+          brew update
+          brew install dpkg ldid xz
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Build OpenVCam tweak
+        working-directory: ios/open_vcam_tweak
+        run: |
+          make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+          find packages -maxdepth 1 -type f -name '*.deb' -print
+
+      - name: Retag package architecture
+        run: |
+          python3 ios/retag_deb_architecture.py --architecture iphoneos-arm64e ios/open_vcam_tweak/packages/*.deb
+
+      - name: Validate package
+        run: |
+          for deb in ios/open_vcam_tweak/packages/*.deb; do
+            python3 ios/validate_deb.py "$deb"
+            dpkg-deb -I "$deb"
+            dpkg-deb -c "$deb"
+          done
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-vcam-tweak-rootless-deb
+          path: ios/open_vcam_tweak/packages/*.deb
+          if-no-files-found: error
