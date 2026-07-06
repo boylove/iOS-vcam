@@ -4,7 +4,7 @@
 #import "VCamFrameStore.h"
 #import "vcam_rtmp.h"
 
-extern void VCamLog(NSString *format, ...);
+#import "VCamLog.h"
 
 @interface VCamRTMPSource ()
 @property (nonatomic, strong) VCamH264Decoder *decoder;

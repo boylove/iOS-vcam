@@ -1,6 +1,5 @@
 #import "VCamConfig.h"
-
-extern void VCamLog(NSString *format, ...);
+#import "VCamLog.h"
 
 // mediaserverd's sandbox blocks /var/mobile, so the primary config + kill-switch
 // live in /var/tmp (which mediaserverd can read — the audio system hook uses it).

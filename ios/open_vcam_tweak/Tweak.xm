@@ -10,6 +10,7 @@
 #import "VCamConfig.h"
 #import "VCamFrameStore.h"
 #import "VCamRTMPSource.h"
+#import "VCamLog.h"
 
 // ---------------------------------------------------------------------------
 // OpenVCam — mediaserverd camera replacement.

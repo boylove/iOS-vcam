@@ -3,7 +3,7 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 
-extern void VCamLog(NSString *format, ...);
+#import "VCamLog.h"
 
 @implementation VCamH264Decoder {
     CMVideoFormatDescriptionRef _formatDesc;
