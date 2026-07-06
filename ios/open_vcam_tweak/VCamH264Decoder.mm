@@ -141,8 +141,10 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     // pipeline, so VTDecompressionSessionCreate intermittently returns err 1100.
     // Force SOFTWARE decode (cheap for Baseline 720p) to avoid the HW decoder;
     // no destination format is forced (CoreImage converts on overwrite).
+    // Use the raw key string: the named constant is annotated iOS 17+ (compile
+    // error under -Werror) but the underlying key works on iOS 16.
     NSDictionary *swSpec = @{
-        (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO,
+        @"EnableHardwareAcceleratedVideoDecoder": @NO,
     };
     status = VTDecompressionSessionCreate(
         kCFAllocatorDefault, _formatDesc,
