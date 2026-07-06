@@ -1,7 +1,12 @@
 {
     Filter = {
-        Classes = (
-            "AVCaptureVideoDataOutput"
+        Bundles = (
+            "com.zhiliaoapp.musically",
+            "com.ss.iphone.ugc.Aweme"
+        );
+        Executables = (
+            "TikTok",
+            "Aweme"
         );
     };
 }
