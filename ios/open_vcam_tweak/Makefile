@@ -10,7 +10,8 @@ TWEAK_NAME := OpenVCam
 # dylib; each %ctor self-gates by process, so they never run in the wrong place.
 OpenVCam_FILES := Tweak.xm VCamAudio.x VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
-OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo CoreImage VideoToolbox AudioToolbox AudioUnit
+# AudioUnit has no standalone framework on iOS; its headers/symbols come via AudioToolbox.
+OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo CoreImage VideoToolbox AudioToolbox
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."
