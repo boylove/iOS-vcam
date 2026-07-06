@@ -164,7 +164,7 @@ static NSLock *gHookLock;
 static IMP VCamOriginalIMPForObject(id object) {
     NSString *className = NSStringFromClass(object_getClass(object));
     NSValue *value = gOriginalIMPs[className];
-    return value ? [value pointerValue] : NULL;
+    return value ? (IMP)[value pointerValue] : NULL;
 }
 
 static void VCamDidOutput(id self, SEL _cmd, id output,
@@ -204,7 +204,7 @@ static void VCamHookDelegateIfNeeded(id delegate) {
         IMP original = NULL;
         MSHookMessageEx(cls, selector, (IMP)VCamDidOutput, &original);
         if (original) {
-            gOriginalIMPs[className] = [NSValue valueWithPointer:original];
+            gOriginalIMPs[className] = [NSValue valueWithPointer:(const void *)original];
             [gHookedClasses addObject:className];
             VCamLog(@"hooked video delegate %@", className);
         }
