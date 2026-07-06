@@ -97,7 +97,17 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     (void)infoFlags;
     (void)presentationTimeStamp;
     (void)presentationDuration;
-    if (status != noErr || imageBuffer == NULL) return;
+    if (status != noErr || imageBuffer == NULL) {
+        VCamLog(@"decoder: output status=%d imageBuffer=%p", (int)status, imageBuffer);
+        return;
+    }
+    static uint64_t produced = 0;
+    produced++;
+    if (produced == 1 || (produced % 120) == 0) {
+        VCamLog(@"decoder: produced %llu frames (%zux%zu)", produced,
+                CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
+                CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
+    }
     [[VCamFrameStore shared] setLatestFrame:(CVPixelBufferRef)imageBuffer];
 }
 

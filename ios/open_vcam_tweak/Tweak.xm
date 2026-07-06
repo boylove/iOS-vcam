@@ -123,8 +123,16 @@ static void VCamReplaceSampleBuffer(CMSampleBufferRef sb) {
     if (!sb) return;
     CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
     if (!pb) return;                                   // audio/metadata -> skip
+
+    static uint64_t calls = 0, overwrote = 0;
+    calls++;
     if (VCamOverwriteImageBuffer(pb)) {
+        overwrote++;
         [[VCamRTMPSource shared] ensureStarted];
+    }
+    if ((calls % 120) == 0) {
+        VCamLog(@"stats: videoBuffers=%llu overwrote=%llu (fresh frames %@)",
+                calls, overwrote, overwrote ? @"present" : @"MISSING");
     }
 }
 
