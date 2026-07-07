@@ -52,16 +52,39 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
+// Auto-orientation. The decoded OBS frame is portrait (e.g. 1080x1920) but some
+// capture clients hand us a LANDSCAPE camera buffer (the stock Camera in video
+// mode gives ~2112x1188 16:9). Stretching a portrait source into a landscape
+// buffer both distorts it AND leaves the capture pipeline's own 90° transform to
+// rotate it — exactly the "rotated 90° + squashed" stock-Camera recording bug.
+// TikTok hands us a portrait buffer (same orientation as the source), so it looks
+// correct and must NOT be rotated. So we rotate 90° ONLY when the source and the
+// destination buffer disagree on portrait-vs-landscape; matching orientations are
+// left alone. After a 90° rotation 1080x1920 -> 1920x1080, which matches the 16:9
+// buffer aspect, so the distortion disappears too. If the stock-Camera result
+// comes out rotated the WRONG way, flip VCAM_AUTO_ORIENT_DIR to 270.
+#ifndef VCAM_AUTO_ORIENT
+#define VCAM_AUTO_ORIENT 1
+#endif
+#ifndef VCAM_AUTO_ORIENT_DIR
+#define VCAM_AUTO_ORIENT_DIR 90
+#endif
+
 // Still-photo replacement. The closed vcamera also overwrites the photo path
 // (report §2.3: -[<core> modifyPixelBuffer:] on the BWStillImageScalerNode /
-// BWPhotoEncoderNode chain, with a TransitionID dedup mark). Enabled by default
-// so a still capture returns the OBS frame, not the real lens. On THIS device
-// the stock-Camera photo->video transition is the highest-risk crash path
-// (EXECUTION-PLAN §4.6), so it is behind a compile flag: build with
-// -DVCAM_HOOK_PHOTO_NODES=0 to drop back to live-video-only if a still capture
-// ever destabilises the stock Camera. Fail-open regardless.
+// BWPhotoEncoderNode chain, with a TransitionID dedup mark).
+//
+// DISABLED BY DEFAULT after device testing: on THIS device (Dopamine iOS 16.1.2)
+// hooking the photo scaler/encoder nodes and overwriting their buffer in place
+// HANGS mediaserverd on the stock-Camera photo->video switch (the system watchdog
+// then restarts mediaserverd and the frame falls back to the real lens). This is
+// the highest-risk path called out in EXECUTION-PLAN §4.6. The live-video path
+// (BWNodeOutput emitSampleBuffer:) is unaffected and verified working, so we ship
+// video-only. Re-enable for experimentation with -DVCAM_HOOK_PHOTO_NODES=1, but it
+// needs a different approach (the closed vcamera gates on a detected face and uses
+// a dedicated session — replicating that safely is future work).
 #ifndef VCAM_HOOK_PHOTO_NODES
-#define VCAM_HOOK_PHOTO_NODES 1
+#define VCAM_HOOK_PHOTO_NODES 0
 #endif
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
@@ -237,6 +260,22 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     BOOL frontCamera = (gSourcePosition == 2);
     BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
     long rot = ((cfg.rotation % 360) + 360) % 360;
+
+    // Auto-orientation: rotate 90° only when the source and destination disagree
+    // on portrait-vs-landscape (see VCAM_AUTO_ORIENT). The stock Camera in video
+    // mode gives a landscape buffer while the OBS frame is portrait -> rotate;
+    // TikTok gives a portrait buffer -> orientations match -> no rotation. Any
+    // explicit cfg.rotation still wins (adds on top).
+#if VCAM_AUTO_ORIENT
+    if (rot == 0) {
+        size_t cw = CVPixelBufferGetWidth(cameraBuf), ch = CVPixelBufferGetHeight(cameraBuf);
+        size_t sw = CVPixelBufferGetWidth(fresh), sh = CVPixelBufferGetHeight(fresh);
+        BOOL dstLandscape = cw > ch;
+        BOOL srcLandscape = sw > sh;
+        if (dstLandscape != srcLandscape) rot = VCAM_AUTO_ORIENT_DIR;
+    }
+#endif
+
     CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
 
