@@ -115,6 +115,15 @@ static void VCamEnsureSessions(void) {
     dispatch_once(&once, ^{
         gVTLock = [[NSLock alloc] init];
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
+        if (gTransferSession) {
+            // CRITICAL: without a scaling mode, VTPixelTransferSessionTransferImage
+            // FAILS whenever the source (decoded RTMP frame, e.g. 1080x1920) and the
+            // destination (camera buffer, a different size) differ — which is the
+            // normal case. That silent failure => replacement NULL => real camera.
+            // Normal = stretch to fill (matches the previous stretch behaviour).
+            VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
+                                 kVTScalingMode_Normal);
+        }
     });
 }
 
