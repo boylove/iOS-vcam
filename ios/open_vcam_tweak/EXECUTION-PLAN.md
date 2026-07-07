@@ -61,8 +61,8 @@ mediaserverd 进程内 (%ctor 仅当 processName==mediaserverd):
 
 ## 4. 已证实的关键事实与坑（实测）
 
-### 4.1 RootHide 强制 mediaserverd
-RootHide 化的 App 绕过普通注入 → 必须 mediaserverd。mediaserverd 是系统进程,**标准 DynamicLibraries 注入即可,不需要 `.roothidepatch` 符号链接**。
+### 4.1 RootHide 强制 mediaserverd + 注入目录必须是 /usr/lib/TweakInject（实测决定性）
+RootHide 化的 App 绕过普通注入 → 必须 mediaserverd。mediaserverd 是系统进程,不需要 `.roothidepatch` 符号链接。**但**装机实测(设备 UDID 00008101-…,RootHide,`/usr/…` 遍布 `.jbroot` 标记,注入器在 `/usr/lib/libellekit.dylib`):RootHide 的 ElleKit **只扫描 `/usr/lib/TweakInject`**(即 `/Library/MobileSubstrate/DynamicLibraries` 符号链接目标),**从不扫描 rootless deb 装入的 `/var/jb/Library/MobileSubstrate/DynamicLibraries`**。所以 `THEOS_PACKAGE_SCHEME=rootless` 的 dylib 落在 `/var/jb`,架构/签名都对却 `%ctor` 从不运行(无任何 `[OpenVCam]` 日志、显示真实相机)——这才是"没注入"的真因(不是路径外的其它猜测)。**修复**:`postinst` 在 `/usr/lib/TweakInject` 存在时把 dylib+plist 镜像过去(纯 rootless/Dopamine 无此可写目录,guard 跳过);`postrm` 删除。镜像后端到端实测通过:`loading in mediaserverd → hooked BWNodeOutput emitSampleBuffer: → rtmp handshake ok 127.10.10.10:1935 → decoder 1080x1920 → health emits=N replaced=N(100%,xferFail=0)`。见记忆 `roothide-tweakinject-path`。
 
 ### 4.2 需要反向隧道,mediaserverd 才能拉流
 ```
