@@ -56,14 +56,23 @@ jobs:
       - name: Build OpenVCam tweak
         working-directory: ios/open_vcam_tweak
         env:
-          # workflow_dispatch inputs default to '' on push/CI triggers; fall back
-          # to the release defaults (photo hooks on, debug off).
-          HOOK_PHOTO_NODES: ${{ github.event.inputs.hook_photo_nodes || '1' }}
-          VCAM_DEBUG: ${{ github.event.inputs.debug || '0' }}
+          # On push/CI these inputs are '' -> we pass NOTHING for that toggle and
+          # the compiled-in default in Tweak.xm wins (photo hooks OFF: the photo
+          # render-node overwrite GPU-iofence-deadlocks, §4.9). Only an explicit
+          # workflow_dispatch choice overrides it — do NOT re-introduce a `|| '1'`
+          # fallback here, that silently forces photo=1 on every push build.
+          HOOK_PHOTO_NODES: ${{ github.event.inputs.hook_photo_nodes }}
+          VCAM_DEBUG: ${{ github.event.inputs.debug }}
         run: |
-          echo "Building with VCAM_HOOK_PHOTO_NODES=$HOOK_PHOTO_NODES VCAM_DEBUG=$VCAM_DEBUG"
-          make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 \
-            VCAM_HOOK_PHOTO_NODES="$HOOK_PHOTO_NODES" VCAM_DEBUG="$VCAM_DEBUG"
+          MAKE_ARGS=""
+          if [ -n "$HOOK_PHOTO_NODES" ]; then
+            MAKE_ARGS="$MAKE_ARGS VCAM_HOOK_PHOTO_NODES=$HOOK_PHOTO_NODES"
+          fi
+          if [ -n "$VCAM_DEBUG" ]; then
+            MAKE_ARGS="$MAKE_ARGS VCAM_DEBUG=$VCAM_DEBUG"
+          fi
+          echo "Building with overrides: [${MAKE_ARGS:-none — using Tweak.xm compiled defaults}]"
+          make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 $MAKE_ARGS
           find packages -maxdepth 1 -type f -name '*.deb' -print
 
       - name: Retag package architecture
@@ -81,8 +90,9 @@ jobs:
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          # Name carries the photo-hook state so a diagnostic (photo=0) build is
-          # never confused with a release (photo=1) build after download.
-          name: open-vcam-tweak-rootless-deb-photo${{ github.event.inputs.hook_photo_nodes || '1' }}
+          # Name carries the photo-hook state so builds aren't confused after
+          # download. On push (no dispatch input) the code default wins — which is
+          # photo OFF — so label it 'default'; a dispatch build reflects its choice.
+          name: open-vcam-tweak-rootless-deb-photo${{ github.event.inputs.hook_photo_nodes || 'default-off' }}
           path: ios/open_vcam_tweak/packages/*.deb
           if-no-files-found: error
