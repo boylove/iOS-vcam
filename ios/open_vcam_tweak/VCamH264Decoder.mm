@@ -236,6 +236,13 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
 - (BOOL)decodeAccessUnit:(NSData *)avccData
      compositionTimeMs:(int32_t)compositionTimeMs
                  dtsMs:(int64_t)dtsMs {
+#if VCAM_DEBUG
+    static uint64_t auCalls = 0;
+    auCalls++;
+    if (auCalls <= 3 || (auCalls % 120) == 0)
+        VCamDebugLog(@"decoder: decodeAccessUnit #%llu len=%lu session=%p fmt=%p",
+                     auCalls, (unsigned long)avccData.length, _session, _formatDesc);
+#endif
     if (!_session || !_formatDesc || avccData.length == 0) return NO;
 
     CMBlockBufferRef blockBuffer = NULL;

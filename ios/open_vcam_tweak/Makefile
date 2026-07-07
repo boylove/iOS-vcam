@@ -12,7 +12,7 @@ TWEAK_NAME := OpenVCam
 # substitution path is verified against stock-Camera recording — re-add it once
 # stock Camera records cleanly.
 OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
-OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
+OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp -DVCAM_DEBUG=1
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 
 after-install::

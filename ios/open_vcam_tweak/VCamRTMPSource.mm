@@ -68,6 +68,12 @@
             VCamLog(@"rtmp: decoder configure failed (see decoder log for cause)");
         }
     } else if (pktType == 1) {
+#if VCAM_DEBUG
+        static uint64_t naluTags = 0;
+        naluTags++;
+        if (naluTags <= 3 || (naluTags % 120) == 0)
+            VCamDebugLog(@"rtmp: NALU tag #%llu bodyLen=%zu cts=%d", naluTags, bodyLen, cts);
+#endif
         NSData *avcc = [NSData dataWithBytes:body length:bodyLen];
         [self.decoder decodeAccessUnit:avcc compositionTimeMs:cts dtsMs:(int64_t)ts];
     }
