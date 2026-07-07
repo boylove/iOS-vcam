@@ -132,6 +132,11 @@ static void VCamEnsureSessions(void) {
 typedef struct { CVPixelBufferPoolRef pool; size_t w, h; OSType fmt; } VCamPool;
 static VCamPool gOutPool;
 
+// Always-on failure-reason counters so the periodic health line reports WHY a
+// replacement returned NULL (fail-open) — the startup-gated debug logs fire
+// before a syslog capture can attach, so these are the reliable diagnostic.
+static uint64_t gRNoFresh, gRNoXfer, gRNoPool, gRXferFail, gRNoSB;
+
 static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt) {
     static NSLock *lock;
     static dispatch_once_t once;
@@ -210,21 +215,17 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     if (!cfg.enabled) return NULL;
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
-    if (!fresh) return NULL;                              // stale/no stream -> real camera
-#if VCAM_DEBUG
-    { static int d = 0; if (d < 3) { d++;
-        VCamDebugLog(@"repl: got fresh %zux%zu", CVPixelBufferGetWidth(fresh), CVPixelBufferGetHeight(fresh)); } }
-#endif
+    if (!fresh) { gRNoFresh++; return NULL; }             // stale/no stream -> real camera
 
     VCamEnsureSessions();
-    if (!gTransferSession) { CVPixelBufferRelease(fresh); VCamLog(@"repl: no transfer session"); return NULL; }
+    if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NULL; }
 
     size_t w = CVPixelBufferGetWidth(templatePB);
     size_t h = CVPixelBufferGetHeight(templatePB);
     OSType fmt = CVPixelBufferGetPixelFormatType(templatePB);
 
     CVPixelBufferRef out = VCamPoolCopy(&gOutPool, w, h, fmt);
-    if (!out) { CVPixelBufferRelease(fresh); return NULL; }
+    if (!out) { gRNoPool++; CVPixelBufferRelease(fresh); return NULL; }
 
     // Rotate / mirror first (front camera auto-mirrors; config files are
     // unreadable in mediaserverd so mirror is driven by the sourcePosition hook),
@@ -258,9 +259,11 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
     if (ts != noErr) {
+        gRXferFail++;
         static BOOL logged = NO;
-        if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) dstFmt=%c%c%c%c",
-                                              (int)ts, (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt); }
+        if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) src=%zux%zu dst=%zux%zu dstFmt=%c%c%c%c",
+                                              (int)ts, CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
+                                              w, h, (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt); }
         CVPixelBufferRelease(out);
         return NULL;
     }
@@ -307,11 +310,12 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
     }
     if (ownFd && fd) CFRelease(fd);
     CVPixelBufferRelease(out);
-#if VCAM_DEBUG
-    { static int d = 0; if (d < 12) { d++;
-        VCamDebugLog(@"repl-sb: fd=%p ownFd=%d createStatus=%d newSB=%p", fd, ownFd, (int)s, newSB); } }
-#endif
-    if (s != noErr || !newSB) return NULL;
+    if (s != noErr || !newSB) {
+        gRNoSB++;
+        static BOOL logged = NO;
+        if (!logged) { logged = YES; VCamLog(@"sampleBuffer create failed (%d) fd=%p", (int)s, fd); }
+        return NULL;
+    }
 
     // Propagate the per-sample attachments (orientation / dependency flags etc.)
     // so downstream treats our frame exactly like the camera's.
@@ -373,7 +377,9 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         repl++;
         if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
     }
-    if ((calls % 600) == 0) VCamLog(@"health: emits=%llu replaced=%llu", calls, repl);
+    if ((calls % 600) == 0)
+        VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu noPool=%llu xferFail=%llu noSB=%llu]",
+                calls, repl, gRNoFresh, gRNoXfer, gRNoPool, gRXferFail, gRNoSB);
 }
 
 // -[... renderSampleBuffer:forInput:] — only installed when VCAM_HOOK_RENDER_NODES
