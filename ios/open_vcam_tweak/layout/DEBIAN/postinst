@@ -8,6 +8,20 @@
 # Also reset videodecoderd: repeated mediaserverd SIGKILLs can leave its H264
 # decode-session pool exhausted, which makes the first VTDecompressionSessionCreate
 # fail with err 1100 (no video overwrite until reset). See EXECUTION-PLAN §4.3.
+
+# RootHide compatibility: this deb is built rootless, so files land under
+# /var/jb/Library/MobileSubstrate/DynamicLibraries. On RootHide, ElleKit ONLY
+# scans /usr/lib/TweakInject (= /Library/MobileSubstrate/DynamicLibraries symlink),
+# and NEVER the /var/jb path — so the tweak silently never injects into
+# mediaserverd (no [OpenVCam] logs, real camera shown). Mirror it into the real
+# scan dir. The guard skips this on pure-rootless (Dopamine) devices, which have
+# no writable /usr/lib/TweakInject. See memory roothide-tweakinject-path.
+SRC="/var/jb/Library/MobileSubstrate/DynamicLibraries"
+if [ -d /usr/lib/TweakInject ] && [ -f "$SRC/OpenVCam.dylib" ]; then
+    cp -f "$SRC/OpenVCam.dylib"  /usr/lib/TweakInject/OpenVCam.dylib  2>/dev/null || true
+    cp -f "$SRC/OpenVCam.plist" /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+fi
+
 killall -9 videodecoderd 2>/dev/null || true
 killall -9 mediaserverd 2>/dev/null || true
 exit 0
