@@ -38,16 +38,19 @@
 
 ```
 mediaserverd 进程内 (%ctor 仅当 processName==mediaserverd):
-  hook BWNodeOutput emitSampleBuffer: + BW{Node,UBNode,PixelTransferNode} renderSampleBuffer:forInput:
+  hook BWNodeOutput emitSampleBuffer:  (只此一个终端节点; render 节点默认不 hook, VCAM_HOOK_RENDER_NODES 可开)
+  hook FigCaptureSourceConfiguration sourcePosition (前后摄判定, 前摄自动镜像)
   VCamRTMPSource ensureStarted → 后台拉流线程
-  换帧: VCamReplaceSampleBuffer(sb)
-    → CMSampleBufferGetImageBuffer(取相机 CVPixelBuffer, 无则跳过)
-    → VCamFrameStore 取 0.5s 内新鲜解码帧(无则 fail-open 透传)
-    → CIContext 把解码帧(缩放/镜像/旋转)就地覆盖进相机 buffer(保留格式/尺寸/attachments) → 调 orig
+  换帧(替换, 不改原 buffer): VCamEmit → VCamCreateReplacementSampleBuffer(origSB)
+    → CMSampleBufferGetImageBuffer(取相机 buffer 作模板: 尺寸/格式/timing/attachments)
+    → VCamFrameStore 取 0.5s 内新鲜解码帧(无则 fail-open 传原 sb)
+    → VTPixelRotationSession(前摄镜像/旋转) + VTPixelTransferSession(转成相机像素格式/色域) → 自建 CVPixelBufferPool 缓冲
+    → CMSampleBufferCreateForImageBuffer(带原 timing/attachments) 造新 sample buffer → 调 orig 传新 sb → 释放
 拉流/解码:
-  vendor/rtmp/vcam_rtmp.c(自写 RTMP play) → FLV/AVC 解析 → VCamH264Decoder(VideoToolbox 软解) → VCamFrameStore
-打包: filter Bundles=(com.apple.mediaserverd) Executables=(mediaserverd); postinst: killall -9 mediaserverd; Conflicts/Replaces com.x.vcamera
+  vendor/rtmp/vcam_rtmp.c(自写 RTMP play) → FLV/AVC 解析 → VCamH264Decoder(VideoToolbox 硬解, dstAttrs+RealTime+ThreadCount 照原作者) → VCamFrameStore
+打包: filter Bundles=(com.apple.mediaserverd) Executables=(mediaserverd); postinst: killall -9 videodecoderd + mediaserverd; Conflicts/Replaces com.x.vcamera
 ```
+> 注:早期用 CIContext 就地覆盖相机 buffer——既慢(多节点重复渲染)又在原生相机录制时触发 CMCapture PixelTransferSession 断言崩溃,且对 YCbCr 输出黑屏。现已改为「VT 转换 + 造新 sample buffer 替换」,照闭源 vcamera(见 VCAMERA_REVERSE_REPORT.md)。
 
 ---
 
@@ -63,11 +66,10 @@ plink -N -R 127.10.10.10:1935:127.0.0.1:1935 -P 2222 -pw <pw> root@127.0.0.1
 没有它 → `rtmp: tcp connect failed`。(launcher USB 模式负责建隧道 + 127.10.10.10 回环别名。)
 
 ### 4.3 解码器 1100 = 系统解码会话池被耗尽（重要）
-`VTDecompressionSessionCreate` 报 **1100**(硬解、软解都报)。**根因不是格式、不是硬件竞争,而是反复 `killall -9 mediaserverd`(SIGKILL 不清理)泄漏了 `videodecoderd` 的解码会话,池耗尽后一律 1100。**
-- 开发期恢复:`killall -9 videodecoderd` 重置池,解码立刻恢复。
-- 生产环境只 killall 一次,不会触发。
-- 代码侧已:① 强制软件解码(raw key `@"EnableHardwareAcceleratedVideoDecoder":@NO`,因命名常量标注 iOS17+ 会触发 -Werror);② NULL 输出格式(强制 NV12+IOSurface 也会独立失败)。
-- **待优化(见 6)**:解码会话复用(SPS/PPS 不变则不重建),避免重连时反复建/毁会话。
+`VTDecompressionSessionCreate` 报 **1100**。**根因不是格式、不是硬件竞争,而是反复 `killall -9 mediaserverd`(SIGKILL 不清理)泄漏了 `videodecoderd` 的解码会话,池耗尽后一律 1100。**
+- 开发期恢复:`killall -9 videodecoderd` 重置池,解码立刻恢复。`postinst` 已带此步。生产环境只 killall 一次,不会触发。
+- 代码侧(照原作者,VCAMERA_REVERSE_REPORT §Decoder):① **不再强制软解**(旧的 `EnableHardwareAcceleratedVideoDecoder=NO` 软解优先路径原包里没有,反而更易在 mediaserverd 里 create 失败;已删);② decoderSpecification=NULL 让 VT 自选解码器;③ 给 destination imageBufferAttributes(native size + 420v + IOSurface + OpenGLCompat);④ create 成功后 `VTSessionSetProperty` RealTime=true + ThreadCount=2;⑤ 解码输出打 ITU-R 709/601 色彩+chroma 元数据。
+- 会话复用:SPS/PPS+naluLen 不变则不重建;create 失败后 2s 退避,避免每个 GOP 头都猛敲 `VTDecompressionSessionCreate`(正是耗尽池的元凶)。
 
 ### 4.4 mediaserverd 沙盒:读不到任何配置文件（重要,当前限制）
 probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/vc.plist`、`/usr/lib/TweakInject/vc.plist` **全部 exists=0**——mediaserverd 沙盒连 stat 都拒。所以:

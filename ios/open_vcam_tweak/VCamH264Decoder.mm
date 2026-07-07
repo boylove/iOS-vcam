@@ -2,8 +2,16 @@
 #import "VCamFrameStore.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <time.h>
 
 #import "VCamLog.h"
+
+// Monotonic seconds, for backing off decoder-session rebuild attempts.
+static double VCamMonoSeconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 @implementation VCamH264Decoder {
     CMVideoFormatDescriptionRef _formatDesc;
@@ -11,6 +19,7 @@
     int _naluLengthSize;
     NSData *_sps;
     NSData *_pps;
+    double _lastBuildFail;   // VCamMonoSeconds() of the last failed buildSession, or 0
 }
 
 - (instancetype)init {
@@ -93,10 +102,19 @@
         return YES;
     }
 
+    // Back off after a failed create: without a live session every GOP header
+    // would otherwise call buildSession again (~every 1-2s), and hammering
+    // VTDecompressionSessionCreate is exactly what wedges the decode-session pool.
+    if (!_session && _lastBuildFail > 0 && (VCamMonoSeconds() - _lastBuildFail) < 2.0) {
+        return NO;
+    }
+
     _sps = sps;
     _pps = pps;
     _naluLengthSize = naluLengthSize;
-    return [self buildSession];
+    BOOL ok = [self buildSession];
+    _lastBuildFail = ok ? 0 : VCamMonoSeconds();
+    return ok;
 }
 
 static void VCamDecodeOutput(void *decompressionOutputRefCon,
@@ -115,6 +133,23 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         VCamLog(@"decoder: output status=%d imageBuffer=%p", (int)status, imageBuffer);
         return;
     }
+
+    // Stamp the ITU-R colour/chroma metadata the original vcamera attaches to its
+    // decoded buffers, so the downstream VTPixelTransferSession does the YCbCr
+    // colour-range/matrix conversion correctly (a fresh buffer with no colour
+    // info converts wrong / dark). kCVAttachmentMode_ShouldPropagate carries it
+    // through to the transferred replacement buffer.
+    CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(imageBuffer, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(imageBuffer, kCVImageBufferChromaLocationTopFieldKey,
+                          kCVImageBufferChromaLocation_Left, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(imageBuffer, kCVImageBufferChromaLocationBottomFieldKey,
+                          kCVImageBufferChromaLocation_Left, kCVAttachmentMode_ShouldPropagate);
+
     static uint64_t produced = 0;
     produced++;
     if (produced == 1)
@@ -153,32 +188,46 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         .decompressionOutputRefCon = (__bridge void *)self,
     };
 
-    // Inside mediaserverd the hardware decoder is contended by the live camera
-    // pipeline, so VTDecompressionSessionCreate intermittently returns err 1100.
-    // Force SOFTWARE decode (cheap for Baseline 720p) to avoid the HW decoder;
-    // no destination format is forced (CoreImage converts on overwrite).
-    // Use the raw key string: the named constant is annotated iOS 17+ (compile
-    // error under -Werror) but the underlying key works on iOS 16.
-    NSDictionary *swSpec = @{
-        @"EnableHardwareAcceleratedVideoDecoder": @NO,
+    // Match the closed vcamera's decoder setup, which does NOT hit the err 1100
+    // our old forced-software / NULL-destination path did. Reverse-engineered from
+    // vcamera.dylib initDecoder:...:
+    //   * let VideoToolbox choose the decoder (default spec => hardware); do NOT
+    //     force EnableHardwareAcceleratedVideoDecoder=NO (the forced-software path
+    //     was what failed to create inside mediaserverd),
+    //   * give it explicit destination attributes (native size, biplanar YCbCr,
+    //     IOSurface-backed) so VT allocates cleanly,
+    //   * then mark the session realtime with a bounded thread count.
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(_formatDesc);
+    NSDictionary *dstAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferWidthKey               : @(dims.width),
+        (id)kCVPixelBufferHeightKey              : @(dims.height),
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        // The original vcamera sets OpenGL compatibility here (its renderer is
+        // GPUImage/OpenGL ES). We keep it for fidelity + so the decoded buffer is
+        // GPU-friendly for the downstream VTPixelTransfer/Rotation sessions.
+        (id)kCVPixelBufferOpenGLCompatibilityKey : @YES,
     };
+
     status = VTDecompressionSessionCreate(
-        kCFAllocatorDefault, _formatDesc,
-        (__bridge CFDictionaryRef)swSpec, NULL, &callback, &_session);
+        kCFAllocatorDefault, _formatDesc, NULL,
+        (__bridge CFDictionaryRef)dstAttrs, &callback, &_session);
     if (status != noErr || !_session) {
-        VCamLog(@"decoder: software create failed (%d); trying default", (int)status);
+        VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d",
+                (int)status, dims.width, dims.height);
         _session = NULL;
-        status = VTDecompressionSessionCreate(
-            kCFAllocatorDefault, _formatDesc, NULL, NULL, &callback, &_session);
-        if (status != noErr || !_session) {
-            VCamLog(@"decoder: session create failed (%d)", (int)status);
-            _session = NULL;
-            return NO;
-        }
+        return NO;
     }
 
-    VCamLog(@"decoder: configured naluLen=%d sps=%lu pps=%lu",
-            _naluLengthSize, (unsigned long)_sps.length, (unsigned long)_pps.length);
+    // Realtime + bounded threads (matches the original; helps the session coexist
+    // with the live camera pipeline in mediaserverd instead of contending it).
+    VTSessionSetProperty(_session, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(_session, kVTDecompressionPropertyKey_ThreadCount,
+                         (__bridge CFTypeRef)@2);
+
+    VCamLog(@"decoder: configured naluLen=%d sps=%lu pps=%lu %dx%d",
+            _naluLengthSize, (unsigned long)_sps.length, (unsigned long)_pps.length,
+            dims.width, dims.height);
     return YES;
 }
 

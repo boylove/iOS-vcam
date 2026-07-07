@@ -1,66 +1,53 @@
 # OpenVCam — 开源可编辑虚拟摄像头 tweak
 
-闭源 `com.x.vcamera`（0.0.1-1922, kox）的**开源、可编辑**复刻。逆向确认其原理：内置 librtmp 拉 RTMP 流 → VideoToolbox 解 H264 → GPUImage 处理 → 替换相机 `CMSampleBuffer`。本项目用可读可改的源码复刻同等**视频注入**能力，并预留音频合并位，最终一个 deb。
+闭源 `com.x.vcamera`（0.0.1-1922, kox）的**开源、可编辑**复刻。逆向报告见 [`VCAMERA_REVERSE_REPORT.md`](../../VCAMERA_REVERSE_REPORT.md)。原理：注入 `mediaserverd`，内置精简 RTMP 客户端拉流 → VideoToolbox 解 H264 → VTPixelTransfer/Rotation 转成相机格式 → **造一个全新的 `CMSampleBuffer` 传给采集图**，替换所有相机客户端看到的画面。
 
-> ⚠️ 你的设备是 Dopamine iOS 16.1.2，相机管线改动历史上极易黑屏。本 tweak 全程 **fail-open**（任何异常都透传真实相机，永不黑屏）并带**硬开关**。请务必先读下面的"安全 / 恢复"。
+> ⚠️ 设备为 Dopamine iOS 16.1.2，`mediaserverd` 是系统进程，改动相机管线历史上极易黑屏/卡死，尤其**系统原生相机的录制**。本 tweak 全程 **fail-open**（任何异常都透传真实相机）。原生相机录制是最高危路径。
 
-## 当前阶段：Phase 1（视频，App 级注入）
+## 架构（当前）
 
-- **注入范围**：Logos filter 按 `Classes = (AVCaptureVideoDataOutput)`，只加载进*用相机的 App*（TikTok、各类直播/相机 App）。不碰 `mediaserverd`，不影响系统原生相机 App。
-- **机制**：hook `AVCaptureVideoDataOutput -setSampleBufferDelegate:queue:`，对 delegate 的 `captureOutput:didOutputSampleBuffer:fromConnection:` 做 `MSHookMessageEx`（与已验证可用的 Safe 音频桥同一套），把解码出的画面塞进 buffer。
-- **视频源**：设备端直接拉 RTMP（内联的 `vendor/rtmp/vcam_rtmp.c`，自写精简 RTMP play 客户端，无外部依赖、可自由修改）。
+- **注入点**：`mediaserverd`（`OpenVCam.plist` filter `Bundles=(com.apple.mediaserverd) Executables=(mediaserverd)`）。`mediaserverd` 在所有相机客户端之下，因此能替换 **RootHide 化的 TikTok / 系统原生相机 / 所有 App**——app 级注入会被 RootHide 绕过，所以必须在这一层。
+- **帧替换**：hook 终端节点 `BWNodeOutput -emitSampleBuffer:`（只此一个，一帧一次；中间 `renderSampleBuffer:forInput:` 节点默认不 hook，`VCAM_HOOK_RENDER_NODES` 编译期可开，风险高）。**不改相机原 buffer**：把解码帧经 `VTPixelTransferSession`（+ 前摄/旋转用 `VTPixelRotationSession`）转进自建的 `CVPixelBufferPool` 缓冲，再 `CMSampleBufferCreateForImageBuffer` 造新 sample buffer（带原 timing/attachments），传给原实现。这与闭源一致，避免了「就地改」导致的 `CMCapture PixelTransferSession` 断言崩溃 + 多节点重复渲染卡顿。
+- **前后摄自动镜像**：hook `FigCaptureSourceConfiguration -sourcePosition`，前摄自动水平镜像（配置文件在 mediaserverd 沙盒读不到，见下）。编译宏 `VCAM_FRONT_AUTOMIRROR`（默认 1）可翻转方向。
+- **视频源**：设备端直接拉 RTMP（内联 `vendor/rtmp/vcam_rtmp.c`，自写精简 play 客户端，无外部依赖）。需要 PC 端 SRS + USB 反向隧道把 `127.10.10.10:1935` 暴露给设备。
+- **解码**：VideoToolbox 硬解，destination attrs 带 native size / 420v / IOSurface / OpenGLCompat，会话 `RealTime=true` + `ThreadCount=2`（照原作者）；SPS/PPS 不变则复用会话；create 失败（如 1100）有退避。
 
-## 配置：`/var/mobile/vc.plist`
+## 配置与沙盒（重要）
 
-与 vcamera / launcher STEP 9d-2 共用同一文件：
+`mediaserverd` 的沙盒**读不到** `/var/mobile/vc.plist`、`/var/tmp`、`/var/mobile/Media` 等所有配置路径，`VCamConfig` 因此只用**编译进去的默认值**（`rtmp://127.10.10.10:1935/live/srs`、enabled=YES）。所以：
 
-| 键 | 类型 | 默认 | 说明 |
-|----|------|------|------|
-| `rtmp` | String | 空→`rtmp://127.10.10.10:1935/live/srs` | 拉流地址 |
-| `enabled` | Bool | YES（键缺省即视为开） | 总开关 |
-| `mirror` | Bool | NO | 水平镜像 |
-| `rotation` | Number | 0 | 顺时针 0/90/180/270 |
-
-配置每 1.5s 自动热重载，无需重启 App。
+- 自定义 RTMP / mirror / rotation 通过 `vc.plist` 在本进程**不生效**；镜像走代码内 sourcePosition 自动判定。
+- 文件硬开关 `vc.disabled` 也读不到——**禁用只能卸载**（见下）。默认 URL 恰好等于工作隧道地址，所以无需配置也能出画。
+- 未来若要可控开关：Darwin notify / mach IPC 等沙盒可达通道。
 
 ## 安全 / 恢复（务必先看）
 
-- **硬开关**：`touch /var/mobile/vc.disabled` → tweak 立即变纯透传空操作（≤1.5s 生效）。删掉文件恢复。任何时候出问题，SSH 建这个文件即可回到真实相机，**无需重越狱**。
-- **看门狗**：解码帧超过 0.5s 没更新（断流/卡顿）自动透传真实相机。
-- **不主动改设备**：deb 由你手动 `dpkg -i`；本仓库/launcher 不自动推送。`postinst` 不 `killall mediaserverd`，装完重启目标 App 即可。
-- deb 声明 `Conflicts/Replaces: com.x.vcamera`，安装时会移除闭源包，避免双重注入黑屏。
+- **禁用 / 恢复**：`dpkg -r com.iosvcam.opencam && killall -9 videodecoderd && killall -9 mediaserverd`。（沙盒读不到 `vc.disabled` 文件开关。）
+- **看门狗**：解码帧超 0.5s 没更新自动透传真实相机；任何环节失败一律透传，永不黑屏/冻结。
+- **反复 killall 后「不是 OBS 画面」**：多半是 `videodecoderd` 解码会话池被 SIGKILL 耗尽 → `VTDecompressionSessionCreate` 报 1100。`killall -9 videodecoderd` 重置；`postinst` 已带这一步。
+- deb `Conflicts/Replaces com.x.vcamera` 及旧音频包，避免双重注入。
 
 ## 构建
 
-推到 `build/**` / `feature/**` / `main` 触发 `.github/workflows/build-open-vcam-tweak.yml`（macOS + Theos），产物为 `open-vcam-tweak-rootless-deb`。本地校验：
-
-```bash
-python ios/validate_deb.py <下载的 deb>
-```
-
-## 端到端验证
-
-1. PC 用 launcher 起 SRS，`ffmpeg -re -i test.mp4 -c copy -f flv rtmp://localhost:1935/live/srs` 推测试流。
-2. `vc.plist` 的 `rtmp` 指向该地址（WiFi 直连 PC IP，或 USB 隧道 127.10.10.10）。
-3. 手动装 deb，重启目标 App，打开其相机 → 应显示推流画面。
-4. 日志：`NSTemporaryDirectory()/OpenVCam.log` 或 syslog 里的 `[OpenVCam]`，应有 `hooked video delegate` / `rtmp: play sent` / `AVC sequence header applied`。
-5. **安全回归**：`touch /var/mobile/vc.disabled` 重启 App → 真实相机、无黑屏；停止推流 → 0.5s 后透传、无黑屏。
+推到 `build/**` / `feature/**` / `main` 触发 `.github/workflows/build-open-vcam-tweak.yml`（macOS + Theos），产物 `open-vcam-tweak-rootless-deb`。本地校验：`python ios/validate_deb.py <deb>`。调试日志：`OpenVCam_CFLAGS += -DVCAM_DEBUG=1`。
 
 ## 文件结构
 
 ```
-Tweak.xm              主逻辑：帧替换 hook + CoreImage 缩放/镜像/旋转 + 日志（含音频 Phase 3 占位）
-VCamConfig.{h,m}      读 vc.plist + 硬开关，热重载
-VCamRTMPSource.{h,mm} RTMP 拉流线程 + FLV/AVC 解析 + 重连
-VCamH264Decoder.{h,mm} VideoToolbox 解码 → NV12 CVPixelBuffer
-VCamFrameStore.{h,m}  线程安全最新帧 + 看门狗
-vendor/rtmp/vcam_rtmp.{h,c} 自写精简 RTMP play 客户端（握手/chunk/AMF0/connect-createStream-play）
-OpenVCam.plist        Logos filter（Classes=AVCaptureVideoDataOutput）
+Tweak.xm               mediaserverd hook + VTPixelTransfer/Rotation 帧替换 + sourcePosition 镜像 + 日志
+VCamConfig.{h,m}       配置（mediaserverd 沙盒下回退默认值）
+VCamRTMPSource.{h,mm}  RTMP 拉流线程 + FLV/AVC 解析 + 重连
+VCamH264Decoder.{h,mm} VideoToolbox 解码（照原作者的 dstAttrs/RealTime/ThreadCount + ITU 色彩元数据）
+VCamFrameStore.{h,m}   线程安全最新帧 + 看门狗
+VCamAudioMS.x          全局 mediaserverd 音频（AudioUnitRender 替换）——当前暂未编入（见 Makefile）
+vendor/rtmp/vcam_rtmp.{h,c} 自写精简 RTMP play 客户端
+OpenVCam.plist         Logos filter（mediaserverd）
 Makefile / control / layout/DEBIAN/*
 ```
 
-## 路线图
+## 路线图 / 待办
 
-- **Phase 2（可选，高风险，默认关）**：额外注入 `mediaserverd`/CMIO 覆盖系统原生相机 App 与全系统。改 `OpenVCam.plist` 加 `Bundles=(com.apple.mediaserverd) Executables=(mediaserverd)`。**仅在 Phase 1 稳定后单独试**，全程用硬开关兜底——这是最容易黑屏的部分。
-- **Phase 3（音频）**：把 `ios/audio_bridge_safe_tweak` 已验证的 `AudioUnitRender` + `AVCaptureAudioDataOutput` 替换逻辑并入本 dylib（见 Tweak.xm 的 Audio 占位区块），视频+音频同一个 deb、同一份配置与硬开关。
-- 画质增强：GPUImage 美颜、保持宽高比（当前 v1 为拉伸填充）。
+- **视频保真**：BGRA/YUV 多路径 + 可选 GPUImage 美颜/瘦脸（当前只 420v + VT transfer，拉伸填充）。
+- **音频**：`VCamAudioMS.x` 全局 `AudioUnitRender` 替换（从 `ios/audio_bridge_media_active_tweak` 并入）。曾破坏原生相机录制，待视频在原相机录制稳定后，用同样的「不破坏录制」思路重新并入。
+- **原生相机录制**：最高危场景，是当前主攻目标。
+- 沙盒可达的配置/开关（Darwin notify）。

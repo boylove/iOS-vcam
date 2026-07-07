@@ -15,13 +15,19 @@
 // ---------------------------------------------------------------------------
 // OpenVCam — mediaserverd camera replacement.
 //
-// Replicates the closed com.x.vcamera approach: hook the private BufferWorks
-// (BW*) capture-graph classes inside mediaserverd and overwrite the camera
-// pixel buffer IN PLACE with the decoded RTMP frame. Because mediaserverd sits
-// below every app, this replaces the camera for all clients, including
-// RootHide-patched apps (TikTok) that bypass normal app-level tweak injection.
+// Replicates the closed com.x.vcamera approach: hook the terminal BufferWorks
+// node `BWNodeOutput -emitSampleBuffer:` inside mediaserverd and SUBSTITUTE a
+// brand-new sample buffer built from the decoded RTMP frame. We never mutate the
+// camera's own CVPixelBuffer — the decoded frame is transferred (VTPixelTransfer
+// + VTPixelRotation, camera pixel-format/size) into our own pool buffer, wrapped
+// in a fresh CMSampleBuffer carrying the original timing/attachments, and passed
+// to the original method. In-place overwrite (old CIContext path) was slow and
+// crashed stock-Camera recording via the CMCapture PixelTransferSession
+// assertion; substitution avoids both. Because mediaserverd sits below every
+// app, this replaces the camera for all clients, including RootHide-patched apps
+// (TikTok) that bypass normal app-level tweak injection.
 //
-// See memory: vcamera-mediaserverd-hookpoints.
+// See memory: vcamera-mediaserverd-hookpoints; report: VCAMERA_REVERSE_REPORT.md.
 // Fail-open everywhere; /var/mobile/vc.disabled or vc.plist enabled=false ->
 // pure pass-through (never a black or frozen frame).
 // ---------------------------------------------------------------------------

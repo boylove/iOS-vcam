@@ -62,7 +62,10 @@
 #endif
         NSData *record = [NSData dataWithBytes:body length:bodyLen];
         if (![self.decoder configureWithAVCDecoderConfigurationRecord:record]) {
-            VCamLog(@"rtmp: AVC sequence header parse failed");
+            // Could be a genuine parse failure OR VTDecompressionSessionCreate
+            // failing (e.g. 1100) — the decoder logs the specific cause; don't
+            // mislabel every failure as a parse error.
+            VCamLog(@"rtmp: decoder configure failed (see decoder log for cause)");
         }
     } else if (pktType == 1) {
         NSData *avcc = [NSData dataWithBytes:body length:bodyLen];
