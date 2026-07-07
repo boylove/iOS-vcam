@@ -103,6 +103,53 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 static volatile long gSourcePosition = 0;
 
 // ---------------------------------------------------------------------------
+// Stall watchdog / heartbeat (diagnostic for the "moves once then freezes" bug).
+//
+// The health line is printed FROM INSIDE the emit hook — so if the capture
+// thread ever blocks inside our replacement (e.g. wedged in the photo path on a
+// photo<->video transition, the historic mediaserverd hang), that log line never
+// fires again and the freeze looks identical to "idle". This heartbeat runs on
+// its OWN thread and reports the emit counter from the outside, so a hang shows
+// up as "emits STALLED at N" with the in-flight breakdown pinpointing WHERE the
+// thread is stuck: photoInflight>0 => blocked in VCamPhotoRender (photo path);
+// emitInflight>0 with photoInflight==0 => blocked in the live-video overwrite.
+// Pure observer, no locks touched — safe to leave on in release builds.
+static volatile uint64_t gEmitEntries  = 0;   // VCamEmit entered
+static volatile uint64_t gEmitReturns  = 0;   // VCamEmit's orig() returned
+static volatile uint64_t gPhotoEntries = 0;   // VCamPhotoRender entered
+static volatile uint64_t gPhotoReturns = 0;   // VCamPhotoRender's orig() returned
+
+static void VCamStartHeartbeat(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            uint64_t last = 0;
+            BOOL stalledLogged = NO;
+            for (;;) {
+                sleep(2);
+                uint64_t now         = gEmitEntries;
+                uint64_t emitInflight  = gEmitEntries  - gEmitReturns;
+                uint64_t photoInflight = gPhotoEntries - gPhotoReturns;
+                if (now != last) {                 // frames still flowing -> healthy
+                    last = now;
+                    stalledLogged = NO;
+                } else if (now > 0 && !stalledLogged) {
+                    // Counter was advancing and has now been frozen for ~2s: the
+                    // capture thread is blocked, not merely idle (idle still emits
+                    // real-camera frames, so the counter keeps rising). Report where.
+                    stalledLogged = YES;
+                    VCamLog(@"HEARTBEAT: emits STALLED at %llu (emitInflight=%llu photoInflight=%llu) "
+                            "-> mediaserverd capture thread BLOCKED%@",
+                            now, emitInflight, photoInflight,
+                            photoInflight > 0 ? @" IN PHOTO PATH (VCAM_HOOK_PHOTO_NODES)"
+                                              : (emitInflight > 0 ? @" IN LIVE OVERWRITE" : @""));
+                }
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
 static NSString *VCamLogPath(void) {
@@ -488,10 +535,12 @@ static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) 
 static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     IMP orig = VCamFindOrig(gEmitOrigs, self);
     if (!orig) return;
+    gEmitEntries++;                            // heartbeat: entered (before any work)
     [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
     BOOL did = ib ? VCamOverwriteInPlace(ib) : NO;
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);   // original sb, now overwritten
+    gEmitReturns++;                            // heartbeat: orig returned (emit not blocked)
 
     // Always-on health line: distinguishes "OBS not showing" (replaced=0) from
     // "decoder idle / fail-open" via syslog; the why[] counters pinpoint the cause.
@@ -516,8 +565,10 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
 static void VCamPhotoRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     IMP orig = VCamFindOrig(gRenderOrigs, self);
     if (!orig) return;
+    gPhotoEntries++;                           // heartbeat: entered photo hook
     if (sb) VCamOverwritePhotoInPlace(sb);
     ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
+    gPhotoReturns++;                           // heartbeat: photo hook returned
 }
 #endif
 
@@ -600,9 +651,19 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // Front/back detection for auto-mirror (config files unreadable here).
         VCamHookSourcePosition();
 
+        // Start the stall watchdog BEFORE frames flow: it reports from its own
+        // thread if the capture thread ever wedges inside our hooks, so the
+        // "moves once then freezes" symptom shows up as "emits STALLED" with an
+        // in-flight breakdown (photo path vs live overwrite) instead of silence.
+        VCamStartHeartbeat();
+
         // Start pulling immediately; frames only get used once enabled + fresh.
         [[VCamRTMPSource shared] ensureStarted];
-        VCamLog(@"hooks installed (%lu emit, %lu photo)",
-                (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count);
+        // Log the photo-node compile state so the syslog itself proves WHICH build
+        // is running (photo=1 default vs the -DVCAM_HOOK_PHOTO_NODES=0 diagnostic
+        // build) — avoids "fixed it" false positives from flashing the wrong deb.
+        VCamLog(@"hooks installed (%lu emit, %lu photo) VCAM_HOOK_PHOTO_NODES=%d",
+                (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count,
+                VCAM_HOOK_PHOTO_NODES);
     }
 }

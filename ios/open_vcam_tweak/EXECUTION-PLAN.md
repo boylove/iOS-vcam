@@ -48,9 +48,11 @@ mediaserverd 进程内 (%ctor 仅当 processName==mediaserverd):
     → gVTLock 加锁: VTPixelTransferSessionTransferImage(session, src, dst)  ★就地写进相机 buffer
       (必须设 kVTPixelTransferPropertyKey_ScalingMode=Normal, 源≠相机尺寸时否则静默失败)
     → orig(self, _cmd, origSB)  ★传【原始 sb】, 不是新建的 (下游客户端读的就是被改写的 dst surface)
-  拍照(VCAM_HOOK_PHOTO_NODES, 默认关): VCamOverwritePhotoInPlace hook BWStillImageScalerNode/
-    BWPhotoEncoderNode, 同样就地覆盖 + kCMSampleBufferAttachmentKey_TransitionID 附件去重(一张照片
-    流经多个节点只覆盖一次)。render 节点(BWNode/BWUBNode/BWPixelTransferNode)默认透传, 就地改它们正是原生录制崩溃路径。
+  拍照(VCAM_HOOK_PHOTO_NODES, **默认开 —— 0.3.9 起, 见 4.8 待验证**): VCamOverwritePhotoInPlace hook
+    BWStillImageScalerNode/BWPhotoEncoderNode, 同样就地覆盖 + kCMSampleBufferAttachmentKey_TransitionID
+    附件去重(一张照片流经多个节点只覆盖一次)。render 节点(BWNode/BWUBNode/BWPixelTransferNode)默认透传,
+    就地改它们正是原生录制崩溃路径。**注: 与原版不同, 本实现去掉了原版照片路径的人脸门控(§2.3 modifyPixelBuffer:
+    开头 `if(!hasFace) 透传`), 改为无条件覆盖 —— 疑为"动一下就卡住"回归的嫌疑点, 见 4.8。**
 拉流/解码:
   vendor/rtmp/vcam_rtmp.c(自写 RTMP play) → FLV/AVC 解析 → VCamH264Decoder(VideoToolbox 硬解, dstAttrs+RealTime+ThreadCount 照原作者) → VCamFrameStore
 打包: filter Bundles=(com.apple.mediaserverd) Executables=(mediaserverd); postinst: killall -9 videodecoderd + mediaserverd; Conflicts/Replaces com.x.vcamera
@@ -93,6 +95,26 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 ### 4.7 设备红线
 `vcam-latency-patch-discrete`、`ios-device-read-only-rule`、`vcam-roothide-vcplist-sandbox`。
 
+### 4.8 拍照路径已默认启用（0.3.9）+ "动一下就卡住"回归嫌疑（待坐实）
+**状态偏差(已修正文档)**:本计划旧版把拍照记为"默认关 / 未做(§6-f、M4)",但**代码 HEAD 与 git `af1fa43 (0.3.9: enable photo capture)` 已把 `VCAM_HOOK_PHOTO_NODES` 默认改成 1**(Tweak.xm:97-99),拍照 hook 实际在线上跑,而计划里对它的风险/验证仍是空的。文档现已对齐代码。
+
+**症状**:打开原相机,画面**动一下(首帧/首个 GOP 出了 OBS)然后突然卡住定格**。
+
+**为什么"卡住"比"解码停了"更严重**:本 tweak 是 fail-open + 0.5s 看门狗(§5),单纯解码停产应回落到**真实摄像头(仍在动)**,不该定格。画面定格说明 **mediaserverd 的采集线程被阻塞在我们的 hook 里**,而非空闲。
+
+**头号嫌疑 = 拍照路径回归**,三条线索叠加:
+1. 时间点吻合:卡住是 0.3.9 启用拍照后出现;上一版(`eae9bfa`)拍照是**禁用**的。
+2. 历史前科:本文件 §4.5/§4.6 + 记忆均记录过 *photo↔video 切换曾 HANG 住 mediaserverd*(`EXC_BREAKPOINT`,栈在 `CMCapture → PixelTransferSession`)。
+3. 与原版的偏差(见 `VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md` §2.3 对照):原版照片路径 `modifyPixelBuffer:` **开头带人脸门控**(`if(!hasFace) 透传`),无脸时根本不进 VT transfer;**本实现去掉门控、每次拍照无条件 VT transfer + 抢 `gVTLock`**,在 photo↔video 切换/多节点并发时更易卡。
+
+**坐实两步(设备侧,只读红线外的装包由用户执行)**:
+- **① photo=0 诊断包**:CI `build-open-vcam-tweak.yml` → `workflow_dispatch` 选 `hook_photo_nodes=0` 出包(artifact 名带 `photo0`),装后若不再卡 → **坐实拍照回归**。装机后 syslog 的 `hooks installed ... VCAM_HOOK_PHOTO_NODES=0` 一行自证跑的是诊断包(防装错包误判)。
+- **② 心跳日志**:Tweak.xm 新增独立线程 `VCamStartHeartbeat`(不占采集线程),卡住时打印
+  `HEARTBEAT: emits STALLED at N (emitInflight=.. photoInflight=..) -> ... BLOCKED IN PHOTO PATH/LIVE OVERWRITE`。
+  - `photoInflight>0` → 卡在 `VCamPhotoRender`/`VCamOverwritePhotoInPlace`(拍照路径)= 坐实①。
+  - `emitInflight>0 且 photoInflight==0` → 卡在 live 覆盖。
+  - `emits` 持续涨、`replaced` 停涨 → 不是阻塞,是解码停产/RTMP 帧率过低(应已 fail-open)。
+
 ---
 
 ## 5. 安全底线
@@ -120,7 +142,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 - [x] **6-c 出正式版清理**(v0.2.0):`VCamLog.h` 加 `VCAM_DEBUG`(默认 0)+ `VCamDebugLog` 宏;probe、seq header 字节 dump、stats、produced 计数全部收进 `#if VCAM_DEBUG`;错误 + 一次性生命周期日志(hooks installed / decoder configured / rtmp 错误)仍走 `VCamLog` 常显。调试时 `make ... OpenVCam_CFLAGS+=-DVCAM_DEBUG=1`。
 - [ ] **6-d 人脸检测确认**:检测在覆盖下游运行,应能识别 OBS 画面里的脸——用户用 TikTok 人脸贴纸实测确认(代码层不覆盖元数据/人脸节点,理论已可用)。
 - [ ] **6-e 沙盒可达的开关/配置(可选)**:用 Darwin notify(`notify_set_state`/`notify_get_state`,64 位可编码 enabled/mirror/rotation 等 flag)或 mach IPC,让配置/kill-switch 在 mediaserverd 里可控;或注入 SpringBoard 读 vc.plist 再经 IPC 传入(vcamera 疑似此法)。
-- [ ] **6-f 拍照替换**:hook `BWPhotoEncoderNode renderSampleBuffer:forInput:` 等。
+- [~] **6-f 拍照替换**(0.3.9 已**默认启用**,`VCAM_HOOK_PHOTO_NODES=1`;**未通过验证,疑为"动一下就卡住"回归——见 §4.8**):hook `BWStillImageScalerNode` / `BWPhotoEncoderNode renderSampleBuffer:forInput:`,就地覆盖 + `kCMSampleBufferAttachmentKey_TransitionID` 去重。**待坐实**:CI 出 `hook_photo_nodes=0` 诊断包 + 读心跳 `HEARTBEAT: ... BLOCKED IN PHOTO PATH` 定位。若坐实,候选修复:①补回原版人脸门控 or 仅在快门事件窗口内启用;②photo 路径与 live 路径彻底分离锁与 VT 会话(勿共用 `gVTLock`);③photo↔video 切换期透传。
 - [ ] **6-g 健壮性 / 完整复刻**:① BGRA/YUV 多路径 + 可选 GPUImage 美颜(原包有 `_h264DecoderToBGRA/_h264DecoderToYUV` + GPUImage 链,当前只 420v+VT transfer,够出画不够全);② 保宽高比选项(当前拉伸);③ 色彩/chroma 元数据当前在 decode 回调打 attachment(原包在 VTDecompressionSessionCreate 前构造参与创建,功能等价但非逐字);④ 拉流线程相机空闲时可停。
 - [x] **P3 音频并入 —— 全局 mediaserverd 版**(v0.3.0,当前方向):用户要求音频也像视频一样全局、原相机也生效,不只 TikTok。故 v0.2.0 的 app 级 `VCamAudio.x`(只注入 TikTok,靠 RootHide `.roothidepatch`+pkgmirror 才注入,已弃)**被替换**为 `VCamAudioMS.x`(移植自 `ios/audio_bridge_media_active_tweak`):在 **mediaserverd** 里全局 hook `AudioUnitRender`,无锁环形缓冲+抖动缓冲的实时安全实现,从 PC 音频桥 `127.10.10.10:1936` 拉 PCM(IAF1 协议,与视频的 1935/RTMP 独立),替换所有采集客户端(原相机/TikTok/全部 App)的麦克风。fail-open。plist 回到 **mediaserverd-only**(不再需要 TikTok app 注入 / RootHide 那套)。Makefile 用 `AudioToolbox`(AudioUnitRender/GetProperty 由它提供,**不要单独连 AudioUnit framework——iOS 无此独立 framework,会 ld 失败**)。postinst 额外 `killall videodecoderd`(重置解码池,避免装后首帧 1100,见 4.3)。control 升 0.3.0,`Conflicts/Replaces` 全套独立音频包。**风险**:原相机拍照→拍视频是黑屏/卡死最高危路径(4.5/4.6),上次卡死疑似多个音频包并存所致,现只留这一个 fail-open 钩子;万一卡死靠 `dpkg -r + killall mediaserverd` 恢复(沙盒可能读不到禁用开关)。**待装机验证原相机稳定性。**
 
@@ -160,7 +182,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 | **M1** | mediaserverd 注入 + BWNodeOutput emit hook + 拉流硬解 + VTPixelTransfer 就地覆盖相机 buffer | ✅ 完成 |
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
-| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | ⬜ 待做(6-d 待肉眼确认) |
+| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | 🔶 进行中:拍照 0.3.9 已默认启用但**疑为卡顿回归**(§4.8,待 photo=0 诊断包 + 心跳坐实);6-d 待肉眼确认 |
 | **M5** | 音频并入(视频+音频一个 deb) | 🔶 v0.3.0 改全局 mediaserverd 音频(原相机也生效),待装机验证原相机稳定性 |
 
 **推进节奏**:每步验证、汇报;动设备的写操作先说明、可回退。
