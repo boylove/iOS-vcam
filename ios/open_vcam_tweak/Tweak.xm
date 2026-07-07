@@ -256,13 +256,17 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
         CFRelease(att);
     }
 
+    // Snapshot src dims BEFORE releasing src (= rotated or fresh); the fail path
+    // logs them and must not read a released buffer (use-after-release -> crash,
+    // which would defeat fail-open on the very path that is supposed to recover).
+    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
     if (ts != noErr) {
         gRXferFail++;
         static BOOL logged = NO;
         if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) src=%zux%zu dst=%zux%zu dstFmt=%c%c%c%c",
-                                              (int)ts, CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
+                                              (int)ts, srcW, srcH,
                                               w, h, (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt); }
         CVPixelBufferRelease(out);
         return NULL;
@@ -480,13 +484,15 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // buffer trips the CMCapture PixelTransferSession assertion that crashes
         // mediaserverd when the stock Camera records (EXECUTION-PLAN §4.6). We now
         // SUBSTITUTE (never mutate the camera buffer) so BWNode/BWUBNode are safe.
-        const char *renderClasses[] = { "BWNode", "BWUBNode" };
+        // Include BWPixelTransferNode: the app preview flows through it, and the
+        // terminal BWNodeOutput emit substitution alone does not reach the app's
+        // preview surface. The §4.6 crash came from IN-PLACE mutation of its
+        // buffer; we now SUBSTITUTE a fresh buffer (never mutate), which should be
+        // safe. Verify stock-Camera recording separately before trusting it.
+        const char *renderClasses[] = { "BWNode", "BWUBNode", "BWPixelTransferNode" };
         for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
             VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
         }
-#ifdef VCAM_HOOK_PIXELTRANSFER   // opt-in only; crashes stock-Camera recording
-        VCamHook("BWPixelTransferNode", renderSel, (IMP)VCamRender, gRenderOrigs);
-#endif
 
         // Front/back detection for auto-mirror (config files unreadable here).
         VCamHookSourcePosition();

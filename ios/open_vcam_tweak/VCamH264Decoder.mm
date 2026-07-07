@@ -216,6 +216,10 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d",
                 (int)status, dims.width, dims.height);
         _session = NULL;
+        // Leave no half-built state: drop the format description too, so we don't
+        // sit with session==NULL but formatDesc!=NULL (which just silently drops
+        // every NALU until the next rebuild). The next buildSession recreates it.
+        if (_formatDesc) { CFRelease(_formatDesc); _formatDesc = NULL; }
         return NO;
     }
 
