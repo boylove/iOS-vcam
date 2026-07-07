@@ -52,17 +52,23 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
-// Auto-orientation. The decoded OBS frame is portrait (e.g. 1080x1920) but some
-// capture clients hand us a LANDSCAPE camera buffer (the stock Camera in video
-// mode gives ~2112x1188 16:9). Stretching a portrait source into a landscape
-// buffer both distorts it AND leaves the capture pipeline's own 90° transform to
-// rotate it — exactly the "rotated 90° + squashed" stock-Camera recording bug.
-// TikTok hands us a portrait buffer (same orientation as the source), so it looks
-// correct and must NOT be rotated. So we rotate 90° ONLY when the source and the
-// destination buffer disagree on portrait-vs-landscape; matching orientations are
-// left alone. After a 90° rotation 1080x1920 -> 1920x1080, which matches the 16:9
-// buffer aspect, so the distortion disappears too. If the stock-Camera result
-// comes out rotated the WRONG way, flip VCAM_AUTO_ORIENT_DIR to 270.
+// Auto-orientation (aspect-ratio driven, matching the closed vcamera).
+//
+// The original does NOT hardcode rotate-90 / rotate-0. It reads the DESTINATION
+// camera buffer's dimensions each frame and picks, between the raw decoded frame
+// and a 90°-rotated intermediate, whichever aspect ratio better matches the
+// target buffer — then VTPixelTransfer scales that into the camera buffer. This
+// is what makes one code path work across every client: TikTok's portrait
+// preview, the stock Camera's landscape video buffer (~2112x1188 16:9), a 4:3
+// still buffer, front/back at different resolutions, etc.
+//
+// We do the same in VCamChooseRotation: compare |srcAR - dstAR| for the source
+// as-is vs. rotated 90°, and rotate only if rotating brings the aspect ratio
+// closer to the destination. So a portrait source into a portrait buffer (TikTok)
+// stays unrotated; a portrait source into a landscape buffer (stock-Camera video)
+// rotates — killing both the distortion and the pipeline's residual 90° turn.
+// VCAM_AUTO_ORIENT_DIR selects which way to rotate when a rotation is chosen; if
+// the stock-Camera result comes out rotated the WRONG way, flip it to 270.
 #ifndef VCAM_AUTO_ORIENT
 #define VCAM_AUTO_ORIENT 1
 #endif
@@ -234,6 +240,35 @@ static CVPixelBufferRef VCamCopyRotated(CVPixelBufferRef fresh, BOOL mirror, lon
     return rotated;
 }
 
+// Decide how many degrees to rotate the OBS source so its pixels line up with the
+// destination CAMERA buffer — mirroring how the closed vcamera chooses between its
+// raw decoded frame and its rotated intermediate (report §2.2/§2.4): the choice is
+// driven by the SOURCE vs DESTINATION geometry, not a fixed angle. Different
+// clients hand us different buffers — TikTok a portrait preview, the stock Camera a
+// landscape video buffer or a 4:3 still — so a fixed 90° is wrong for half of them.
+//
+// We compare the destination's aspect ratio against the source's at 0° vs at 90°
+// and pick whichever orientation is closer to the destination. Ties (e.g. a square
+// buffer) keep 0°. Only 0/90 are considered here because a capture buffer is only
+// ever the source rotated by a quarter turn; explicit cfg.rotation still composes
+// on top. Returns 0 or 90 (the caller adds it to any configured rotation).
+#if VCAM_AUTO_ORIENT
+static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
+    size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
+    size_t dw = CVPixelBufferGetWidth(dst),  dh = CVPixelBufferGetHeight(dst);
+    if (sw == 0 || sh == 0 || dw == 0 || dh == 0) return 0;
+
+    double dstAR = (double)dw / (double)dh;
+    double arAt0  = (double)sw / (double)sh;   // source as-is
+    double arAt90 = (double)sh / (double)sw;   // source turned a quarter -> W/H swap
+
+    // Compare in log space so e.g. 2x too wide and 2x too tall weigh equally.
+    double d0  = fabs(log(arAt0  / dstAR));
+    double d90 = fabs(log(arAt90 / dstAR));
+    return (d90 < d0) ? 90 : 0;
+}
+#endif
+
 // Overwrites the camera's OWN CVImageBuffer IN PLACE with the decoded RTMP frame,
 // exactly like the closed vcamera's -[<core> modifyImageBuffer:]
 // (see ../../VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md §2.2): it calls
@@ -261,18 +296,16 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
     long rot = ((cfg.rotation % 360) + 360) % 360;
 
-    // Auto-orientation: rotate 90° only when the source and destination disagree
-    // on portrait-vs-landscape (see VCAM_AUTO_ORIENT). The stock Camera in video
-    // mode gives a landscape buffer while the OBS frame is portrait -> rotate;
-    // TikTok gives a portrait buffer -> orientations match -> no rotation. Any
-    // explicit cfg.rotation still wins (adds on top).
+    // Auto-orientation: align the OBS source to the destination buffer's geometry
+    // (see VCamAutoOrientDegrees) rather than assuming a fixed angle. The stock
+    // Camera video buffer is landscape (rotate the portrait OBS frame 90°); TikTok's
+    // preview buffer is portrait (already aligned -> 0°); a 4:3 still lands closer to
+    // one of the two and is picked accordingly. VCAM_AUTO_ORIENT_DIR flips the sense
+    // (90 vs 270) if the result turns the wrong way. Explicit cfg.rotation composes
+    // on top so a user override still applies.
 #if VCAM_AUTO_ORIENT
-    if (rot == 0) {
-        size_t cw = CVPixelBufferGetWidth(cameraBuf), ch = CVPixelBufferGetHeight(cameraBuf);
-        size_t sw = CVPixelBufferGetWidth(fresh), sh = CVPixelBufferGetHeight(fresh);
-        BOOL dstLandscape = cw > ch;
-        BOOL srcLandscape = sw > sh;
-        if (dstLandscape != srcLandscape) rot = VCAM_AUTO_ORIENT_DIR;
+    if (VCamAutoOrientDegrees(fresh, cameraBuf) == 90) {
+        rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
     }
 #endif
 
@@ -321,9 +354,13 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 // is what a virtual camera wants — the OBS frame lands in the photo whether or
 // not a face is present.
 // ---------------------------------------------------------------------------
+// Counters stay unconditionally compiled: the always-on health line reads them so
+// the syslog shows photo[...] = 0 when the photo path is disabled (the default).
+static uint64_t gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail, gPhotoReplaced;
+
+#if VCAM_HOOK_PHOTO_NODES
 static VTPixelTransferSessionRef gPhotoTransferSession;
 static NSLock *gPhotoVTLock;
-static uint64_t gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail, gPhotoReplaced;
 
 static void VCamEnsurePhotoSession(void) {
     static dispatch_once_t once;
@@ -386,6 +423,7 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
     gPhotoReplaced++;
     return YES;
 }
+#endif  // VCAM_HOOK_PHOTO_NODES
 
 // ---------------------------------------------------------------------------
 // Hook plumbing for private mediaserverd classes (objc_getClass + MSHookMessageEx)
@@ -434,12 +472,14 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
 // VCamOverwritePhotoInPlace means only the first node in the chain does the
 // transfer; the rest see the tag and pass through. forInput: is opaque here
 // (BWNodeInput*), so it is threaded straight to the original untouched.
+#if VCAM_HOOK_PHOTO_NODES
 static void VCamPhotoRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     IMP orig = VCamFindOrig(gRenderOrigs, self);
     if (!orig) return;
     if (sb) VCamOverwritePhotoInPlace(sb);
     ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
 }
+#endif
 
 // -[FigCaptureSourceConfiguration sourcePosition] — records which physical
 // camera is active (front/back) so the overwrite path can auto-mirror the front
