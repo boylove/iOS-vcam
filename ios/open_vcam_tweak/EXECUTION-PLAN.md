@@ -103,9 +103,10 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 ## 6. 已完成 / 待办
 
 ### ✅ 已完成并验证
-- 自写 RTMP 客户端、VideoToolbox 软解、FrameStore、mediaserverd BW hook、就地覆盖。
-- **端到端成功**:OBS 稳定显示在 RootHide 化 TikTok,100% 帧覆盖。
-- 解码器 1100 根因定位(videodecoderd 会话耗尽)+ 软解规避。
+- 自写 RTMP 客户端、VideoToolbox **硬解**(照原作者:非强制软解)、FrameStore、mediaserverd `BWNodeOutput emitSampleBuffer:` hook。
+- **换帧=替换**:VT 转换(VTPixelTransfer/Rotation)进自建 pool 缓冲 → 造新 CMSampleBuffer 传下游,**不改相机原 buffer**(照闭源;旧的 CIContext 就地覆盖已弃——慢+原相机录制崩+YCbCr 黑屏)。
+- **端到端成功**:OBS 显示在 RootHide 化 TikTok。
+- 解码器 1100 根因定位(videodecoderd 会话耗尽)+ 会话复用 + create 退避。
 - 反向隧道、CI(build+retag+validate)、VCamLog C 链接。
 
 ### 🔶 稍后继续开发(按建议优先级)
@@ -115,17 +116,17 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 - [ ] **6-d 人脸检测确认**:检测在覆盖下游运行,应能识别 OBS 画面里的脸——用户用 TikTok 人脸贴纸实测确认(代码层不覆盖元数据/人脸节点,理论已可用)。
 - [ ] **6-e 沙盒可达的开关/配置(可选)**:用 Darwin notify(`notify_set_state`/`notify_get_state`,64 位可编码 enabled/mirror/rotation 等 flag)或 mach IPC,让配置/kill-switch 在 mediaserverd 里可控;或注入 SpringBoard 读 vc.plist 再经 IPC 传入(vcamera 疑似此法)。
 - [ ] **6-f 拍照替换**:hook `BWPhotoEncoderNode renderSampleBuffer:forInput:` 等。
-- [ ] **6-g 健壮性**:保宽高比选项(当前拉伸);CIContext 预热移出采集线程;拉流线程相机空闲时可停。
+- [ ] **6-g 健壮性 / 完整复刻**:① BGRA/YUV 多路径 + 可选 GPUImage 美颜(原包有 `_h264DecoderToBGRA/_h264DecoderToYUV` + GPUImage 链,当前只 420v+VT transfer,够出画不够全);② 保宽高比选项(当前拉伸);③ 色彩/chroma 元数据当前在 decode 回调打 attachment(原包在 VTDecompressionSessionCreate 前构造参与创建,功能等价但非逐字);④ 拉流线程相机空闲时可停。
 - [x] **P3 音频并入 —— 全局 mediaserverd 版**(v0.3.0,当前方向):用户要求音频也像视频一样全局、原相机也生效,不只 TikTok。故 v0.2.0 的 app 级 `VCamAudio.x`(只注入 TikTok,靠 RootHide `.roothidepatch`+pkgmirror 才注入,已弃)**被替换**为 `VCamAudioMS.x`(移植自 `ios/audio_bridge_media_active_tweak`):在 **mediaserverd** 里全局 hook `AudioUnitRender`,无锁环形缓冲+抖动缓冲的实时安全实现,从 PC 音频桥 `127.10.10.10:1936` 拉 PCM(IAF1 协议,与视频的 1935/RTMP 独立),替换所有采集客户端(原相机/TikTok/全部 App)的麦克风。fail-open。plist 回到 **mediaserverd-only**(不再需要 TikTok app 注入 / RootHide 那套)。Makefile 用 `AudioToolbox`(AudioUnitRender/GetProperty 由它提供,**不要单独连 AudioUnit framework——iOS 无此独立 framework,会 ld 失败**)。postinst 额外 `killall videodecoderd`(重置解码池,避免装后首帧 1100,见 4.3)。control 升 0.3.0,`Conflicts/Replaces` 全套独立音频包。**风险**:原相机拍照→拍视频是黑屏/卡死最高危路径(4.5/4.6),上次卡死疑似多个音频包并存所致,现只留这一个 fail-open 钩子;万一卡死靠 `dpkg -r + killall mediaserverd` 恢复(沙盒可能读不到禁用开关)。**待装机验证原相机稳定性。**
 
 ---
 
 ## 7. 🕳️ 防坑清单
 
-1. mediaserverd 换帧要保原格式(就地覆盖最稳,避 CMCapture 断言)。
+1. mediaserverd 换帧**别就地改相机 buffer**——造新 sample buffer 替换(VT 转成相机格式),否则原相机录制会触发 CMCapture PixelTransferSession 断言崩溃(4.6)。
 2. **配置别指望文件**:mediaserverd 沙盒挡所有路径(4.4)。mirror 走 sourcePosition;开关走卸载或 notify。
 3. **解码 1100 先想到 videodecoderd 会话耗尽**(反复 killall -9 的后果),`killall videodecoderd` 重置;生产只 killall 一次(4.3)。
-4. 解码器规范用 raw key 字符串(命名常量 iOS17+ 触发 -Werror)。
+4. Theos 默认 **-Werror**:iOS15+ 弃用 API(如 `CVBufferGetAttachments`→用 `CVBufferCopyAttachments`)、iOS17+ 标注常量都会编译失败;iOS 无独立 `AudioUnit` framework(只连 `AudioToolbox`)。
 5. 没反向隧道拉不到流(4.2)。
 6. 别输出黑屏/冻结 → fail-open。
 7. 别与闭源 vcamera 同装(Conflicts/Replaces 已做)。
@@ -151,7 +152,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
-| **M1** | mediaserverd 注入 + BW hook + 拉流软解 + 就地覆盖 | ✅ 完成 |
+| **M1** | mediaserverd 注入 + BWNodeOutput hook + 拉流硬解 + VT 转换造新 sample buffer 替换 | ✅ 完成 |
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
 | **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | ⬜ 待做(6-d 待肉眼确认) |
