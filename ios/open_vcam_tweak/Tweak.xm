@@ -15,21 +15,28 @@
 // ---------------------------------------------------------------------------
 // OpenVCam — mediaserverd camera replacement.
 //
-// Replicates the closed com.x.vcamera approach: hook the terminal BufferWorks
-// node `BWNodeOutput -emitSampleBuffer:` inside mediaserverd and SUBSTITUTE a
-// brand-new sample buffer built from the decoded RTMP frame. We never mutate the
-// camera's own CVPixelBuffer — the decoded frame is transferred (VTPixelTransfer
-// + VTPixelRotation, camera pixel-format/size) into our own pool buffer, wrapped
-// in a fresh CMSampleBuffer carrying the original timing/attachments, and passed
-// to the original method. In-place overwrite (old CIContext path) was slow and
-// crashed stock-Camera recording via the CMCapture PixelTransferSession
-// assertion; substitution avoids both. Because mediaserverd sits below every
-// app, this replaces the camera for all clients, including RootHide-patched apps
-// (TikTok) that bypass normal app-level tweak injection.
+// Replicates the closed com.x.vcamera approach byte-for-byte per the deep binary
+// reverse (../../VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md): hook the terminal
+// BufferWorks node `BWNodeOutput -emitSampleBuffer:` inside mediaserverd and
+// OVERWRITE THE CAMERA'S OWN CVImageBuffer IN PLACE with the decoded RTMP frame
+// via VTPixelTransferSessionTransferImage, then pass the SAME (now-overwritten)
+// sample buffer to the original. In-place overwrite of the shared IOSurface is
+// what actually reaches every client's live preview — apps read that upstream
+// surface directly, so emitting a fresh downstream buffer never reaches them
+// (that was the earlier bug). Using VideoToolbox (not CIContext), on the terminal
+// emit only (never the BWPixelTransferNode), is why the original neither lags nor
+// crashes stock-Camera recording. Because mediaserverd sits below every app, this
+// replaces the camera for all clients, including RootHide-patched apps (TikTok)
+// that bypass normal app-level tweak injection.
 //
-// See memory: vcamera-mediaserverd-hookpoints; report: VCAMERA_REVERSE_REPORT.md.
-// Fail-open everywhere; /var/mobile/vc.disabled or vc.plist enabled=false ->
-// pure pass-through (never a black or frozen frame).
+// Still-photo capture is covered by the same in-place overwrite on the photo
+// render nodes (BWStillImageScalerNode / BWPhotoEncoderNode), guarded by a
+// TransitionID attachment so the one buffer that flows through several photo
+// nodes is only overwritten once (report §2.3).
+//
+// See memory: vcamera-mediaserverd-hookpoints; report:
+// VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md. Fail-open everywhere; a missing/stale
+// decoded frame -> pure pass-through (never a black or frozen frame).
 // ---------------------------------------------------------------------------
 
 #define VCAM_LOG_NAME @"OpenVCam.log"
@@ -43,6 +50,18 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 // opposite — this is the one knob to flip after a visual check.
 #ifndef VCAM_FRONT_AUTOMIRROR
 #define VCAM_FRONT_AUTOMIRROR 1
+#endif
+
+// Still-photo replacement. The closed vcamera also overwrites the photo path
+// (report §2.3: -[<core> modifyPixelBuffer:] on the BWStillImageScalerNode /
+// BWPhotoEncoderNode chain, with a TransitionID dedup mark). Enabled by default
+// so a still capture returns the OBS frame, not the real lens. On THIS device
+// the stock-Camera photo->video transition is the highest-risk crash path
+// (EXECUTION-PLAN §4.6), so it is behind a compile flag: build with
+// -DVCAM_HOOK_PHOTO_NODES=0 to drop back to live-video-only if a still capture
+// ever destabilises the stock Camera. Fail-open regardless.
+#ifndef VCAM_HOOK_PHOTO_NODES
+#define VCAM_HOOK_PHOTO_NODES 1
 #endif
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
@@ -81,20 +100,6 @@ void VCamLog(NSString *format, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// Frame substitution (mirrors the closed vcamera's proven approach).
-//
-// We do NOT mutate the camera's shared CVPixelBuffer in place. Doing that is
-// slow (the stock Camera routes a frame through several capture-graph nodes, so
-// hooking them overwrote each frame multiple times) and, worse, trips the
-// CMCapture PixelTransferSession assertion and crashes mediaserverd the moment
-// the stock Camera records (EXECUTION-PLAN §4.6). The closed vcamera instead
-// renders its frame into its OWN pool buffer and emits a brand-new sample
-// buffer downstream, never touching the camera's buffer — so it neither lags
-// nor crashes. We do the same: render the decoded RTMP frame into a pool buffer
-// matching the camera buffer, wrap it in a fresh CMSampleBuffer carrying the
-// original timing + attachments, and hand that to the original method.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // VideoToolbox pixel-transfer session.
 //
 // The closed vcamera converts the decoded RTMP frame into a camera-format buffer
@@ -128,14 +133,14 @@ static void VCamEnsureSessions(void) {
 }
 
 // A CVPixelBufferPool keyed on (width, height, pixel format); recreated only when
-// those change. Used for the substitute buffers handed to the capture graph.
+// those change. Used for the rotation intermediate buffer (VCamCopyRotated).
 typedef struct { CVPixelBufferPoolRef pool; size_t w, h; OSType fmt; } VCamPool;
-static VCamPool gOutPool;
 
-// Always-on failure-reason counters so the periodic health line reports WHY a
-// replacement returned NULL (fail-open) — the startup-gated debug logs fire
-// before a syslog capture can attach, so these are the reliable diagnostic.
-static uint64_t gRNoFresh, gRNoXfer, gRNoPool, gRXferFail, gRNoSB;
+// Always-on failure-reason counters so the periodic health line reports WHY an
+// overwrite was skipped (fail-open): no fresh decoded frame, no transfer session,
+// or the VT transfer failed. Read in the health line; that is the reliable
+// diagnostic (startup-gated debug logs fire before a syslog capture can attach).
+static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
 
 static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt) {
     static NSLock *lock;
@@ -206,154 +211,148 @@ static CVPixelBufferRef VCamCopyRotated(CVPixelBufferRef fresh, BOOL mirror, lon
     return rotated;
 }
 
-// Transfers the latest decoded frame (scaled + pixel-format converted) into a
-// fresh pool buffer matching `templatePB`. Returns a retained buffer, or NULL
-// when there is no fresh frame (caller then passes the real camera frame through).
-static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
-    if (!templatePB) return NULL;
+// Overwrites the camera's OWN CVImageBuffer IN PLACE with the decoded RTMP frame,
+// exactly like the closed vcamera's -[<core> modifyImageBuffer:]
+// (see ../../VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md §2.2): it calls
+// VTPixelTransferSessionTransferImage(session, OBS frame, CAMERA image buffer),
+// writing straight into the camera's shared IOSurface. THAT is what actually
+// reaches the app's live preview — apps read that shared surface directly, so
+// substituting a new sample buffer downstream does not reach them. Using VT (not
+// CIContext), on the terminal emit only (not the PixelTransfer node), is why the
+// original neither crashes stock-Camera recording nor lags. Returns YES on
+// overwrite; on any failure returns NO and the caller passes the real frame.
+static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
+    if (!cameraBuf) return NO;
     VCamConfig *cfg = [VCamConfig shared];
-    if (!cfg.enabled) return NULL;
+    if (!cfg.enabled) return NO;
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
-    if (!fresh) { gRNoFresh++; return NULL; }             // stale/no stream -> real camera
+    if (!fresh) { gRNoFresh++; return NO; }             // stale/no stream -> real camera
 
     VCamEnsureSessions();
-    if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NULL; }
+    if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NO; }
 
-    size_t w = CVPixelBufferGetWidth(templatePB);
-    size_t h = CVPixelBufferGetHeight(templatePB);
-    OSType fmt = CVPixelBufferGetPixelFormatType(templatePB);
-
-    CVPixelBufferRef out = VCamPoolCopy(&gOutPool, w, h, fmt);
-    if (!out) { gRNoPool++; CVPixelBufferRelease(fresh); return NULL; }
-
-    // Rotate / mirror first (front camera auto-mirrors; config files are
-    // unreadable in mediaserverd so mirror is driven by the sourcePosition hook),
-    // then scale + pixel-format/range convert into the camera-format buffer.
+    // Rotate / front-camera mirror first (config files are unreadable in
+    // mediaserverd, so mirror is driven by the sourcePosition hook).
     BOOL frontCamera = (gSourcePosition == 2);
     BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
     long rot = ((cfg.rotation % 360) + 360) % 360;
     CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
 
+    // Scale + pixel-format/range convert the OBS frame directly INTO the camera
+    // buffer. Serialised by gVTLock (the capture graph is multi-threaded), like
+    // the original's per-instance lock around its transfer session. ScalingMode
+    // is set on the session (VCamEnsureSessions) so a src/dst size mismatch works.
     [gVTLock lock];
-    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, out);
+    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
     [gVTLock unlock];
 
-#if VCAM_DEBUG
-    { static int d = 0; if (d < 12) { d++;
-        VCamDebugLog(@"repl: srcW=%zu srcH=%zu camW=%zu camH=%zu camFmt=%c%c%c%c out=%p ts=%d",
-                     CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src), w, h,
-                     (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt, out, (int)ts); } }
-#endif
-
-    // Copy the camera buffer's colour attachments (YCbCr matrix, primaries,
-    // transfer function, clean aperture, ...) onto our buffer so downstream and
-    // the graph teardown treat it identically to a real camera frame.
-    CFDictionaryRef att = CVBufferCopyAttachments(templatePB, kCVAttachmentMode_ShouldPropagate);
-    if (att) {
-        CVBufferSetAttachments(out, att, kCVAttachmentMode_ShouldPropagate);
-        CFRelease(att);
-    }
-
-    // Snapshot src dims BEFORE releasing src (= rotated or fresh); the fail path
-    // logs them and must not read a released buffer (use-after-release -> crash,
-    // which would defeat fail-open on the very path that is supposed to recover).
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
     if (ts != noErr) {
         gRXferFail++;
         static BOOL logged = NO;
-        if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) src=%zux%zu dst=%zux%zu dstFmt=%c%c%c%c",
+        if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) src=%zux%zu dst=%zux%zu",
                                               (int)ts, srcW, srcH,
-                                              w, h, (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt); }
-        CVPixelBufferRelease(out);
-        return NULL;
+                                              CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf)); }
+        return NO;
     }
-    return out;
+    return YES;
 }
 
-// Builds a replacement CMSampleBuffer (fresh frame + original timing/attachments)
-// or NULL. Caller passes it to the original method and then CFReleases it.
-static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef origSB) {
-    CVImageBufferRef origPB = CMSampleBufferGetImageBuffer(origSB);
-    if (!origPB) return NULL;
+// ---------------------------------------------------------------------------
+// Photo / still-capture path — mirrors the closed vcamera's
+// -[<core> modifyPixelBuffer:] (report §2.3).
+//
+// A still-capture sample buffer flows through several photo nodes in turn
+// (BWStillImageScalerNode -> BWPhotoEncoderNode -> preview/thumbnail), so the
+// original overwrites the image buffer IN PLACE and stamps a dedup attachment so
+// the same buffer is never overwritten twice as it moves down the graph. We do
+// the same: overwrite once at the earliest photo node, tag the buffer, and skip
+// any node that sees the tag. A DEDICATED transfer session (matching the
+// original's second session at +0x90) keeps still captures off the live-video
+// session's lock. Fail-open everywhere: any miss -> the real still frame.
+//
+// The original repurposes CoreMedia's kCMSampleBufferAttachmentKey_TransitionID
+// for the dedup mark; we use a private key instead so we never perturb the real
+// transition semantics the photo encoder may rely on. The original also gates
+// this on a detected face (its beauty path); we replace unconditionally, which
+// is what a virtual camera wants — the OBS frame lands in the photo whether or
+// not a face is present.
+// ---------------------------------------------------------------------------
+static VTPixelTransferSessionRef gPhotoTransferSession;
+static NSLock *gPhotoVTLock;
+static uint64_t gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail, gPhotoReplaced;
 
-    CVPixelBufferRef out = VCamCopyReplacementBuffer(origPB);
-    if (!out) return NULL;
-
-    [[VCamRTMPSource shared] ensureStarted];
-
-    // Reuse the camera sample buffer's OWN format description. Our buffer has the
-    // identical pixel format + dimensions (the transfer target came from origPB),
-    // so the description matches. A description created afresh from our buffer
-    // differs subtly and made -[BWGraph stop:] assert on capture teardown;
-    // reusing the original makes our frame indistinguishable from the camera's.
-    // Create the format description FRESH from our own buffer. CMSampleBufferCreate‐
-    // ForImageBuffer requires the description to match the image buffer exactly;
-    // reusing the camera sample buffer's description (which carries format
-    // extensions our pool buffer lacks) makes creation FAIL — that was the noSB
-    // failure. The closed vcamera also creates its description from its own buffer.
-    CMVideoFormatDescriptionRef fd = NULL;
-    BOOL ownFd = NO;
-    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd) == noErr && fd) {
-        ownFd = YES;
-    } else {
-        fd = (CMVideoFormatDescriptionRef)CMSampleBufferGetFormatDescription(origSB);  // fallback
-    }
-
-    CMSampleBufferRef newSB = NULL;
-    OSStatus s = -1;
-    if (fd) {
-        CMSampleTimingInfo timing;
-        if (CMSampleBufferGetSampleTimingInfo(origSB, 0, &timing) != noErr) {
-            timing.duration = kCMTimeInvalid;
-            timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(origSB);
-            timing.decodeTimeStamp = kCMTimeInvalid;
+static void VCamEnsurePhotoSession(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gPhotoVTLock = [[NSLock alloc] init];
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gPhotoTransferSession);
+        if (gPhotoTransferSession) {
+            // Same reason as the video session: without a scaling mode the transfer
+            // FAILS whenever the still buffer's size differs from the decoded frame.
+            VTSessionSetProperty(gPhotoTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
+                                 kVTScalingMode_Normal);
         }
-        s = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, out, true, NULL, NULL,
-                                               fd, &timing, &newSB);
+    });
+}
+
+static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
+    if (!sb) return NO;
+    VCamConfig *cfg = [VCamConfig shared];
+    if (!cfg.enabled) return NO;
+
+    // Dedup: this still buffer may pass through several photo nodes; overwrite
+    // exactly once. A propagating attachment carries the mark onto any buffer the
+    // scaler derives from it, so the encoder/preview/thumbnail nodes skip it.
+    if (CMGetAttachment(sb, CFSTR("VCamTransitionID"), NULL) != NULL) {
+        gRPhotoDup++;
+        return YES;   // already ours from an upstream node
     }
-    if (ownFd && fd) CFRelease(fd);
-    CVPixelBufferRelease(out);
-    if (s != noErr || !newSB) {
-        gRNoSB++;
+
+    CVImageBufferRef dst = CMSampleBufferGetImageBuffer(sb);
+    if (!dst) return NO;
+
+    CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
+    if (!fresh) { gRPhotoNoFresh++; return NO; }        // stale/no stream -> real still
+
+    VCamEnsurePhotoSession();
+    if (!gPhotoTransferSession) { CVPixelBufferRelease(fresh); return NO; }
+
+    BOOL frontCamera = (gSourcePosition == 2);
+    BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
+    long rot = ((cfg.rotation % 360) + 360) % 360;
+    CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
+    CVPixelBufferRef src = rotated ? rotated : fresh;
+
+    [gPhotoVTLock lock];
+    OSStatus ts = VTPixelTransferSessionTransferImage(gPhotoTransferSession, src, dst);
+    [gPhotoVTLock unlock];
+
+    if (rotated) CVPixelBufferRelease(rotated);
+    CVPixelBufferRelease(fresh);
+    if (ts != noErr) {
+        gRPhotoXferFail++;
         static BOOL logged = NO;
-        if (!logged) { logged = YES; VCamLog(@"sampleBuffer create failed (%d) fd=%p", (int)s, fd); }
-        return NULL;
+        if (!logged) { logged = YES; VCamLog(@"photo transfer failed (%d)", (int)ts); }
+        return NO;
     }
 
-    // Propagate the per-sample attachments (orientation / dependency flags etc.)
-    // so downstream treats our frame exactly like the camera's.
-    CFArrayRef src = CMSampleBufferGetSampleAttachmentsArray(origSB, false);
-    if (src && CFArrayGetCount(src) > 0) {
-        CFArrayRef dst = CMSampleBufferGetSampleAttachmentsArray(newSB, true);
-        if (dst && CFArrayGetCount(dst) > 0) {
-            CFDictionaryRef s0 = (CFDictionaryRef)CFArrayGetValueAtIndex(src, 0);
-            CFMutableDictionaryRef d0 = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(dst, 0);
-            if (s0 && d0) {
-                CFIndex n = CFDictionaryGetCount(s0);
-                if (n > 0) {
-                    const void **keys = (const void **)malloc(sizeof(void *) * (size_t)n);
-                    const void **vals = (const void **)malloc(sizeof(void *) * (size_t)n);
-                    if (keys && vals) {
-                        CFDictionaryGetKeysAndValues(s0, keys, vals);
-                        for (CFIndex i = 0; i < n; i++) CFDictionarySetValue(d0, keys[i], vals[i]);
-                    }
-                    free(keys); free(vals);
-                }
-            }
-        }
-    }
-    return newSB;
+    // Tag so downstream photo nodes skip re-overwriting this (or a derived) buffer.
+    CMSetAttachment(sb, CFSTR("VCamTransitionID"), (__bridge CFTypeRef)@(1),
+                    kCMAttachmentMode_ShouldPropagate);
+    gPhotoReplaced++;
+    return YES;
 }
 
 // ---------------------------------------------------------------------------
 // Hook plumbing for private mediaserverd classes (objc_getClass + MSHookMessageEx)
 // ---------------------------------------------------------------------------
 static NSMutableDictionary<NSValue *, NSValue *> *gEmitOrigs;    // Class -> IMP
-static NSMutableDictionary<NSValue *, NSValue *> *gRenderOrigs;  // Class -> IMP
+static NSMutableDictionary<NSValue *, NSValue *> *gRenderOrigs;  // photo nodes -> IMP
 
 static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) {
     Class c = object_getClass(obj);
@@ -365,58 +364,42 @@ static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) 
     return NULL;
 }
 
-// -[... emitSampleBuffer:] — substitute a fresh sample buffer, never mutate sb.
+// -[BWNodeOutput emitSampleBuffer:] — overwrite the camera's image buffer IN
+// PLACE (exactly like vcamera's -[<core> modifyImageBuffer:]), then call the
+// original with the ORIGINAL sample buffer. This is the ONLY node the original
+// modifies; the render nodes are left untouched (see the deep reverse report).
 static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     IMP orig = VCamFindOrig(gEmitOrigs, self);
     if (!orig) return;
-    CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
-                                ? VCamCreateReplacementSampleBuffer(sb) : NULL;
-#if VCAM_DEBUG
-    { static uint64_t c = 0; c++; if ((c % 400) == 0) {
-        CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
-        OSType f = ib ? CVPixelBufferGetPixelFormatType(ib) : 0;
-        VCamDebugLog(@"emit: cls=%s img=%d %zux%zu fmt=%c%c%c%c rep=%d",
-                     class_getName(object_getClass(self)), ib != NULL,
-                     ib ? CVPixelBufferGetWidth(ib) : 0, ib ? CVPixelBufferGetHeight(ib) : 0,
-                     (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f, rep != NULL); } }
-#endif
-    ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, rep ?: sb);
-    if (rep) CFRelease(rep);
+    [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
+    CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+    BOOL did = ib ? VCamOverwriteInPlace(ib) : NO;
+    ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);   // original sb, now overwritten
 
-    // Lightweight always-on health line (release builds are otherwise silent once
-    // running): every ~600 emits report how many frames we actually replaced, so
-    // "OBS not showing" can be told apart from "decoder idle / fail-open" from the
-    // syslog alone. Logs the FIRST replacement immediately so success is visible.
+    // Always-on health line: distinguishes "OBS not showing" (replaced=0) from
+    // "decoder idle / fail-open" via syslog; the why[] counters pinpoint the cause.
     static uint64_t calls = 0, repl = 0;
     calls++;
-    if (rep) {
-        repl++;
-        if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
-    }
+    if (did) { repl++; if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)"); }
     if ((calls % 600) == 0)
-        VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu noPool=%llu xferFail=%llu noSB=%llu]",
-                calls, repl, gRNoFresh, gRNoXfer, gRNoPool, gRXferFail, gRNoSB);
+        VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu] "
+                "photo[replaced=%llu noFresh=%llu dup=%llu xferFail=%llu]",
+                calls, repl, gRNoFresh, gRNoXfer, gRXferFail,
+                gPhotoReplaced, gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail);
 }
 
-// -[... renderSampleBuffer:forInput:] — only installed when VCAM_HOOK_RENDER_NODES
-// is set (off by default; emit-only is enough and avoids the record-path crash).
-__attribute__((unused))
-static void VCamRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
+// -[<photo node> renderSampleBuffer:forInput:] — the still-capture nodes
+// (BWStillImageScalerNode, BWPhotoEncoderNode). Overwrite the still buffer IN
+// PLACE with the OBS frame, then call the original so the encoder/preview/
+// thumbnail still run on our pixels. The TransitionID dedup inside
+// VCamOverwritePhotoInPlace means only the first node in the chain does the
+// transfer; the rest see the tag and pass through. forInput: is opaque here
+// (BWNodeInput*), so it is threaded straight to the original untouched.
+static void VCamPhotoRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     IMP orig = VCamFindOrig(gRenderOrigs, self);
     if (!orig) return;
-    CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
-                                ? VCamCreateReplacementSampleBuffer(sb) : NULL;
-#if VCAM_DEBUG
-    { static uint64_t c = 0; c++; if ((c % 400) == 0) {
-        CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
-        OSType f = ib ? CVPixelBufferGetPixelFormatType(ib) : 0;
-        VCamDebugLog(@"render: cls=%s img=%d %zux%zu fmt=%c%c%c%c rep=%d",
-                     class_getName(object_getClass(self)), ib != NULL,
-                     ib ? CVPixelBufferGetWidth(ib) : 0, ib ? CVPixelBufferGetHeight(ib) : 0,
-                     (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f, rep != NULL); } }
-#endif
-    ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, rep ?: sb, input);
-    if (rep) CFRelease(rep);
+    if (sb) VCamOverwritePhotoInPlace(sb);
+    ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
 }
 
 // -[FigCaptureSourceConfiguration sourcePosition] — records which physical
@@ -463,43 +446,44 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         if (![proc isEqualToString:@"mediaserverd"]) return;   // safety: mediaserverd only
 
         gEmitOrigs = [NSMutableDictionary dictionary];
-        gRenderOrigs = [NSMutableDictionary dictionary];
 
         VCamConfig *cfg = [VCamConfig shared];
         VCamLog(@"loading in mediaserverd, enabled=%d url=%@", cfg.enabled, cfg.rtmpURL);
 
-        SEL emitSel = @selector(emitSampleBuffer:);
+        // Hook ONLY the terminal BWNodeOutput emitSampleBuffer:. Per the binary
+        // analysis of the closed vcamera (VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md),
+        // that is the single place it modifies the frame: it overwrites the camera's
+        // own image buffer IN PLACE there (via VTPixelTransfer), and passes the same
+        // sample buffer on. Modifying the shared IOSurface is what reaches the app's
+        // live preview. vcamera hooks the render nodes too but only as pass-through,
+        // so we don't hook them at all — which also avoids the BWPixelTransferNode
+        // recording-crash path entirely.
+        VCamHook("BWNodeOutput", @selector(emitSampleBuffer:), (IMP)VCamEmit, gEmitOrigs);
 
-        // Terminal emit path. Substituting only here (emit-only) replaces the
-        // frame for downstream consumers but NOT the live preview: the preview
-        // branches off the graph at the intermediate render nodes, upstream of
-        // BWNodeOutput. So we ALSO substitute at the video-carrying render nodes
-        // BWNode / BWUBNode (renderSampleBuffer:forInput:) — that is where the
-        // preview frame is produced.
-        VCamHook("BWNodeOutput", emitSel, (IMP)VCamEmit, gEmitOrigs);
-
+        // Still-capture path (report §1.1/§2.3). The live-video emit hook above
+        // only covers the streaming preview; a still photo flows through the photo
+        // nodes instead, so without these the shutter captures the REAL lens. We
+        // overwrite the still buffer IN PLACE at these nodes with TransitionID
+        // dedup (VCamOverwritePhotoInPlace) — the same nodes and technique the
+        // closed vcamera uses. These are the photo scaler/encoder nodes, NOT the
+        // live-video render nodes the report warns crash recording when overwritten
+        // (BWNode/BWUBNode/BWPixelTransferNode) — those we still never touch.
+        // Compile-time escape hatch: -DVCAM_HOOK_PHOTO_NODES=0 disables the still
+        // path entirely (shutter falls back to the real lens) if it ever misbehaves
+        // on the stock Camera, without affecting live streaming.
+#if VCAM_HOOK_PHOTO_NODES
+        gRenderOrigs = [NSMutableDictionary dictionary];
         SEL renderSel = @selector(renderSampleBuffer:forInput:);
-        // BWNode + BWUBNode reach the preview. We EXCLUDE BWPixelTransferNode:
-        // it is the recording-path format/resolution converter, and touching its
-        // buffer trips the CMCapture PixelTransferSession assertion that crashes
-        // mediaserverd when the stock Camera records (EXECUTION-PLAN §4.6). We now
-        // SUBSTITUTE (never mutate the camera buffer) so BWNode/BWUBNode are safe.
-        // Include BWPixelTransferNode: the app preview flows through it, and the
-        // terminal BWNodeOutput emit substitution alone does not reach the app's
-        // preview surface. The §4.6 crash came from IN-PLACE mutation of its
-        // buffer; we now SUBSTITUTE a fresh buffer (never mutate), which should be
-        // safe. Verify stock-Camera recording separately before trusting it.
-        const char *renderClasses[] = { "BWNode", "BWUBNode", "BWPixelTransferNode" };
-        for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
-            VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
-        }
+        VCamHook("BWStillImageScalerNode", renderSel, (IMP)VCamPhotoRender, gRenderOrigs);
+        VCamHook("BWPhotoEncoderNode",     renderSel, (IMP)VCamPhotoRender, gRenderOrigs);
+#endif
 
         // Front/back detection for auto-mirror (config files unreadable here).
         VCamHookSourcePosition();
 
         // Start pulling immediately; frames only get used once enabled + fresh.
         [[VCamRTMPSource shared] ensureStarted];
-        VCamLog(@"hooks installed (%lu emit, %lu render)",
+        VCamLog(@"hooks installed (%lu emit, %lu photo)",
                 (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count);
     }
 }
