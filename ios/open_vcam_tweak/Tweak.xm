@@ -1,7 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
-#import <CoreImage/CoreImage.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <stdarg.h>
@@ -88,74 +88,63 @@ void VCamLog(NSString *format, ...) {
 // matching the camera buffer, wrap it in a fresh CMSampleBuffer carrying the
 // original timing + attachments, and hand that to the original method.
 // ---------------------------------------------------------------------------
-static CIContext *VCamCIContext(void) {
-    static CIContext *ctx;
+// ---------------------------------------------------------------------------
+// VideoToolbox pixel-transfer session.
+//
+// The closed vcamera converts the decoded RTMP frame into a camera-format buffer
+// with VTPixelTransferSession (scale + pixel-format / colour-range conversion),
+// NOT CoreImage. CIContext rendering a decoded frame into a biplanar YCbCr
+// (420v/420f) buffer with a NULL colour space came out BLACK downstream;
+// VTPixelTransferSession does the YCbCr<->YCbCr and video<->full-range
+// conversion correctly. The session adapts to the src/dst buffers on each call,
+// so we create it once and reuse it, serialised by gVTLock because the capture
+// graph can service several source nodes concurrently.
+// (Rotation / front-camera mirror is added on top with VTPixelRotationSession in
+// a follow-up; the priority here is a correct, non-crashing colour frame.)
+// ---------------------------------------------------------------------------
+static VTPixelTransferSessionRef gTransferSession;
+static NSLock *gVTLock;
+
+static void VCamEnsureSessions(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        @try {
-            ctx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
-        } @catch (__unused NSException *e) { ctx = nil; }
+        gVTLock = [[NSLock alloc] init];
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
     });
-    return ctx;
 }
 
-// Pool of replacement pixel buffers, matching the current camera buffer's pixel
-// format + dimensions (recreated only when those change).
-static CVPixelBufferPoolRef gPool;
-static size_t gPoolW, gPoolH;
-static OSType gPoolFmt;
+// A CVPixelBufferPool keyed on (width, height, pixel format); recreated only when
+// those change. Used for the substitute buffers handed to the capture graph.
+typedef struct { CVPixelBufferPoolRef pool; size_t w, h; OSType fmt; } VCamPool;
+static VCamPool gOutPool;
 
-static CVPixelBufferRef VCamCopyPoolBuffer(size_t w, size_t h, OSType fmt) {
+static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt) {
     static NSLock *lock;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
 
     CVPixelBufferRef out = NULL;
     [lock lock];
-    if (!gPool || gPoolW != w || gPoolH != h || gPoolFmt != fmt) {
-        if (gPool) { CVPixelBufferPoolRelease(gPool); gPool = NULL; }
+    if (!p->pool || p->w != w || p->h != h || p->fmt != fmt) {
+        if (p->pool) { CVPixelBufferPoolRelease(p->pool); p->pool = NULL; }
         NSDictionary *attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey       : @(fmt),
-            (id)kCVPixelBufferWidthKey                 : @(w),
-            (id)kCVPixelBufferHeightKey                : @(h),
-            (id)kCVPixelBufferIOSurfacePropertiesKey   : @{},
-            (id)kCVPixelBufferMetalCompatibilityKey    : @YES,  // let the GPU CIContext render into it
+            (id)kCVPixelBufferPixelFormatTypeKey     : @(fmt),
+            (id)kCVPixelBufferWidthKey               : @(w),
+            (id)kCVPixelBufferHeightKey              : @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},   // VT needs IOSurface-backed buffers
         };
         CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
-                                (__bridge CFDictionaryRef)attrs, &gPool);
-        gPoolW = w; gPoolH = h; gPoolFmt = fmt;
+                                (__bridge CFDictionaryRef)attrs, &p->pool);
+        p->w = w; p->h = h; p->fmt = fmt;
     }
-    if (gPool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, gPool, &out);
+    if (p->pool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, p->pool, &out);
     [lock unlock];
     return out;
 }
 
-#if VCAM_DEBUG
-// Sample the centre byte of plane 0 (luma for YCbCr, blue for BGRA) so we can
-// tell whether a buffer actually holds an image or is all-black.
-static int VCamCenterByte(CVPixelBufferRef pb) {
-    if (!pb) return -3;
-    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -2;
-    int v = -1;
-    if (CVPixelBufferIsPlanar(pb)) {
-        uint8_t *b = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-        size_t h = CVPixelBufferGetHeightOfPlane(pb, 0), w = CVPixelBufferGetWidthOfPlane(pb, 0);
-        if (b) v = b[(h / 2) * bpr + (w / 2)];
-    } else {
-        uint8_t *b = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
-        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-        size_t h = CVPixelBufferGetHeight(pb), w = CVPixelBufferGetWidth(pb);
-        if (b) v = b[(h / 2) * bpr + (w / 2) * 4];
-    }
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    return v;
-}
-#endif
-
-// Renders the latest decoded frame (scaled/mirrored/rotated) into a fresh pool
-// buffer matching `templatePB`. Returns a retained buffer, or NULL when there
-// is no fresh frame (caller then passes the real camera frame through).
+// Transfers the latest decoded frame (scaled + pixel-format converted) into a
+// fresh pool buffer matching `templatePB`. Returns a retained buffer, or NULL
+// when there is no fresh frame (caller then passes the real camera frame through).
 static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     if (!templatePB) return NULL;
     VCamConfig *cfg = [VCamConfig shared];
@@ -164,68 +153,32 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
     if (!fresh) return NULL;                              // stale/no stream -> real camera
 
-    CIContext *ctx = VCamCIContext();
-    if (!ctx) { CVPixelBufferRelease(fresh); return NULL; }
+    VCamEnsureSessions();
+    if (!gTransferSession) { CVPixelBufferRelease(fresh); return NULL; }
 
     size_t w = CVPixelBufferGetWidth(templatePB);
     size_t h = CVPixelBufferGetHeight(templatePB);
     OSType fmt = CVPixelBufferGetPixelFormatType(templatePB);
 
-    CVPixelBufferRef out = VCamCopyPoolBuffer(w, h, fmt);
+    CVPixelBufferRef out = VCamPoolCopy(&gOutPool, w, h, fmt);
     if (!out) { CVPixelBufferRelease(fresh); return NULL; }
 
-    // Propagate the camera buffer's color attachments (YCbCr matrix, colour
-    // primaries, transfer function, clean aperture, ...) onto our buffer. A
-    // fresh YCbCr buffer with no colour info renders BLACK downstream, so this
-    // is essential for the substituted frame to display correctly.
+    // Scale + pixel-format/range convert decoded frame -> camera-format buffer.
+    [gVTLock lock];
+    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, fresh, out);
+    [gVTLock unlock];
+
+    // Copy the camera buffer's colour attachments (YCbCr matrix, primaries,
+    // transfer function, clean aperture, ...) onto our buffer so downstream and
+    // the graph teardown treat it identically to a real camera frame.
     CFDictionaryRef att = CVBufferCopyAttachments(templatePB, kCVAttachmentMode_ShouldPropagate);
     if (att) {
         CVBufferSetAttachments(out, att, kCVAttachmentMode_ShouldPropagate);
         CFRelease(att);
     }
 
-    BOOL ok = NO;
-    @try {
-        @autoreleasepool {
-            CIImage *img = [CIImage imageWithCVPixelBuffer:fresh];
-
-            // Mirror on the front camera automatically (config files are
-            // unreadable in mediaserverd), OR-ed with any explicit cfg.mirror.
-            BOOL frontCamera = (gSourcePosition == 2);
-            BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
-
-            CGAffineTransform t = CGAffineTransformIdentity;
-            if (shouldMirror) t = CGAffineTransformScale(t, -1, 1);
-            if (cfg.rotation) t = CGAffineTransformRotate(t, -(CGFloat)cfg.rotation * M_PI / 180.0);
-            img = [img imageByApplyingTransform:t];
-            img = [img imageByApplyingTransform:
-                       CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
-
-            CGFloat sx = (CGFloat)w / img.extent.size.width;
-            CGFloat sy = (CGFloat)h / img.extent.size.height;
-            img = [img imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
-            img = [img imageByApplyingTransform:
-                       CGAffineTransformMakeTranslation(-img.extent.origin.x, -img.extent.origin.y)];
-
-            [ctx render:img toCVPixelBuffer:out bounds:CGRectMake(0, 0, w, h) colorSpace:NULL];
-            ok = YES;
-        }
-    } @catch (__unused NSException *e) { ok = NO; }
-
-#if VCAM_DEBUG
-    static int dbg = 0;
-    if (dbg < 5) {
-        dbg++;
-        VCamDebugLog(@"repl: camFmt=%c%c%c%c w=%zu h=%zu renderOK=%d "
-                     @"freshCenter=%d outCenter=%d camCenter=%d",
-                     (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt,
-                     w, h, ok, VCamCenterByte(fresh), VCamCenterByte(out),
-                     VCamCenterByte(templatePB));
-    }
-#endif
-
     CVPixelBufferRelease(fresh);
-    if (!ok) { CVPixelBufferRelease(out); return NULL; }
+    if (ts != noErr) { CVPixelBufferRelease(out); return NULL; }
     return out;
 }
 
@@ -240,10 +193,24 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
 
     [[VCamRTMPSource shared] ensureStarted];
 
+    // Reuse the camera sample buffer's OWN format description. Our buffer has the
+    // identical pixel format + dimensions (the transfer target came from origPB),
+    // so the description matches. A description created afresh from our buffer
+    // differs subtly and made -[BWGraph stop:] assert on capture teardown;
+    // reusing the original makes our frame indistinguishable from the camera's.
+    CMVideoFormatDescriptionRef fd =
+        (CMVideoFormatDescriptionRef)CMSampleBufferGetFormatDescription(origSB);
+    BOOL ownFd = NO;
+    if (!fd) {
+        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd) != noErr)
+            fd = NULL;
+        else
+            ownFd = YES;
+    }
+
     CMSampleBufferRef newSB = NULL;
-    CMVideoFormatDescriptionRef fd = NULL;
-    OSStatus s = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd);
-    if (s == noErr && fd) {
+    OSStatus s = -1;
+    if (fd) {
         CMSampleTimingInfo timing;
         if (CMSampleBufferGetSampleTimingInfo(origSB, 0, &timing) != noErr) {
             timing.duration = kCMTimeInvalid;
@@ -253,12 +220,8 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
         s = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, out, true, NULL, NULL,
                                                fd, &timing, &newSB);
     }
-    if (fd) CFRelease(fd);
+    if (ownFd && fd) CFRelease(fd);
     CVPixelBufferRelease(out);
-#if VCAM_DEBUG
-    static int dbg2 = 0;
-    if (dbg2 < 5) { dbg2++; VCamDebugLog(@"repl: sampleBufferStatus=%d newSB=%p", (int)s, newSB); }
-#endif
     if (s != noErr || !newSB) return NULL;
 
     // Propagate the per-sample attachments (orientation / dependency flags etc.)
