@@ -130,6 +130,29 @@ static CVPixelBufferRef VCamCopyPoolBuffer(size_t w, size_t h, OSType fmt) {
     return out;
 }
 
+#if VCAM_DEBUG
+// Sample the centre byte of plane 0 (luma for YCbCr, blue for BGRA) so we can
+// tell whether a buffer actually holds an image or is all-black.
+static int VCamCenterByte(CVPixelBufferRef pb) {
+    if (!pb) return -3;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -2;
+    int v = -1;
+    if (CVPixelBufferIsPlanar(pb)) {
+        uint8_t *b = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        size_t h = CVPixelBufferGetHeightOfPlane(pb, 0), w = CVPixelBufferGetWidthOfPlane(pb, 0);
+        if (b) v = b[(h / 2) * bpr + (w / 2)];
+    } else {
+        uint8_t *b = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        size_t h = CVPixelBufferGetHeight(pb), w = CVPixelBufferGetWidth(pb);
+        if (b) v = b[(h / 2) * bpr + (w / 2) * 4];
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return v;
+}
+#endif
+
 // Renders the latest decoded frame (scaled/mirrored/rotated) into a fresh pool
 // buffer matching `templatePB`. Returns a retained buffer, or NULL when there
 // is no fresh frame (caller then passes the real camera frame through).
@@ -189,6 +212,18 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
         }
     } @catch (__unused NSException *e) { ok = NO; }
 
+#if VCAM_DEBUG
+    static int dbg = 0;
+    if (dbg < 5) {
+        dbg++;
+        VCamDebugLog(@"repl: camFmt=%c%c%c%c w=%zu h=%zu renderOK=%d "
+                     @"freshCenter=%d outCenter=%d camCenter=%d",
+                     (char)(fmt >> 24), (char)(fmt >> 16), (char)(fmt >> 8), (char)fmt,
+                     w, h, ok, VCamCenterByte(fresh), VCamCenterByte(out),
+                     VCamCenterByte(templatePB));
+    }
+#endif
+
     CVPixelBufferRelease(fresh);
     if (!ok) { CVPixelBufferRelease(out); return NULL; }
     return out;
@@ -220,6 +255,10 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
     }
     if (fd) CFRelease(fd);
     CVPixelBufferRelease(out);
+#if VCAM_DEBUG
+    static int dbg2 = 0;
+    if (dbg2 < 5) { dbg2++; VCamDebugLog(@"repl: sampleBufferStatus=%d newSB=%p", (int)s, newSB); }
+#endif
     if (s != noErr || !newSB) return NULL;
 
     // Propagate the per-sample attachments (orientation / dependency flags etc.)
