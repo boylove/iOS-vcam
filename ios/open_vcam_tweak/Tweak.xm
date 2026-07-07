@@ -448,32 +448,26 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
 
         SEL emitSel = @selector(emitSampleBuffer:);
 
-        // Terminal emit path only. This is the single point where a node emits
-        // its finished frame to every downstream consumer (preview AND the movie
-        // recorder), so overwriting here replaces the frame for all of them with
-        // exactly ONE CIContext render per frame.
-        //
-        // We deliberately do NOT hook the intermediate renderSampleBuffer: nodes
-        // (BWNode/BWUBNode/BWPixelTransferNode) any more:
-        //   * The stock Camera routes each frame through several of them, so
-        //     hooking them overwrote the same frame 3-4x/frame -> GPU-bound,
-        //     choppy preview.
-        //   * BWPixelTransferNode is the recording-path format/resolution
-        //     converter; overwriting its buffer trips the CMCapture
-        //     PixelTransferSession assertion and crashes mediaserverd the moment
-        //     the stock Camera switches to video/record (EXECUTION-PLAN §4.6).
-        // Set VCAM_HOOK_RENDER_NODES=1 to restore the old behaviour for testing.
+        // Terminal emit path. Substituting only here (emit-only) replaces the
+        // frame for downstream consumers but NOT the live preview: the preview
+        // branches off the graph at the intermediate render nodes, upstream of
+        // BWNodeOutput. So we ALSO substitute at the video-carrying render nodes
+        // BWNode / BWUBNode (renderSampleBuffer:forInput:) — that is where the
+        // preview frame is produced.
         VCamHook("BWNodeOutput", emitSel, (IMP)VCamEmit, gEmitOrigs);
 
-#ifndef VCAM_HOOK_RENDER_NODES
-#define VCAM_HOOK_RENDER_NODES 0
-#endif
-#if VCAM_HOOK_RENDER_NODES
         SEL renderSel = @selector(renderSampleBuffer:forInput:);
-        const char *renderClasses[] = { "BWNode", "BWUBNode", "BWPixelTransferNode" };
+        // BWNode + BWUBNode reach the preview. We EXCLUDE BWPixelTransferNode:
+        // it is the recording-path format/resolution converter, and touching its
+        // buffer trips the CMCapture PixelTransferSession assertion that crashes
+        // mediaserverd when the stock Camera records (EXECUTION-PLAN §4.6). We now
+        // SUBSTITUTE (never mutate the camera buffer) so BWNode/BWUBNode are safe.
+        const char *renderClasses[] = { "BWNode", "BWUBNode" };
         for (size_t i = 0; i < sizeof(renderClasses) / sizeof(renderClasses[0]); i++) {
             VCamHook(renderClasses[i], renderSel, (IMP)VCamRender, gRenderOrigs);
         }
+#ifdef VCAM_HOOK_PIXELTRANSFER   // opt-in only; crashes stock-Camera recording
+        VCamHook("BWPixelTransferNode", renderSel, (IMP)VCamRender, gRenderOrigs);
 #endif
 
         // Front/back detection for auto-mirror (config files unreadable here).
