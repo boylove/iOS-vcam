@@ -211,9 +211,13 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
     if (!fresh) return NULL;                              // stale/no stream -> real camera
+#if VCAM_DEBUG
+    { static int d = 0; if (d < 3) { d++;
+        VCamDebugLog(@"repl: got fresh %zux%zu", CVPixelBufferGetWidth(fresh), CVPixelBufferGetHeight(fresh)); } }
+#endif
 
     VCamEnsureSessions();
-    if (!gTransferSession) { CVPixelBufferRelease(fresh); return NULL; }
+    if (!gTransferSession) { CVPixelBufferRelease(fresh); VCamLog(@"repl: no transfer session"); return NULL; }
 
     size_t w = CVPixelBufferGetWidth(templatePB);
     size_t h = CVPixelBufferGetHeight(templatePB);
@@ -234,6 +238,13 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     [gVTLock lock];
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, out);
     [gVTLock unlock];
+
+#if VCAM_DEBUG
+    { static int d = 0; if (d < 12) { d++;
+        VCamDebugLog(@"repl: srcW=%zu srcH=%zu camW=%zu camH=%zu camFmt=%c%c%c%c out=%p ts=%d",
+                     CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src), w, h,
+                     (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt, out, (int)ts); } }
+#endif
 
     // Copy the camera buffer's colour attachments (YCbCr matrix, primaries,
     // transfer function, clean aperture, ...) onto our buffer so downstream and
@@ -296,6 +307,10 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
     }
     if (ownFd && fd) CFRelease(fd);
     CVPixelBufferRelease(out);
+#if VCAM_DEBUG
+    { static int d = 0; if (d < 12) { d++;
+        VCamDebugLog(@"repl-sb: fd=%p ownFd=%d createStatus=%d newSB=%p", fd, ownFd, (int)s, newSB); } }
+#endif
     if (s != noErr || !newSB) return NULL;
 
     // Propagate the per-sample attachments (orientation / dependency flags etc.)
