@@ -115,10 +115,14 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         VCamLog(@"decoder: output status=%d imageBuffer=%p", (int)status, imageBuffer);
         return;
     }
-#if VCAM_DEBUG
     static uint64_t produced = 0;
     produced++;
-    if (produced == 1 || (produced % 120) == 0) {
+    if (produced == 1)
+        VCamLog(@"decoder: first frame decoded (%zux%zu)",
+                CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
+                CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
+#if VCAM_DEBUG
+    if ((produced % 120) == 0) {
         VCamDebugLog(@"decoder: produced %llu frames (%zux%zu)", produced,
                      CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
                      CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));

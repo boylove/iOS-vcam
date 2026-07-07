@@ -1,7 +1,8 @@
 #!/bin/sh
-# OpenVCam hooks mediaserverd's capture graph (video) and AudioUnitRender (audio),
-# both in mediaserverd, like the original vcamera. Restart mediaserverd so the
-# tweak loads; it respawns automatically.
+# OpenVCam hooks mediaserverd's capture graph (BWNodeOutput -emitSampleBuffer:)
+# and substitutes a fresh camera-format sample buffer, like the original vcamera.
+# (The audio / AudioUnitRender hook is temporarily out of this build.) Restart
+# mediaserverd so the tweak loads; it respawns automatically.
 #
 # Also reset videodecoderd: repeated mediaserverd SIGKILLs can leave its H264
 # decode-session pool exhausted, which makes the first VTDecompressionSessionCreate

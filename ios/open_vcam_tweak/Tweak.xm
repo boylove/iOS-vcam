@@ -98,9 +98,8 @@ void VCamLog(NSString *format, ...) {
 // VTPixelTransferSession does the YCbCr<->YCbCr and video<->full-range
 // conversion correctly. The session adapts to the src/dst buffers on each call,
 // so we create it once and reuse it, serialised by gVTLock because the capture
-// graph can service several source nodes concurrently.
-// (Rotation / front-camera mirror is added on top with VTPixelRotationSession in
-// a follow-up; the priority here is a correct, non-crashing colour frame.)
+// graph can service several source nodes concurrently. Rotation / front-camera
+// mirror is layered on top with VTPixelRotationSession (see VCamCopyRotated).
 // ---------------------------------------------------------------------------
 static VTPixelTransferSessionRef gTransferSession;
 static NSLock *gVTLock;
@@ -142,6 +141,51 @@ static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt
     return out;
 }
 
+// Rotation / front-camera mirror via VTPixelRotationSession (iOS 16+), matching
+// the closed vcamera's _pixelRotationSession. Rotates + optionally horizontally
+// flips the decoded frame into an intermediate buffer (source pixel format,
+// rotated dimensions); the transfer session then scales/converts it to the
+// camera format. Stored as CFTypeRef so the file-scope declaration needs no
+// availability annotation; every use is inside `if (@available(iOS 16, *))`.
+// On iOS < 16 rotation is skipped (the frame still shows, just unrotated).
+static VCamPool gRotPool;
+static CFTypeRef gRotationSession;   // VTPixelRotationSessionRef, or NULL
+
+static CVPixelBufferRef VCamCopyRotated(CVPixelBufferRef fresh, BOOL mirror, long rot) {
+    if (!mirror && rot == 0) return NULL;          // nothing to do -> transfer 'fresh' directly
+    CVPixelBufferRef rotated = NULL;
+    if (@available(iOS 16.0, *)) {
+        [gVTLock lock];
+        if (!gRotationSession) {
+            VTPixelRotationSessionRef rs = NULL;
+            VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
+            gRotationSession = rs;
+        }
+        VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
+        if (rs) {
+            CFStringRef rotKey = kVTRotation_0;
+            if (rot == 90) rotKey = kVTRotation_CW90;
+            else if (rot == 180) rotKey = kVTRotation_180;
+            else if (rot == 270) rotKey = kVTRotation_CCW90;
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, rotKey);
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
+                                 mirror ? kCFBooleanTrue : kCFBooleanFalse);
+
+            size_t fw = CVPixelBufferGetWidth(fresh), fh = CVPixelBufferGetHeight(fresh);
+            OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
+            size_t rw = (rot == 90 || rot == 270) ? fh : fw;   // rotation swaps W/H
+            size_t rh = (rot == 90 || rot == 270) ? fw : fh;
+            rotated = VCamPoolCopy(&gRotPool, rw, rh, ffmt);
+            if (rotated && VTPixelRotationSessionRotateImage(rs, fresh, rotated) != noErr) {
+                CVPixelBufferRelease(rotated);
+                rotated = NULL;
+            }
+        }
+        [gVTLock unlock];
+    }
+    return rotated;
+}
+
 // Transfers the latest decoded frame (scaled + pixel-format converted) into a
 // fresh pool buffer matching `templatePB`. Returns a retained buffer, or NULL
 // when there is no fresh frame (caller then passes the real camera frame through).
@@ -163,9 +207,17 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     CVPixelBufferRef out = VCamPoolCopy(&gOutPool, w, h, fmt);
     if (!out) { CVPixelBufferRelease(fresh); return NULL; }
 
-    // Scale + pixel-format/range convert decoded frame -> camera-format buffer.
+    // Rotate / mirror first (front camera auto-mirrors; config files are
+    // unreadable in mediaserverd so mirror is driven by the sourcePosition hook),
+    // then scale + pixel-format/range convert into the camera-format buffer.
+    BOOL frontCamera = (gSourcePosition == 2);
+    BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
+    long rot = ((cfg.rotation % 360) + 360) % 360;
+    CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
+    CVPixelBufferRef src = rotated ? rotated : fresh;
+
     [gVTLock lock];
-    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, fresh, out);
+    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, out);
     [gVTLock unlock];
 
     // Copy the camera buffer's colour attachments (YCbCr matrix, primaries,
@@ -177,8 +229,15 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
         CFRelease(att);
     }
 
+    if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
-    if (ts != noErr) { CVPixelBufferRelease(out); return NULL; }
+    if (ts != noErr) {
+        static BOOL logged = NO;
+        if (!logged) { logged = YES; VCamLog(@"transfer failed (%d) dstFmt=%c%c%c%c",
+                                              (int)ts, (char)(fmt>>24),(char)(fmt>>16),(char)(fmt>>8),(char)fmt); }
+        CVPixelBufferRelease(out);
+        return NULL;
+    }
     return out;
 }
 
@@ -273,11 +332,18 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
                                 ? VCamCreateReplacementSampleBuffer(sb) : NULL;
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, rep ?: sb);
     if (rep) CFRelease(rep);
-#if VCAM_DEBUG
+
+    // Lightweight always-on health line (release builds are otherwise silent once
+    // running): every ~600 emits report how many frames we actually replaced, so
+    // "OBS not showing" can be told apart from "decoder idle / fail-open" from the
+    // syslog alone. Logs the FIRST replacement immediately so success is visible.
     static uint64_t calls = 0, repl = 0;
-    calls++; if (rep) repl++;
-    if ((calls % 120) == 0) VCamDebugLog(@"stats: emits=%llu replaced=%llu", calls, repl);
-#endif
+    calls++;
+    if (rep) {
+        repl++;
+        if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
+    }
+    if ((calls % 600) == 0) VCamLog(@"health: emits=%llu replaced=%llu", calls, repl);
 }
 
 // -[... renderSampleBuffer:forInput:] — only installed when VCAM_HOOK_RENDER_NODES
