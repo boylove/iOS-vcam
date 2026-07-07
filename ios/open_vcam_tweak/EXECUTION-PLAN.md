@@ -48,11 +48,12 @@ mediaserverd 进程内 (%ctor 仅当 processName==mediaserverd):
     → gVTLock 加锁: VTPixelTransferSessionTransferImage(session, src, dst)  ★就地写进相机 buffer
       (必须设 kVTPixelTransferPropertyKey_ScalingMode=Normal, 源≠相机尺寸时否则静默失败)
     → orig(self, _cmd, origSB)  ★传【原始 sb】, 不是新建的 (下游客户端读的就是被改写的 dst surface)
-  拍照(VCAM_HOOK_PHOTO_NODES, **默认开 —— 0.3.9 起, 见 4.8 待验证**): VCamOverwritePhotoInPlace hook
-    BWStillImageScalerNode/BWPhotoEncoderNode, 同样就地覆盖 + kCMSampleBufferAttachmentKey_TransitionID
-    附件去重(一张照片流经多个节点只覆盖一次)。render 节点(BWNode/BWUBNode/BWPixelTransferNode)默认透传,
-    就地改它们正是原生录制崩溃路径。**注: 与原版不同, 本实现去掉了原版照片路径的人脸门控(§2.3 modifyPixelBuffer:
-    开头 `if(!hasFace) 透传`), 改为无条件覆盖 —— 疑为"动一下就卡住"回归的嫌疑点, 见 4.8。**
+  拍照(VCAM_HOOK_PHOTO_NODES, **正确方案=默认关(0), 见 4.8 已坐实**): 照片 render 节点
+    (BWStillImageScalerNode/BWPhotoEncoderNode)hook **设备实测会 GPU iofence 死锁**(切到照片模式即卡),
+    即使视频路径已修好单锁也无效。**原版真正的拍照机制不是 hook 照片节点**: emitSampleBuffer: 就地覆盖的
+    是上游共享 IOSurface, 该 surface 自然向下游照片管线流动, 所以拍照拿到 OBS 靠的是视频路径, 不是照片节点。
+    原版照片节点 modifyPixelBuffer: 带人脸门控(§2.3 `if(!hasFace) 透传`), 是美颜叠加而非"照片变OBS"总开关。
+    → 结论: 关掉照片 hook, 拍照经共享 surface 自然出 OBS。
 拉流/解码:
   vendor/rtmp/vcam_rtmp.c(自写 RTMP play) → FLV/AVC 解析 → VCamH264Decoder(VideoToolbox 硬解, dstAttrs+RealTime+ThreadCount 照原作者) → VCamFrameStore
 打包: filter Bundles=(com.apple.mediaserverd) Executables=(mediaserverd); postinst: killall -9 videodecoderd + mediaserverd; Conflicts/Replaces com.x.vcamera
@@ -95,25 +96,27 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 ### 4.7 设备红线
 `vcam-latency-patch-discrete`、`ios-device-read-only-rule`、`vcam-roothide-vcplist-sandbox`。
 
-### 4.8 拍照路径已默认启用（0.3.9）+ "动一下就卡住"回归嫌疑（待坐实）
-**状态偏差(已修正文档)**:本计划旧版把拍照记为"默认关 / 未做(§6-f、M4)",但**代码 HEAD 与 git `af1fa43 (0.3.9: enable photo capture)` 已把 `VCAM_HOOK_PHOTO_NODES` 默认改成 1**(Tweak.xm:97-99),拍照 hook 实际在线上跑,而计划里对它的风险/验证仍是空的。文档现已对齐代码。
+### 4.8 "卡住"根因 = GPU IOSurface fence 死锁（已设备坐实）+ 正确方案
 
-**症状**:打开原相机,画面**动一下(首帧/首个 GOP 出了 OBS)然后突然卡住定格**。
+**结论(设备实测坐实,非推断)**:症状"打开原相机动一下就卡 / 切到照片模式就卡"的根因**不是拍照 hook 本身的逻辑,而是 GPU IOSurface fence 死锁**。崩溃取证:卡住时刻 `/var/mobile/Library/Logs/CrashReporter` 连续冒出 `gpuEvent-backboardd-*.ips`,`bug_type 284` + `iofence`——同一块 IOSurface(如 id 411)上多个 GPU accelerator(0/1/2)在 fence 队列里互相等待;`launchctl` 显示 mediaserverd 以 `-9` 退出并重启(watchdog 杀挂起进程),重启期间画面定格。记忆:`openvcam-freeze-gpu-iofence`、`openvcam-original-gpu-sync-model`。
 
-**为什么"卡住"比"解码停了"更严重**:本 tweak 是 fail-open + 0.5s 看门狗(§5),单纯解码停产应回落到**真实摄像头(仍在动)**,不该定格。画面定格说明 **mediaserverd 的采集线程被阻塞在我们的 hook 里**,而非空闲。
+**为什么会 fence 死锁**:我们提交 `VTPixelTransferSessionTransferImage` / `VTPixelRotationSessionRotateImage` **就地写相机共享 IOSurface** 的那一刻,采集图的 GPU 端可能正在读同一块 surface;两边对同一 surface 的 GPU 命令没有串行化 → fence 环等。旧代码还有两个放大器:①旋转在 `gVTLock` 内做完就**解锁**,transfer 再**重新加锁**,中间空档让另一 emit 线程插入并发 GPU 提交;②旋转输出每帧从 pool 取**新 buffer**,GPU 还在读 buffer N 时 buffer N+1 已提交,fence 交叠。
 
-**头号嫌疑 = 拍照路径回归**,三条线索叠加:
-1. 时间点吻合:卡住是 0.3.9 启用拍照后出现;上一版(`eae9bfa`)拍照是**禁用**的。
-2. 历史前科:本文件 §4.5/§4.6 + 记忆均记录过 *photo↔video 切换曾 HANG 住 mediaserverd*(`EXC_BREAKPOINT`,栈在 `CMCapture → PixelTransferSession`)。
-3. 与原版的偏差(见 `VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md` §2.3 对照):原版照片路径 `modifyPixelBuffer:` **开头带人脸门控**(`if(!hasFace) 透传`),无脸时根本不进 VT transfer;**本实现去掉门控、每次拍照无条件 VT transfer + 抢 `gVTLock`**,在 photo↔video 切换/多节点并发时更易卡。
+**逆向原版的同步模型(`VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md` + 反汇编 0x84458/0x854f8)**:原版 `modifyImageBuffer:` 把**旋转 + transfer 全程放在同一把实例锁(self+0x18)内**,一次不中断完成;旋转只写**同一块复用 buffer(self+0x70)**;ScalingMode 用 `Trim`。这三点正是它就地覆盖同一 surface 却不死锁的原因。
 
-**坐实两步(设备侧,只读红线外的装包由用户执行)**:
-- **① photo=0 诊断包**:CI `build-open-vcam-tweak.yml` → `workflow_dispatch` 选 `hook_photo_nodes=0` 出包(artifact 名带 `photo0`),装后若不再卡 → **坐实拍照回归**。装机后 syslog 的 `hooks installed ... VCAM_HOOK_PHOTO_NODES=0` 一行自证跑的是诊断包(防装错包误判)。
-- **② 心跳日志**:Tweak.xm 新增独立线程 `VCamStartHeartbeat`(不占采集线程),卡住时打印
-  `HEARTBEAT: emits STALLED at N (emitInflight=.. photoInflight=..) -> ... BLOCKED IN PHOTO PATH/LIVE OVERWRITE`。
-  - `photoInflight>0` → 卡在 `VCamPhotoRender`/`VCamOverwritePhotoInPlace`(拍照路径)= 坐实①。
-  - `emitInflight>0 且 photoInflight==0` → 卡在 live 覆盖。
-  - `emits` 持续涨、`replaced` 停涨 → 不是阻塞,是解码停产/RTMP 帧率过低(应已 fail-open)。
+**已实施修复(commit `ee81079`)**:① 旋转+transfer 合进**单一不中断的 `gVTLock` 临界区**(`VCamCopyRotatedLocked` 要求调用者持锁);② 旋转输出改用**单块复用 buffer**(`VCamRotBuf`/`VCamRotBufGet`,不再每帧 pool 新取);③ ScalingMode 对齐 `Trim`;④ 照片路径同样处理,并用**独立的**旋转缓存/session(`gPhotoRotBuf`/`gPhotoRotationSession`)避免跨锁争用。
+
+**设备实测结果(决定性)**:
+- ✅ **视频路径修复有效**:装 photo=1 修复版,原相机**视频预览正常、不卡**——单锁+复用 buffer 消除了视频路径的 fence 死锁。
+- ❌ **照片 render 节点仍死锁**:一**切换到照片模式**立即卡 + 再次 `gpuEvent iofence`。即使套用单锁,在 `BWStillImageScalerNode`/`BWPhotoEncoderNode` 就地覆盖静态图 surface 仍撞 fence(静态图管线的 GPU 时序与 live 不同,更难串行化)。
+
+**正确方案(最接近原版)= 关闭照片 render hook,依赖上游共享 surface**:
+- 原版拍照拿到 OBS 的**主机制**是——`emitSampleBuffer:` 覆盖的那块**上游共享 IOSurface** 自然往下游照片管线流,拍照编码器读到的本就是已被换过的帧(见 `vcamera-photo-capture-hooks`)。原版的 `modifyPixelBuffer:` 是**人脸门控的美颜叠加**(`if(!hasFace) 透传`),**不是**"照片变 OBS"的总开关。
+- 故正确做法:**`VCAM_HOOK_PHOTO_NODES=0`**——不 hook 照片 render 节点,只靠视频路径 `emitSampleBuffer:` 的就地覆盖让拍照自然拿到 OBS。这既避开照片路径 fence 死锁,又符合原版真实机制。
+- 待验证:photo=0 + 视频单锁修复版,原相机拍照是否稳定且能拿到 OBS 帧。
+
+**留存的诊断工具**:独立心跳线程 `VCamStartHeartbeat`(不占采集线程),卡住时打印
+`HEARTBEAT: emits STALLED at N (emitInflight=.. photoInflight=..) -> ... BLOCKED IN PHOTO PATH/LIVE OVERWRITE`;`hooks installed ... VCAM_HOOK_PHOTO_NODES=N` 一行自证跑的是哪个包。CI `workflow_dispatch` 的 `hook_photo_nodes` 输入可一键出 photo=0/1 包(artifact 名带 `photo0`/`photo1`)。
 
 ---
 
@@ -182,7 +185,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 | **M1** | mediaserverd 注入 + BWNodeOutput emit hook + 拉流硬解 + VTPixelTransfer 就地覆盖相机 buffer | ✅ 完成 |
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
-| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | 🔶 进行中:拍照 0.3.9 已默认启用但**疑为卡顿回归**(§4.8,待 photo=0 诊断包 + 心跳坐实);6-d 待肉眼确认 |
+| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | 🔶 进行中:视频 GPU fence 死锁已修(单锁原子, §4.8/§4.9),设备实测视频预览稳定;拍照 render 节点 hook 仍死锁 → **改回 photo=0 默认**,拍照靠 emit 共享 surface 继承 OBS(原版主机制);待 photo=0+视频修复版装机确认拍照出 OBS 且稳定 |
 | **M5** | 音频并入(视频+音频一个 deb) | 🔶 v0.3.0 改全局 mediaserverd 音频(原相机也生效),待装机验证原相机稳定性 |
 
 **推进节奏**:每步验证、汇报;动设备的写操作先说明、可回退。

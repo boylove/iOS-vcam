@@ -81,21 +81,30 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_AUTO_ORIENT_DIR 270
 #endif
 
-// Still-photo replacement (report §2.3: the closed vcamera overwrites the photo
-// path too, on the BWStillImageScalerNode / BWPhotoEncoderNode chain, with a
-// TransitionID dedup mark) so the shutter captures OBS, not the real lens.
+// Still-photo replacement. DEFAULT OFF (0) — this is the closest-to-original,
+// device-verified stable configuration. Do NOT flip to 1 without re-testing the
+// stock-Camera photo mode on-device.
 //
-// ENABLED to match the original. An earlier attempt HUNG mediaserverd on the
-// stock-Camera photo->video switch; the cause was our dedup using a PRIVATE
-// attachment key. The original reuses CoreMedia's REAL
-// kCMSampleBufferAttachmentKey_TransitionID — which the system itself stamps on
-// the buffers it shuffles during a mode transition, so reading the real key makes
-// us pass those through untouched instead of overwriting mid-transition (the
-// hang). VCamOverwritePhotoInPlace now uses the real key, matching the original.
-// Kill switch if a device still misbehaves: -DVCAM_HOOK_PHOTO_NODES=0 (falls back
-// to real-lens stills; live video is unaffected).
+// WHY OFF: hooking the photo render nodes (BWStillImageScalerNode /
+// BWPhotoEncoderNode) and overwriting the still buffer IN PLACE deadlocks the GPU
+// on the video<->photo mode switch — a GPU IOSurface fence cycle (bug_type 284
+// iofence, backboardd gpuEvent) that freezes mediaserverd until watchdog SIGKILLs
+// it. Device-confirmed on 2026-07-07: with the video single-lock fence fix in
+// place the LIVE preview is stable, but switching the stock Camera into photo mode
+// still froze with photo=1; photo=0 does not. See memory
+// openvcam-photo-path-iofence-deadlock and EXECUTION-PLAN §4.8.
+//
+// This is NOT a feature loss: the original vcamera makes the shutter capture OBS
+// primarily through the SHARED IOSurface — emitSampleBuffer: overwrites the
+// camera's upstream buffer, and the still-image pipeline downstream reads that
+// same (already-OBS) surface. The original's photo-node hook (modifyPixelBuffer:)
+// is a FACE-GATED beauty overlay (`if(!hasFace) pass-through`), not the switch
+// that makes the photo be OBS. So with photo=0 the shutter still captures OBS via
+// the shared surface, without the deadlock. Re-enabling the photo nodes to match
+// the original's beauty path would require replicating its face gating AND a
+// per-still lock model that survives the mode transition (future work, §6-f).
 #ifndef VCAM_HOOK_PHOTO_NODES
-#define VCAM_HOOK_PHOTO_NODES 1
+#define VCAM_HOOK_PHOTO_NODES 0
 #endif
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
