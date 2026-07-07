@@ -72,8 +72,13 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #ifndef VCAM_AUTO_ORIENT
 #define VCAM_AUTO_ORIENT 1
 #endif
+// 270, not 90: on the stock Camera (landscape video buffer) a +90 quarter-turn
+// came out 180° upside-down in the RECORDED video (device-tested). The opposite
+// quarter-turn (270) lines it up. TikTok's portrait preview picks 0° so this knob
+// never touches it. Flip back to 90 with -DVCAM_AUTO_ORIENT_DIR=90 if a future
+// device turns the other way.
 #ifndef VCAM_AUTO_ORIENT_DIR
-#define VCAM_AUTO_ORIENT_DIR 90
+#define VCAM_AUTO_ORIENT_DIR 270
 #endif
 
 // Still-photo replacement. The closed vcamera also overwrites the photo path
@@ -304,10 +309,30 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // (90 vs 270) if the result turns the wrong way. Explicit cfg.rotation composes
     // on top so a user override still applies.
 #if VCAM_AUTO_ORIENT
-    if (VCamAutoOrientDegrees(fresh, cameraBuf) == 90) {
+    long autoDeg = VCamAutoOrientDegrees(fresh, cameraBuf);
+    if (autoDeg == 90) {
         rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
     }
+#else
+    long autoDeg = 0;
 #endif
+
+    // One-time geometry diagnostic: log the first few distinct destination sizes
+    // seen (each client hands us a different buffer) with the chosen orientation,
+    // so a wrong-way rotation can be diagnosed from src/dst dims without guessing.
+    {
+        static long loggedDst[6]; static int nLogged = 0;
+        long key = (long)CVPixelBufferGetWidth(cameraBuf) * 100000 + (long)CVPixelBufferGetHeight(cameraBuf);
+        BOOL seen = NO;
+        for (int i = 0; i < nLogged; i++) if (loggedDst[i] == key) { seen = YES; break; }
+        if (!seen && nLogged < 6) {
+            loggedDst[nLogged++] = key;
+            VCamLog(@"geom: src=%zux%zu dst=%zux%zu front=%d autoDeg=%ld rot=%ld mirror=%d",
+                    CVPixelBufferGetWidth(fresh), CVPixelBufferGetHeight(fresh),
+                    CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
+                    frontCamera, autoDeg, rot, shouldMirror);
+        }
+    }
 
     CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
