@@ -10,7 +10,7 @@
 
 - **注入点**：`mediaserverd`（`OpenVCam.plist` filter `Bundles=(com.apple.mediaserverd) Executables=(mediaserverd)`）。`mediaserverd` 在所有相机客户端之下，因此能替换 **RootHide 化的 TikTok / 系统原生相机 / 所有 App**——app 级注入会被 RootHide 绕过，所以必须在这一层。
 - **帧替换（视频/预览）**：hook 终端节点 `BWNodeOutput -emitSampleBuffer:`（只此一个，一帧一次）。**就地覆盖相机自己的 `CVImageBuffer`**：把解码帧经 `VTPixelTransferSession`（+ 前摄/旋转用 `VTPixelRotationSession`）直接 `VTPixelTransferSessionTransferImage` 转写进相机那块共享 IOSurface，然后把**原始 sample buffer**（现已被就地改写）传给原实现。这与闭源二进制行为逐条一致（见 `VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md` §2.2）——只有就地写相机原 buffer 才会被 App 预览/TikTok 读到（下游造新 buffer 到不了 App）。用 VT（非 CIContext）、只在终端 emit（不在 PixelTransfer 节点），是原作者既不崩原生相机录制也不卡顿的原因。中间 `renderSampleBuffer:forInput:` 视频节点（`BWNode/BWUBNode/BWPixelTransferNode`）**一律不 hook**——就地覆盖它们正是录制崩溃路径。
-- **帧替换（拍照/静态捕获）**：hook `BWStillImageScalerNode` / `BWPhotoEncoderNode` 的 `renderSampleBuffer:forInput:`，就地覆盖静态照片 buffer（否则快门拿到真实镜头），用 `TransitionID` 附件去重保证一张照片流经多个照片节点时只覆盖一次（照原作者 §2.3）。编译宏 `VCAM_HOOK_PHOTO_NODES`（默认 1）可关；关掉则只替换视频/预览、拍照回落真实镜头。**注意**：原生相机拍照→录像切换是本机最高危崩溃路径，若装后拍照使原生相机不稳，用 `-DVCAM_HOOK_PHOTO_NODES=0` 重出即可，不影响直播。
+- **帧替换（拍照/静态捕获）**：hook `BWStillImageScalerNode` / `BWPhotoEncoderNode` 的 `renderSampleBuffer:forInput:`，就地覆盖静态照片 buffer（否则快门拿到真实镜头），用 `TransitionID` 附件去重保证一张照片流经多个照片节点时只覆盖一次（照原作者 §2.3）。编译宏 `VCAM_HOOK_PHOTO_NODES` **默认 0（关）**——原生相机拍照→录像切换是本机最高危崩溃路径，故默认只替换视频/预览、拍照回落真实镜头，保原生相机稳定。要拍照也出 OBS 用 `-DVCAM_HOOK_PHOTO_NODES=1` 重出。
 - **前后摄自动镜像**：hook `FigCaptureSourceConfiguration -sourcePosition`，前摄自动水平镜像（配置文件在 mediaserverd 沙盒读不到，见下）。编译宏 `VCAM_FRONT_AUTOMIRROR`（默认 1）可翻转方向。
 - **视频源**：设备端直接拉 RTMP（内联 `vendor/rtmp/vcam_rtmp.c`，自写精简 play 客户端，无外部依赖）。需要 PC 端 SRS + USB 反向隧道把 `127.10.10.10:1935` 暴露给设备。
 - **解码**：VideoToolbox 硬解，destination attrs 带 native size / 420v / IOSurface / OpenGLCompat，会话 `RealTime=true` + `ThreadCount=2`（照原作者）；SPS/PPS 不变则复用会话；create 失败（如 1100）有退避。
@@ -56,7 +56,7 @@ Makefile / control / layout/DEBIAN/*
 |---|---|
 | 就地覆盖 `emitSampleBuffer:`（§2.2，VT + 加锁 + 传原始 sb） | ✅ `VCamOverwriteInPlace` |
 | 只 hook emit、render 节点不改帧（§6 要点 1） | ✅ 避开 BWPixelTransferNode 录制崩溃 |
-| 拍照路径 `modifyPixelBuffer:` + TransitionID 去重（§2.3） | ✅ `VCamOverwritePhotoInPlace`（`VCAM_HOOK_PHOTO_NODES`，默认开） |
+| 拍照路径 `modifyPixelBuffer:` + TransitionID 去重（§2.3） | ✅ `VCamOverwritePhotoInPlace`（`VCAM_HOOK_PHOTO_NODES`，默认**关**，`=1` 开） |
 | 旋转/前摄镜像（§2.4） | ✅ `VTPixelRotationSession` + `sourcePosition` |
 | 解码器配置（§4：不强制软解/OpenGLCompat/RealTime/ThreadCount=2/ITU 色彩） | ✅ `VCamH264Decoder` |
 | GPUImage 美颜/瘦脸（§3：thinFaceFilter/beautyFaceFilter…） | ⏭️ **不可忠实复刻**：报告只给了滤镜名，无参数/着色器/地址。虚拟摄像头核心不依赖美颜；如需可另写一套近似实现，但那是新功能，非复刻。 |
