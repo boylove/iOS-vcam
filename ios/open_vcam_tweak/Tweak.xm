@@ -367,6 +367,15 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (!orig) return;
     CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
                                 ? VCamCreateReplacementSampleBuffer(sb) : NULL;
+#if VCAM_DEBUG
+    { static uint64_t c = 0; c++; if ((c % 400) == 0) {
+        CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+        OSType f = ib ? CVPixelBufferGetPixelFormatType(ib) : 0;
+        VCamDebugLog(@"emit: cls=%s img=%d %zux%zu fmt=%c%c%c%c rep=%d",
+                     class_getName(object_getClass(self)), ib != NULL,
+                     ib ? CVPixelBufferGetWidth(ib) : 0, ib ? CVPixelBufferGetHeight(ib) : 0,
+                     (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f, rep != NULL); } }
+#endif
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, rep ?: sb);
     if (rep) CFRelease(rep);
 
@@ -393,6 +402,15 @@ static void VCamRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
     if (!orig) return;
     CMSampleBufferRef rep = (sb && CMSampleBufferGetImageBuffer(sb))
                                 ? VCamCreateReplacementSampleBuffer(sb) : NULL;
+#if VCAM_DEBUG
+    { static uint64_t c = 0; c++; if ((c % 400) == 0) {
+        CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+        OSType f = ib ? CVPixelBufferGetPixelFormatType(ib) : 0;
+        VCamDebugLog(@"render: cls=%s img=%d %zux%zu fmt=%c%c%c%c rep=%d",
+                     class_getName(object_getClass(self)), ib != NULL,
+                     ib ? CVPixelBufferGetWidth(ib) : 0, ib ? CVPixelBufferGetHeight(ib) : 0,
+                     (char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f, rep != NULL); } }
+#endif
     ((void (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, rep ?: sb, input);
     if (rep) CFRelease(rep);
 }
