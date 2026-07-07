@@ -107,6 +107,13 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_HOOK_PHOTO_NODES 0
 #endif
 
+// GPU fence flush after each transfer (stock-Camera PHOTO-mode IOFence deadlock
+// fix). See VCamOverwriteInPlace. Set -DVCAM_GPU_FENCE_FLUSH=0 to A/B test whether
+// the flush is what stops the freeze.
+#ifndef VCAM_GPU_FENCE_FLUSH
+#define VCAM_GPU_FENCE_FLUSH 1
+#endif
+
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
 // FigCaptureSourceConfiguration -sourcePosition hook; read on the capture path.
 static volatile long gSourcePosition = 0;
@@ -415,6 +422,22 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     CVPixelBufferRef src = rotated ? rotated : fresh;
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
+#if VCAM_GPU_FENCE_FLUSH
+    // GPU FENCE FLUSH (stock-Camera PHOTO-mode IOFence fix). VTPixelTransferSession-
+    // TransferImage submits the GPU write ASYNC and returns immediately. In photo
+    // mode the capture graph drives this same camera IOSurface across 3 GPU
+    // accelerators; our still-pending async write then crosses their fences ->
+    // bug_type 284 iofence deadlock ("moves once, then freezes"). Locking the DEST
+    // surface forces the CPU to block until our GPU write has fully landed, so
+    // nothing lingers to cross-fence — the VTPixelTransfer analogue of the closed
+    // vcamera's glFinish-after-render (VCAMERA_PHOTO_CAPTURE_REVERSE.md §9). Done
+    // inside the same gVTLock span so the flush stays part of the one critical
+    // section. readOnly: we don't dirty the buffer, so no writeback on unlock.
+    if (ts == noErr) {
+        CVPixelBufferLockBaseAddress(cameraBuf, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferUnlockBaseAddress(cameraBuf, kCVPixelBufferLock_ReadOnly);
+    }
+#endif
     [gVTLock unlock];
 
     CVPixelBufferRelease(fresh);
@@ -528,6 +551,14 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
                                                      &gPhotoRotBuf, &gPhotoRotationSession);
     CVPixelBufferRef src = rotated ? rotated : fresh;
     OSStatus ts = VTPixelTransferSessionTransferImage(gPhotoTransferSession, src, dst);
+#if VCAM_GPU_FENCE_FLUSH
+    // Force GPU completion of the still write before returning (same IOFence fix as
+    // the live path — see VCamOverwriteInPlace).
+    if (ts == noErr) {
+        CVPixelBufferLockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferUnlockBaseAddress(dst, kCVPixelBufferLock_ReadOnly);
+    }
+#endif
     [gPhotoVTLock unlock];
 
     CVPixelBufferRelease(fresh);
