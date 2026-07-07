@@ -115,10 +115,11 @@ static CVPixelBufferRef VCamCopyPoolBuffer(size_t w, size_t h, OSType fmt) {
     if (!gPool || gPoolW != w || gPoolH != h || gPoolFmt != fmt) {
         if (gPool) { CVPixelBufferPoolRelease(gPool); gPool = NULL; }
         NSDictionary *attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey     : @(fmt),
-            (id)kCVPixelBufferWidthKey               : @(w),
-            (id)kCVPixelBufferHeightKey              : @(h),
-            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+            (id)kCVPixelBufferPixelFormatTypeKey       : @(fmt),
+            (id)kCVPixelBufferWidthKey                 : @(w),
+            (id)kCVPixelBufferHeightKey                : @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey   : @{},
+            (id)kCVPixelBufferMetalCompatibilityKey    : @YES,  // let the GPU CIContext render into it
         };
         CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
                                 (__bridge CFDictionaryRef)attrs, &gPool);
@@ -149,6 +150,13 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
 
     CVPixelBufferRef out = VCamCopyPoolBuffer(w, h, fmt);
     if (!out) { CVPixelBufferRelease(fresh); return NULL; }
+
+    // Propagate the camera buffer's color attachments (YCbCr matrix, colour
+    // primaries, transfer function, clean aperture, ...) onto our buffer. A
+    // fresh YCbCr buffer with no colour info renders BLACK downstream, so this
+    // is essential for the substituted frame to display correctly.
+    CFDictionaryRef att = CVBufferGetAttachments(templatePB, kCVAttachmentMode_ShouldPropagate);
+    if (att) CVBufferSetAttachments(out, att, kCVAttachmentMode_ShouldPropagate);
 
     BOOL ok = NO;
     @try {
