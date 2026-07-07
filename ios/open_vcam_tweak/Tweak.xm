@@ -155,8 +155,11 @@ static CVPixelBufferRef VCamCopyReplacementBuffer(CVImageBufferRef templatePB) {
     // primaries, transfer function, clean aperture, ...) onto our buffer. A
     // fresh YCbCr buffer with no colour info renders BLACK downstream, so this
     // is essential for the substituted frame to display correctly.
-    CFDictionaryRef att = CVBufferGetAttachments(templatePB, kCVAttachmentMode_ShouldPropagate);
-    if (att) CVBufferSetAttachments(out, att, kCVAttachmentMode_ShouldPropagate);
+    CFDictionaryRef att = CVBufferCopyAttachments(templatePB, kCVAttachmentMode_ShouldPropagate);
+    if (att) {
+        CVBufferSetAttachments(out, att, kCVAttachmentMode_ShouldPropagate);
+        CFRelease(att);
+    }
 
     BOOL ok = NO;
     @try {
