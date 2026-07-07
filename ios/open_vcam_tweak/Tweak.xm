@@ -81,21 +81,21 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_AUTO_ORIENT_DIR 270
 #endif
 
-// Still-photo replacement. The closed vcamera also overwrites the photo path
-// (report §2.3: -[<core> modifyPixelBuffer:] on the BWStillImageScalerNode /
-// BWPhotoEncoderNode chain, with a TransitionID dedup mark).
+// Still-photo replacement (report §2.3: the closed vcamera overwrites the photo
+// path too, on the BWStillImageScalerNode / BWPhotoEncoderNode chain, with a
+// TransitionID dedup mark) so the shutter captures OBS, not the real lens.
 //
-// DISABLED BY DEFAULT after device testing: on THIS device (Dopamine iOS 16.1.2)
-// hooking the photo scaler/encoder nodes and overwriting their buffer in place
-// HANGS mediaserverd on the stock-Camera photo->video switch (the system watchdog
-// then restarts mediaserverd and the frame falls back to the real lens). This is
-// the highest-risk path called out in EXECUTION-PLAN §4.6. The live-video path
-// (BWNodeOutput emitSampleBuffer:) is unaffected and verified working, so we ship
-// video-only. Re-enable for experimentation with -DVCAM_HOOK_PHOTO_NODES=1, but it
-// needs a different approach (the closed vcamera gates on a detected face and uses
-// a dedicated session — replicating that safely is future work).
+// ENABLED to match the original. An earlier attempt HUNG mediaserverd on the
+// stock-Camera photo->video switch; the cause was our dedup using a PRIVATE
+// attachment key. The original reuses CoreMedia's REAL
+// kCMSampleBufferAttachmentKey_TransitionID — which the system itself stamps on
+// the buffers it shuffles during a mode transition, so reading the real key makes
+// us pass those through untouched instead of overwriting mid-transition (the
+// hang). VCamOverwritePhotoInPlace now uses the real key, matching the original.
+// Kill switch if a device still misbehaves: -DVCAM_HOOK_PHOTO_NODES=0 (falls back
+// to real-lens stills; live video is unaffected).
 #ifndef VCAM_HOOK_PHOTO_NODES
-#define VCAM_HOOK_PHOTO_NODES 0
+#define VCAM_HOOK_PHOTO_NODES 1
 #endif
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
@@ -372,12 +372,14 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 // original's second session at +0x90) keeps still captures off the live-video
 // session's lock. Fail-open everywhere: any miss -> the real still frame.
 //
-// The original repurposes CoreMedia's kCMSampleBufferAttachmentKey_TransitionID
-// for the dedup mark; we use a private key instead so we never perturb the real
-// transition semantics the photo encoder may rely on. The original also gates
-// this on a detected face (its beauty path); we replace unconditionally, which
-// is what a virtual camera wants — the OBS frame lands in the photo whether or
-// not a face is present.
+// We reuse CoreMedia's real kCMSampleBufferAttachmentKey_TransitionID for the
+// dedup mark, EXACTLY like the original — not a private key. This is deliberate:
+// the system stamps TransitionID on the buffers it moves during a photo<->video
+// mode switch, so reading the real key makes us skip those and pass through
+// mid-transition (an earlier private-key version overwrote them and hung
+// mediaserverd). The original also gates on a detected face (its beauty path); we
+// replace unconditionally, which is what a virtual camera wants — the OBS frame
+// lands in the photo whether or not a face is present.
 // ---------------------------------------------------------------------------
 // Counters stay unconditionally compiled: the always-on health line reads them so
 // the syslog shows photo[...] = 0 when the photo path is disabled (the default).
@@ -406,12 +408,15 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
     VCamConfig *cfg = [VCamConfig shared];
     if (!cfg.enabled) return NO;
 
-    // Dedup: this still buffer may pass through several photo nodes; overwrite
-    // exactly once. A propagating attachment carries the mark onto any buffer the
-    // scaler derives from it, so the encoder/preview/thumbnail nodes skip it.
-    if (CMGetAttachment(sb, CFSTR("VCamTransitionID"), NULL) != NULL) {
+    // Dedup with the REAL TransitionID (report §2.3). Two jobs: (1) a still flows
+    // scaler->encoder->preview/thumbnail, so the first node stamps it and the rest
+    // skip — overwrite exactly once; (2) the system stamps TransitionID on the
+    // buffers it shuffles during a photo<->video mode switch, so seeing it here
+    // means "leave this one alone", which keeps us out of the transition that used
+    // to hang mediaserverd. Propagating mode carries the mark onto derived buffers.
+    if (CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) != NULL) {
         gRPhotoDup++;
-        return YES;   // already ours from an upstream node
+        return YES;   // already ours, or a system transition buffer -> pass through
     }
 
     CVImageBufferRef dst = CMSampleBufferGetImageBuffer(sb);
@@ -423,9 +428,18 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
     VCamEnsurePhotoSession();
     if (!gPhotoTransferSession) { CVPixelBufferRelease(fresh); return NO; }
 
+    // Same geometry handling as the live path: a 4:3/16:9 landscape still buffer
+    // needs the portrait OBS frame quarter-turned (auto-orient), then front-mirror,
+    // so captured photos match the corrected video orientation instead of coming
+    // out stretched/rotated.
     BOOL frontCamera = (gSourcePosition == 2);
     BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && frontCamera);
     long rot = ((cfg.rotation % 360) + 360) % 360;
+#if VCAM_AUTO_ORIENT
+    if (VCamAutoOrientDegrees(fresh, dst) == 90) {
+        rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
+    }
+#endif
     CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
 
@@ -442,8 +456,9 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
         return NO;
     }
 
-    // Tag so downstream photo nodes skip re-overwriting this (or a derived) buffer.
-    CMSetAttachment(sb, CFSTR("VCamTransitionID"), (__bridge CFTypeRef)@(1),
+    // Stamp the real TransitionID so downstream photo nodes skip re-overwriting
+    // this (or a derived) buffer — matching the original.
+    CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, (__bridge CFTypeRef)@(1),
                     kCMAttachmentMode_ShouldPropagate);
     gPhotoReplaced++;
     return YES;
