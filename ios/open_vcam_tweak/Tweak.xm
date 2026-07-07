@@ -191,7 +191,7 @@ void VCamLog(NSString *format, ...) {
 // conversion correctly. The session adapts to the src/dst buffers on each call,
 // so we create it once and reuse it, serialised by gVTLock because the capture
 // graph can service several source nodes concurrently. Rotation / front-camera
-// mirror is layered on top with VTPixelRotationSession (see VCamCopyRotated).
+// mirror is layered on top with VTPixelRotationSession (see VCamCopyRotatedLocked).
 // ---------------------------------------------------------------------------
 static VTPixelTransferSessionRef gTransferSession;
 static NSLock *gVTLock;
@@ -206,16 +206,23 @@ static void VCamEnsureSessions(void) {
             // FAILS whenever the source (decoded RTMP frame, e.g. 1080x1920) and the
             // destination (camera buffer, a different size) differ — which is the
             // normal case. That silent failure => replacement NULL => real camera.
-            // Normal = stretch to fill (matches the previous stretch behaviour).
+            // Trim = scale preserving aspect ratio, cropping overflow — matches the
+            // closed vcamera (it sets kVTScalingMode_Trim, RE'd at 0x84928). Trim
+            // avoids the stretched look Normal gives when src/dst aspect ratios differ.
             VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
-                                 kVTScalingMode_Normal);
+                                 kVTScalingMode_Trim);
         }
     });
 }
 
-// A CVPixelBufferPool keyed on (width, height, pixel format); recreated only when
-// those change. Used for the rotation intermediate buffer (VCamCopyRotated).
-typedef struct { CVPixelBufferPoolRef pool; size_t w, h; OSType fmt; } VCamPool;
+// A single REUSED rotation-output buffer, keyed on (width, height, pixel format);
+// reallocated only when those change. The closed vcamera rotates into ONE cached
+// buffer (self+0x70) every frame, NOT a fresh pool buffer per frame — reusing the
+// same IOSurface is part of why it never hits the GPU iofence deadlock (a new
+// surface each frame lets the capture graph's GPU still be reading buffer N while
+// we submit a write to buffer N+1, and the fences cross). See memory
+// openvcam-original-gpu-sync-model / openvcam-freeze-gpu-iofence.
+typedef struct { CVPixelBufferRef buf; size_t w, h; OSType fmt; } VCamRotBuf;
 
 // Always-on failure-reason counters so the periodic health line reports WHY an
 // overwrite was skipped (fail-open): no fresh decoded frame, no transfer session,
@@ -223,28 +230,24 @@ typedef struct { CVPixelBufferPoolRef pool; size_t w, h; OSType fmt; } VCamPool;
 // diagnostic (startup-gated debug logs fire before a syslog capture can attach).
 static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
 
-static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt) {
-    static NSLock *lock;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lock = [[NSLock alloc] init]; });
-
-    CVPixelBufferRef out = NULL;
-    [lock lock];
-    if (!p->pool || p->w != w || p->h != h || p->fmt != fmt) {
-        if (p->pool) { CVPixelBufferPoolRelease(p->pool); p->pool = NULL; }
+// Return the cached rotation-output buffer, (re)allocating only when the geometry
+// changes. NOT retained/returned to a pool per frame — the SAME buffer is handed
+// back every call so the rotation writes into one stable IOSurface. The caller
+// MUST already hold gVTLock (this touches shared cached state and is only ever
+// called from inside the single rotate+transfer critical section).
+static CVPixelBufferRef VCamRotBufGet(VCamRotBuf *p, size_t w, size_t h, OSType fmt) {
+    if (!p->buf || p->w != w || p->h != h || p->fmt != fmt) {
+        if (p->buf) { CVPixelBufferRelease(p->buf); p->buf = NULL; }
         NSDictionary *attrs = @{
-            (id)kCVPixelBufferPixelFormatTypeKey     : @(fmt),
-            (id)kCVPixelBufferWidthKey               : @(w),
-            (id)kCVPixelBufferHeightKey              : @(h),
             (id)kCVPixelBufferIOSurfacePropertiesKey : @{},   // VT needs IOSurface-backed buffers
         };
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
-                                (__bridge CFDictionaryRef)attrs, &p->pool);
-        p->w = w; p->h = h; p->fmt = fmt;
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
+                                (__bridge CFDictionaryRef)attrs, &nb) == kCVReturnSuccess) {
+            p->buf = nb; p->w = w; p->h = h; p->fmt = fmt;
+        }
     }
-    if (p->pool) CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, p->pool, &out);
-    [lock unlock];
-    return out;
+    return p->buf;   // owned by the cache; caller does NOT release
 }
 
 // Rotation / front-camera mirror via VTPixelRotationSession (iOS 16+), matching
@@ -254,20 +257,28 @@ static CVPixelBufferRef VCamPoolCopy(VCamPool *p, size_t w, size_t h, OSType fmt
 // camera format. Stored as CFTypeRef so the file-scope declaration needs no
 // availability annotation; every use is inside `if (@available(iOS 16, *))`.
 // On iOS < 16 rotation is skipped (the frame still shows, just unrotated).
-static VCamPool gRotPool;
+static VCamRotBuf gRotBuf;
 static CFTypeRef gRotationSession;   // VTPixelRotationSessionRef, or NULL
 
-static CVPixelBufferRef VCamCopyRotated(CVPixelBufferRef fresh, BOOL mirror, long rot) {
+// Rotate `fresh` into the single cached rotation buffer and return it (NOT
+// retained — owned by the cache, valid only until the next call). Returns NULL
+// when no rotation/mirror is needed (caller transfers `fresh` directly) or on
+// failure. The caller MUST already hold gVTLock: unlike before, this does NOT
+// take the lock itself, so the rotate and the subsequent transfer run as ONE
+// uninterrupted critical section (the closed vcamera holds a single lock across
+// rotate+transfer; splitting them let a second emit thread interleave GPU
+// submissions on the shared surfaces and cross the IOSurface fences -> deadlock).
+static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirror, long rot,
+                                              VCamRotBuf *rotBuf, CFTypeRef *sessionSlot) {
     if (!mirror && rot == 0) return NULL;          // nothing to do -> transfer 'fresh' directly
     CVPixelBufferRef rotated = NULL;
     if (@available(iOS 16.0, *)) {
-        [gVTLock lock];
-        if (!gRotationSession) {
+        if (!*sessionSlot) {
             VTPixelRotationSessionRef rs = NULL;
             VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
-            gRotationSession = rs;
+            *sessionSlot = rs;
         }
-        VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
+        VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)*sessionSlot;
         if (rs) {
             CFStringRef rotKey = kVTRotation_0;
             if (rot == 90) rotKey = kVTRotation_CW90;
@@ -281,15 +292,13 @@ static CVPixelBufferRef VCamCopyRotated(CVPixelBufferRef fresh, BOOL mirror, lon
             OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
             size_t rw = (rot == 90 || rot == 270) ? fh : fw;   // rotation swaps W/H
             size_t rh = (rot == 90 || rot == 270) ? fw : fh;
-            rotated = VCamPoolCopy(&gRotPool, rw, rh, ffmt);
-            if (rotated && VTPixelRotationSessionRotateImage(rs, fresh, rotated) != noErr) {
-                CVPixelBufferRelease(rotated);
-                rotated = NULL;
+            CVPixelBufferRef out = VCamRotBufGet(rotBuf, rw, rh, ffmt);  // cached, not retained
+            if (out && VTPixelRotationSessionRotateImage(rs, fresh, out) == noErr) {
+                rotated = out;
             }
         }
-        [gVTLock unlock];
     }
-    return rotated;
+    return rotated;   // cache-owned; caller must NOT release
 }
 
 // Decide how many degrees to rotate the OBS source so its pixels line up with the
@@ -381,19 +390,24 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
         }
     }
 
-    CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
-    CVPixelBufferRef src = rotated ? rotated : fresh;
-
-    // Scale + pixel-format/range convert the OBS frame directly INTO the camera
-    // buffer. Serialised by gVTLock (the capture graph is multi-threaded), like
-    // the original's per-instance lock around its transfer session. ScalingMode
-    // is set on the session (VCamEnsureSessions) so a src/dst size mismatch works.
+    // Rotate + transfer as ONE atomic critical section under gVTLock — exactly
+    // like the closed vcamera, which holds its single instance lock across the
+    // WHOLE rotate->transfer sequence (self+0x18, disassembly 0x844a4..0x847d0).
+    // The earlier code rotated under gVTLock, RELEASED it, then re-acquired it for
+    // the transfer; in that gap another emit thread could interleave its own
+    // rotate/transfer on the shared rotation buffer and camera surface, producing
+    // the crossing GPU IOSurface fences (bug_type 284 iofence) that froze
+    // mediaserverd. One unbroken lock span serialises all GPU submits on these
+    // shared surfaces. VCamCopyRotatedLocked now REQUIRES the caller to hold gVTLock and
+    // returns a CACHED buffer (not owned — do NOT release it).
     [gVTLock lock];
+    CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot,
+                                                     &gRotBuf, &gRotationSession);
+    CVPixelBufferRef src = rotated ? rotated : fresh;
+    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
     [gVTLock unlock];
 
-    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
-    if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
     if (ts != noErr) {
         gRXferFail++;
@@ -435,6 +449,11 @@ static uint64_t gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail, gPhotoReplaced;
 #if VCAM_HOOK_PHOTO_NODES
 static VTPixelTransferSessionRef gPhotoTransferSession;
 static NSLock *gPhotoVTLock;
+// Photo path gets its OWN rotation session + reused rotation buffer, distinct from
+// the live-video ones, so the two paths never touch each other's cached GPU state
+// across their separate locks. Guarded by gPhotoVTLock (see VCamOverwritePhotoInPlace).
+static CFTypeRef gPhotoRotationSession;   // VTPixelRotationSessionRef, or NULL
+static VCamRotBuf gPhotoRotBuf;
 
 static void VCamEnsurePhotoSession(void) {
     static dispatch_once_t once;
@@ -444,8 +463,9 @@ static void VCamEnsurePhotoSession(void) {
         if (gPhotoTransferSession) {
             // Same reason as the video session: without a scaling mode the transfer
             // FAILS whenever the still buffer's size differs from the decoded frame.
+            // Trim matches the closed vcamera (kVTScalingMode_Trim).
             VTSessionSetProperty(gPhotoTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
-                                 kVTScalingMode_Normal);
+                                 kVTScalingMode_Trim);
         }
     });
 }
@@ -487,14 +507,20 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
         rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
     }
 #endif
-    CVPixelBufferRef rotated = VCamCopyRotated(fresh, shouldMirror, rot);
-    CVPixelBufferRef src = rotated ? rotated : fresh;
-
+    // Same single-lock atomic rotate+transfer as the live path (see the long note
+    // in VCamOverwriteInPlace): hold gPhotoVTLock across BOTH the rotate and the
+    // transfer so no other thread interleaves a GPU submit on the shared photo
+    // rotation buffer / still surface. Uses the photo path's OWN rotation buffer
+    // and session (gPhotoRotBuf / gPhotoRotationSession) so it never contends the
+    // video path's gRotBuf. VCamCopyRotatedLocked returns a CACHED buffer — do NOT
+    // release it.
     [gPhotoVTLock lock];
+    CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot,
+                                                     &gPhotoRotBuf, &gPhotoRotationSession);
+    CVPixelBufferRef src = rotated ? rotated : fresh;
     OSStatus ts = VTPixelTransferSessionTransferImage(gPhotoTransferSession, src, dst);
     [gPhotoVTLock unlock];
 
-    if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(fresh);
     if (ts != noErr) {
         gRPhotoXferFail++;
