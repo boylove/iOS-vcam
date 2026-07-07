@@ -286,14 +286,17 @@ static CMSampleBufferRef VCamCreateReplacementSampleBuffer(CMSampleBufferRef ori
     // so the description matches. A description created afresh from our buffer
     // differs subtly and made -[BWGraph stop:] assert on capture teardown;
     // reusing the original makes our frame indistinguishable from the camera's.
-    CMVideoFormatDescriptionRef fd =
-        (CMVideoFormatDescriptionRef)CMSampleBufferGetFormatDescription(origSB);
+    // Create the format description FRESH from our own buffer. CMSampleBufferCreate‐
+    // ForImageBuffer requires the description to match the image buffer exactly;
+    // reusing the camera sample buffer's description (which carries format
+    // extensions our pool buffer lacks) makes creation FAIL — that was the noSB
+    // failure. The closed vcamera also creates its description from its own buffer.
+    CMVideoFormatDescriptionRef fd = NULL;
     BOOL ownFd = NO;
-    if (!fd) {
-        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd) != noErr)
-            fd = NULL;
-        else
-            ownFd = YES;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, out, &fd) == noErr && fd) {
+        ownFd = YES;
+    } else {
+        fd = (CMVideoFormatDescriptionRef)CMSampleBufferGetFormatDescription(origSB);  // fallback
     }
 
     CMSampleBufferRef newSB = NULL;
