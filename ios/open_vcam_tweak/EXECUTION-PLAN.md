@@ -41,16 +41,21 @@ mediaserverd 进程内 (%ctor 仅当 processName==mediaserverd):
   hook BWNodeOutput emitSampleBuffer:  (只此一个终端节点; render 节点默认不 hook, VCAM_HOOK_RENDER_NODES 可开)
   hook FigCaptureSourceConfiguration sourcePosition (前后摄判定, 前摄自动镜像)
   VCamRTMPSource ensureStarted → 后台拉流线程
-  换帧(替换, 不改原 buffer): VCamEmit → VCamCreateReplacementSampleBuffer(origSB)
-    → CMSampleBufferGetImageBuffer(取相机 buffer 作模板: 尺寸/格式/timing/attachments)
-    → VCamFrameStore 取 0.5s 内新鲜解码帧(无则 fail-open 传原 sb)
-    → VTPixelRotationSession(前摄镜像/旋转) + VTPixelTransferSession(转成相机像素格式/色域) → 自建 CVPixelBufferPool 缓冲
-    → CMSampleBufferCreateForImageBuffer(带原 timing/attachments) 造新 sample buffer → 调 orig 传新 sb → 释放
+  换帧(★就地覆盖相机自己的 IOSurface, 不造新 buffer): VCamEmit → VCamOverwriteInPlace(相机buf)
+    → dst = CMSampleBufferGetImageBuffer(origSB)  (相机自己的共享 IOSurface, App 预览/录制都读它)
+    → VCamFrameStore 取 0.5s 内新鲜解码帧(无则 fail-open, 传原始 sb 给 orig, 不动 buffer)
+    → src = VCamCopyRotated(fresh, 前摄镜像/旋转, VTPixelRotationSession)
+    → gVTLock 加锁: VTPixelTransferSessionTransferImage(session, src, dst)  ★就地写进相机 buffer
+      (必须设 kVTPixelTransferPropertyKey_ScalingMode=Normal, 源≠相机尺寸时否则静默失败)
+    → orig(self, _cmd, origSB)  ★传【原始 sb】, 不是新建的 (下游客户端读的就是被改写的 dst surface)
+  拍照(VCAM_HOOK_PHOTO_NODES, 默认关): VCamOverwritePhotoInPlace hook BWStillImageScalerNode/
+    BWPhotoEncoderNode, 同样就地覆盖 + kCMSampleBufferAttachmentKey_TransitionID 附件去重(一张照片
+    流经多个节点只覆盖一次)。render 节点(BWNode/BWUBNode/BWPixelTransferNode)默认透传, 就地改它们正是原生录制崩溃路径。
 拉流/解码:
   vendor/rtmp/vcam_rtmp.c(自写 RTMP play) → FLV/AVC 解析 → VCamH264Decoder(VideoToolbox 硬解, dstAttrs+RealTime+ThreadCount 照原作者) → VCamFrameStore
 打包: filter Bundles=(com.apple.mediaserverd) Executables=(mediaserverd); postinst: killall -9 videodecoderd + mediaserverd; Conflicts/Replaces com.x.vcamera
 ```
-> 注:早期用 CIContext 就地覆盖相机 buffer——既慢(多节点重复渲染)又在原生相机录制时触发 CMCapture PixelTransferSession 断言崩溃,且对 YCbCr 输出黑屏。现已改为「VT 转换 + 造新 sample buffer 替换」,照闭源 vcamera(见 VCAMERA_REVERSE_REPORT.md)。
+> 注:两条路都试过。**早期错误路径 A** = 在 render 节点用 CIContext 就地覆盖——既慢(多节点重复渲染)又在原生相机录制时触发 CMCapture PixelTransferSession 断言崩溃,且对 YCbCr 输出黑屏。**错误路径 B** = 造新 CMSampleBuffer 传下游替换——App 实时预览读的是**上游共享 IOSurface**,新 buffer 到不了预览,所以画面不变(0.3.5 之前预览不出 OBS 的根因)。**正确路径(当前 HEAD)** = 照闭源 vcamera 指令级逆向(见 `VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md`):**只在 `emitSampleBuffer:` 一处**用 **VTPixelTransferSessionTransferImage 就地写进相机自己的 buffer**,再把**原始 sb** 传给 orig;render 节点透传。VT(非 CIContext)正确处理 IOSurface 锁与 YCbCr 色域,不与采集管线抢占,故不崩录制。
 
 ---
 
@@ -104,13 +109,13 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 
 ### ✅ 已完成并验证
 - 自写 RTMP 客户端、VideoToolbox **硬解**(照原作者:非强制软解)、FrameStore、mediaserverd `BWNodeOutput emitSampleBuffer:` hook。
-- **换帧=替换**:VT 转换(VTPixelTransfer/Rotation)进自建 pool 缓冲 → 造新 CMSampleBuffer 传下游,**不改相机原 buffer**(照闭源;旧的 CIContext 就地覆盖已弃——慢+原相机录制崩+YCbCr 黑屏)。
+- **换帧=就地覆盖**:`emitSampleBuffer:` 里 `VTPixelTransferSessionTransferImage(src, 相机buf)` 就地写进相机自己的 IOSurface(VTPixelRotation 先做前摄镜像/旋转),再把**原始 sb** 传 orig。照闭源 vcamera 指令级逆向(`VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md`)。旧的「CIContext 就地覆盖」(慢+录制崩+YCbCr 黑屏)和「造新 buffer 传下游」(预览读上游 surface,到不了)都已弃。
 - **端到端成功**:OBS 显示在 RootHide 化 TikTok。
 - 解码器 1100 根因定位(videodecoderd 会话耗尽)+ 会话复用 + create 退避。
 - 反向隧道、CI(build+retag+validate)、VCamLog C 链接。
 
 ### 🔶 稍后继续开发(按建议优先级)
-- [x] **6-a 前后摄自动镜像**(v0.2.0 已实现,待设备肉眼确认方向):`Tweak.xm` hook `FigCaptureSourceConfiguration -sourcePosition` → 全局 `gSourcePosition`;`VCamOverwriteImageBuffer` 里前摄(pos==2)自动水平镜像,OR 上 `cfg.mirror`。方向可一键翻转:编译期 `VCAM_FRONT_AUTOMIRROR`(默认 1)。**这是 mirror 的正确实现**(配置文件在 mediaserverd 读不到,见 4.4)。若装后前摄镜像方向反了,把该宏改 0 重出即可。
+- [x] **6-a 前后摄自动镜像**(v0.2.0 已实现,待设备肉眼确认方向):`Tweak.xm` hook `FigCaptureSourceConfiguration -sourcePosition` → 全局 `gSourcePosition`;`VCamOverwriteInPlace` 里前摄(pos==2)自动水平镜像,OR 上 `cfg.mirror`。方向可一键翻转:编译期 `VCAM_FRONT_AUTOMIRROR`(默认 1)。**这是 mirror 的正确实现**(配置文件在 mediaserverd 读不到,见 4.4)。若装后前摄镜像方向反了,把该宏改 0 重出即可。
 - [x] **6-b 解码会话复用**(v0.2.0):`configureWithAVCDecoderConfigurationRecord` 里若新 SPS/PPS + naluLen 与当前相同且 `_session/_formatDesc` 存在 → 直接返回 YES,跳过重建;减少 GOP 重发 seq header 时的建/毁,避免会话泄漏(呼应 4.3)。
 - [x] **6-c 出正式版清理**(v0.2.0):`VCamLog.h` 加 `VCAM_DEBUG`(默认 0)+ `VCamDebugLog` 宏;probe、seq header 字节 dump、stats、produced 计数全部收进 `#if VCAM_DEBUG`;错误 + 一次性生命周期日志(hooks installed / decoder configured / rtmp 错误)仍走 `VCamLog` 常显。调试时 `make ... OpenVCam_CFLAGS+=-DVCAM_DEBUG=1`。
 - [ ] **6-d 人脸检测确认**:检测在覆盖下游运行,应能识别 OBS 画面里的脸——用户用 TikTok 人脸贴纸实测确认(代码层不覆盖元数据/人脸节点,理论已可用)。
@@ -123,7 +128,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 
 ## 7. 🕳️ 防坑清单
 
-1. mediaserverd 换帧**别就地改相机 buffer**——造新 sample buffer 替换(VT 转成相机格式),否则原相机录制会触发 CMCapture PixelTransferSession 断言崩溃(4.6)。
+1. mediaserverd 换帧**就地覆盖相机 buffer,但只在 `emitSampleBuffer:` 一处、且用 VT(`VTPixelTransferSessionTransferImage`)不用 CIContext**——render 节点透传(就地改它们才会触发 CMCapture PixelTransferSession 断言崩溃,4.6);造新 buffer 传下游则预览读上游 surface 不变(§3 注)。
 2. **配置别指望文件**:mediaserverd 沙盒挡所有路径(4.4)。mirror 走 sourcePosition;开关走卸载或 notify。
 3. **解码 1100 先想到 videodecoderd 会话耗尽**(反复 killall -9 的后果),`killall videodecoderd` 重置;生产只 killall 一次(4.3)。
 4. Theos 默认 **-Werror**:iOS15+ 弃用 API(如 `CVBufferGetAttachments`→用 `CVBufferCopyAttachments`)、iOS17+ 标注常量都会编译失败;iOS 无独立 `AudioUnit` framework(只连 `AudioToolbox`)。
@@ -152,7 +157,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
-| **M1** | mediaserverd 注入 + BWNodeOutput hook + 拉流硬解 + VT 转换造新 sample buffer 替换 | ✅ 完成 |
+| **M1** | mediaserverd 注入 + BWNodeOutput emit hook + 拉流硬解 + VTPixelTransfer 就地覆盖相机 buffer | ✅ 完成 |
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
 | **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | ⬜ 待做(6-d 待肉眼确认) |

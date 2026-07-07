@@ -1,6 +1,7 @@
 #!/bin/sh
 # OpenVCam hooks mediaserverd's capture graph (BWNodeOutput -emitSampleBuffer:)
-# and substitutes a fresh camera-format sample buffer, like the original vcamera.
+# and overwrites the camera's OWN image buffer IN PLACE via VTPixelTransferSession,
+# then passes the original sample buffer downstream, like the original vcamera.
 # (The audio / AudioUnitRender hook is temporarily out of this build.) Restart
 # mediaserverd so the tweak loads; it respawns automatically.
 #
