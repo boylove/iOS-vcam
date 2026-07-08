@@ -222,9 +222,15 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         VCamLog(@"decoder: HW create failed (%d) %dx%d — trying software fallback",
                 (int)status, dims.width, dims.height);
         _session = NULL;
+        // Use the raw CFString values, not the named constants: those constants are
+        // annotated iOS 17+ in the SDK (-Werror,-Wunguarded-availability-new blocks
+        // them) but the underlying string keys are honoured on earlier iOS. If this
+        // device's iOS 16 has no software H264 decoder at all, VT ignores them and
+        // create still fails — no worse off; a hardware reset (power cycle) is then
+        // the only fix.
         NSDictionary *swSpec = @{
-            (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder  : @NO,
-            (id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder : @NO,
+            (__bridge id)CFSTR("EnableHardwareAcceleratedVideoDecoder")  : @NO,
+            (__bridge id)CFSTR("RequireHardwareAcceleratedVideoDecoder") : @NO,
         };
         status = VTDecompressionSessionCreate(
             kCFAllocatorDefault, _formatDesc,
