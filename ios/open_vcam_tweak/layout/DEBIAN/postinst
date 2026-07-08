@@ -9,31 +9,38 @@
 # decode-session pool exhausted, which makes the first VTDecompressionSessionCreate
 # fail with err 1100 (no video overwrite until reset). See EXECUTION-PLAN §4.3.
 
-# RootHide compatibility: this deb is built rootless, so files land under
-# /var/jb/Library/MobileSubstrate/DynamicLibraries. On RootHide, ElleKit ONLY
-# scans /usr/lib/TweakInject (= /Library/MobileSubstrate/DynamicLibraries symlink),
-# and NEVER the /var/jb path — so the tweak silently never injects into
-# mediaserverd (no [OpenVCam] logs, real camera shown). Mirror it into the real
-# scan dir. The guard skips this on pure-rootless (Dopamine) devices, which have
-# no writable /usr/lib/TweakInject. See memory roothide-tweakinject-path.
+# RootHide compatibility. ElleKit only scans /usr/lib/TweakInject. On some rootless
+# layouts the deb's files land under /var/jb/... which is a DIFFERENT directory, so
+# the tweak must be mirrored into the scan dir or it never injects (memory
+# roothide-tweakinject-path).
 #
-# ELLEKIT-SAFE MIRROR (do NOT clobber RootHide's own copy): when this deb is
-# installed through a package manager (Sileo/Zebra), RootHide's AutoPatcher ALREADY
-# mirrors + re-signs the dylib into /usr/lib/TweakInject and records it with a
-# `<dylib>.roothidepatch` marker (see VCAMERA_DEB_REVERSE_ANALYSIS.md §4.1). If we
-# then `cp -f` our raw /var/jb copy over that managed file, we (a) replace RootHide's
-# patched/signed binary with an unpatched one and (b) leave RootHide's patch record
-# pointing at a file it no longer owns — which is what makes ElleKit error when the
-# package is later removed. So only place our manual copy when the scan dir does NOT
-# already have the file (the raw `dpkg -i` case, where AutoPatcher never ran). When
-# RootHide already mirrored it, leave it entirely to RootHide.
+# CRITICAL (device-confirmed 2026-07-08): on THIS RootHide device `/var/jb` is a
+# symlink to `/`, so /var/jb/Library/MobileSubstrate/DynamicLibraries,
+# /Library/MobileSubstrate/DynamicLibraries and /usr/lib/TweakInject ALL resolve to
+# the SAME directory. In that case dpkg already installs the dylib straight into the
+# scan dir, so mirroring copies a file onto itself AND — far worse — the postrm
+# removing "the mirror" deletes the package's OWN dpkg-tracked file. On a Sileo
+# upgrade dpkg unpacks the new dylib, then runs the OLD postrm, which wiped the
+# freshly-unpacked file -> phantom install (dpkg says installed, file gone, no
+# injection, real camera shown). So mirror ONLY when the scan dir is a genuinely
+# DIFFERENT directory from where dpkg installed the file.
 SRC="/var/jb/Library/MobileSubstrate/DynamicLibraries"
-if [ -d /usr/lib/TweakInject ] && [ -f "$SRC/OpenVCam.dylib" ]; then
-    if [ ! -e /usr/lib/TweakInject/OpenVCam.dylib ] \
-       && [ ! -e /usr/lib/TweakInject/OpenVCam.dylib.roothidepatch ]; then
-        cp -f "$SRC/OpenVCam.dylib"  /usr/lib/TweakInject/OpenVCam.dylib  2>/dev/null || true
-        cp -f "$SRC/OpenVCam.plist" /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+DST="/usr/lib/TweakInject"
+if [ -d "$DST" ] && [ -f "$SRC/OpenVCam.dylib" ]; then
+    SRC_REAL="$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")"
+    DST_REAL="$(readlink -f "$DST" 2>/dev/null || echo "$DST")"
+    if [ "$SRC_REAL" != "$DST_REAL" ]; then
+        # Genuinely separate dirs (e.g. some pure-rootless layouts). Only place our
+        # copy when the scan dir does not already have the file and RootHide's
+        # AutoPatcher has not already managed it (a <dylib>.roothidepatch marker):
+        # clobbering RootHide's patched/signed copy is what made ElleKit error.
+        if [ ! -e "$DST/OpenVCam.dylib" ] && [ ! -e "$DST/OpenVCam.dylib.roothidepatch" ]; then
+            cp -f "$SRC/OpenVCam.dylib"  "$DST/OpenVCam.dylib"  2>/dev/null || true
+            cp -f "$SRC/OpenVCam.plist" "$DST/OpenVCam.plist" 2>/dev/null || true
+        fi
     fi
+    # else: same directory -> dpkg already placed the file in the scan dir; nothing
+    # to mirror, and postrm must NOT remove it (see postrm).
 fi
 
 killall -9 videodecoderd 2>/dev/null || true

@@ -1,13 +1,22 @@
 #!/bin/sh
-# Remove ONLY the manual mirror copy our postinst placed in the ElleKit scan dir
-# (the raw `dpkg -i` case). Do NOT touch it when RootHide's AutoPatcher owns that
-# path — presence of a `<dylib>.roothidepatch` marker means RootHide mirrored and
-# tracks it (VCAMERA_DEB_REVERSE_ANALYSIS.md §4.1), and RootHide removes it as part
-# of the package removal itself. Deleting a RootHide-managed file (or its plist)
-# out from under it orphans RootHide's patch record and makes ElleKit error on the
-# next scan — the exact "uninstall breaks ellekit" symptom this guard prevents.
-if [ ! -e /usr/lib/TweakInject/OpenVCam.dylib.roothidepatch ]; then
-    rm -f /usr/lib/TweakInject/OpenVCam.dylib /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+# Remove the manual TweakInject mirror ONLY when it is a genuinely SEPARATE copy
+# from the dpkg-installed file, i.e. when /usr/lib/TweakInject resolves to a
+# DIFFERENT directory than where dpkg put the dylib
+# (/var/jb/Library/MobileSubstrate/DynamicLibraries).
+#
+# CRITICAL (device-confirmed 2026-07-08): on RootHide layouts where `/var/jb` is a
+# symlink to `/`, those two paths are the SAME directory. The file in TweakInject is
+# then dpkg's OWN tracked file, which dpkg removes itself. Manually rm'ing it here
+# (a) is redundant on real removal and (b) on a Sileo UPGRADE deletes the newly
+# unpacked dylib that dpkg just placed (old postrm runs after unpack) -> phantom
+# install, no injection. Also never touch a RootHide AutoPatcher-managed copy
+# (a <dylib>.roothidepatch marker) — orphaning its patch record makes ElleKit error.
+SRC="/var/jb/Library/MobileSubstrate/DynamicLibraries"
+DST="/usr/lib/TweakInject"
+SRC_REAL="$(readlink -f "$SRC" 2>/dev/null || echo "$SRC")"
+DST_REAL="$(readlink -f "$DST" 2>/dev/null || echo "$DST")"
+if [ "$SRC_REAL" != "$DST_REAL" ] && [ ! -e "$DST/OpenVCam.dylib.roothidepatch" ]; then
+    rm -f "$DST/OpenVCam.dylib" "$DST/OpenVCam.plist" 2>/dev/null || true
 fi
 killall -9 mediaserverd 2>/dev/null || true
 exit 0

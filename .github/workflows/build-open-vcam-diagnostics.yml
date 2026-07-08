@@ -55,7 +55,7 @@ jobs:
         run: |
           # Distinct version per variant so the two debs never collide and dpkg
           # installs one over the other cleanly. -i.bak is portable BSD/GNU sed.
-          sed -i.bak 's/^Version: .*/Version: 0.5.2+${{ matrix.label }}/' control
+          sed -i.bak 's/^Version: .*/Version: 0.5.3+${{ matrix.label }}/' control
           rm -f control.bak
           grep '^Version:' control
 
