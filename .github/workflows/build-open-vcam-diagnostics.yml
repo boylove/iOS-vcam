@@ -31,6 +31,8 @@ jobs:
             flags: VCAM_DEST_COLOR=1
           - label: cpuxfer
             flags: VCAM_GPU_ACCEL=0
+          - label: fenceflush
+            flags: VCAM_GPU_FENCE_FLUSH=1
 
     steps:
       - name: Checkout
