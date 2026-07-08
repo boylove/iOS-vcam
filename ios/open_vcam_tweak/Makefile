@@ -13,6 +13,11 @@ TWEAK_NAME := OpenVCam
 # Set -DVCAM_DEBUG=1 to re-enable verbose per-frame diagnostics.
 OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
+# TEMPORARY DIAGNOSTIC (0.4.1): isolate whether the per-frame VTPixelRotation pass
+# is the photo-mode IOFence deadlock. Transfers raw OBS -> dst with no rotation,
+# like the closed vcamera's single-pass photo flow. Orientation is wrong while on.
+# REVERT this line once confirmed (then implement metadata-orientation).
+OpenVCam_CFLAGS += -DVCAM_DISABLE_ROTATION=1
 
 # Diagnostic / feature toggles, passthrough from the command line or CI.
 #   make package VCAM_HOOK_PHOTO_NODES=0   -> build the still-path OFF diagnostic deb
@@ -25,6 +30,9 @@ OpenVCam_CFLAGS += -DVCAM_HOOK_PHOTO_NODES=$(VCAM_HOOK_PHOTO_NODES)
 endif
 ifdef VCAM_DEBUG
 OpenVCam_CFLAGS += -DVCAM_DEBUG=$(VCAM_DEBUG)
+endif
+ifdef VCAM_DISABLE_ROTATION
+OpenVCam_CFLAGS += -DVCAM_DISABLE_ROTATION=$(VCAM_DISABLE_ROTATION)
 endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 

@@ -114,6 +114,14 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_GPU_FENCE_FLUSH 1
 #endif
 
+// DIAGNOSTIC ONLY: skip the per-frame VTPixelRotationSession pass and transfer the
+// raw OBS frame straight into dst (like the closed vcamera's single-pass photo
+// flow). Isolates whether the rotation pass is the photo-mode IOFence deadlock.
+// Orientation is wrong while this is on. Enabled via -DVCAM_DISABLE_ROTATION=1.
+#ifndef VCAM_DISABLE_ROTATION
+#define VCAM_DISABLE_ROTATION 0
+#endif
+
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
 // FigCaptureSourceConfiguration -sourcePosition hook; read on the capture path.
 static volatile long gSourcePosition = 0;
@@ -417,9 +425,21 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // shared surfaces. VCamCopyRotatedLocked now REQUIRES the caller to hold gVTLock and
     // returns a CACHED buffer (not owned — do NOT release it).
     [gVTLock lock];
+#if VCAM_DISABLE_ROTATION
+    // DIAGNOSTIC: no per-frame VTPixelRotationSession pass at all — transfer the
+    // raw OBS frame straight into dst, exactly like the closed vcamera's photo-mode
+    // flow (dynamic RE: it logs one transfer/frame, src stays 1080x1920, no
+    // rotation). If photo mode stops freezing with this, the rotation pass is the
+    // IOFence culprit. Orientation will be ~90 deg off here — expected, this only
+    // isolates the deadlock. (void the unused rotate helper via cfg params.)
+    CVPixelBufferRef rotated = NULL;
+    (void)shouldMirror; (void)rot;
+    CVPixelBufferRef src = fresh;
+#else
     CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot,
                                                      &gRotBuf, &gRotationSession);
     CVPixelBufferRef src = rotated ? rotated : fresh;
+#endif
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
 #if VCAM_GPU_FENCE_FLUSH
