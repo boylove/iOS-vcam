@@ -213,7 +213,26 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         kCFAllocatorDefault, _formatDesc, NULL,
         (__bridge CFDictionaryRef)dstAttrs, &callback, &_session);
     if (status != noErr || !_session) {
-        VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d",
+        // Hardware session create can fail with err 1100 when mediaserverd's
+        // hardware H264 decode-session pool (AppleAVE) is wedged — e.g. after heavy
+        // mediaserverd churn — and it can persist across a userspace reboot. Fall
+        // back to a forced SOFTWARE decoder so the OBS frame still decodes (more CPU
+        // but no dependence on the stuck hardware sessions). Only used when hardware
+        // fails, so normal operation is unchanged.
+        VCamLog(@"decoder: HW create failed (%d) %dx%d — trying software fallback",
+                (int)status, dims.width, dims.height);
+        _session = NULL;
+        NSDictionary *swSpec = @{
+            (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder  : @NO,
+            (id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder : @NO,
+        };
+        status = VTDecompressionSessionCreate(
+            kCFAllocatorDefault, _formatDesc,
+            (__bridge CFDictionaryRef)swSpec,
+            (__bridge CFDictionaryRef)dstAttrs, &callback, &_session);
+    }
+    if (status != noErr || !_session) {
+        VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d (hw+sw)",
                 (int)status, dims.width, dims.height);
         _session = NULL;
         // Leave no half-built state: drop the format description too, so we don't

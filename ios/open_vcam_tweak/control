@@ -1,6 +1,6 @@
 Package: com.iosvcam.opencam
 Name: iOS-VCAM OpenCam
-Version: 0.4.1
+Version: 0.4.2
 Architecture: iphoneos-arm64e
 Description: Open-source, editable virtual camera tweak. Runs in mediaserverd so it covers every capture client (stock Camera, TikTok, all apps). Pulls an RTMP stream on-device, decodes H264 via VideoToolbox, and overwrites the camera's OWN image buffer IN PLACE at BWNodeOutput -emitSampleBuffer: via VTPixelTransferSessionTransferImage (VTPixelRotationSession rotate/front-mirror first), then passes the ORIGINAL sample buffer downstream - exactly like the closed vcamera (render nodes stay pass-through). This is why the app preview shows OBS: every client reads the same overwritten upstream IOSurface. Fail-open everywhere (any error falls back to the real camera). NOTE: the global microphone/audio hook (VCamAudioMS.x) is temporarily out of this build while the video path is verified; it returns in a later version.
 Maintainer: iOS-VCAM
