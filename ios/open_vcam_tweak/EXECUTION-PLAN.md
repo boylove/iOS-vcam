@@ -115,6 +115,10 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 - 故正确做法:**`VCAM_HOOK_PHOTO_NODES=0`**——不 hook 照片 render 节点,只靠视频路径 `emitSampleBuffer:` 的就地覆盖让拍照自然拿到 OBS。这既避开照片路径 fence 死锁,又符合原版真实机制。
 - 待验证:photo=0 + 视频单锁修复版,原相机拍照是否稳定且能拿到 OBS 帧。
 
+**✅ 已定案的根因与最终修复(0.5.0,动态 RE 坐实,记忆 `openvcam-photomode-original-flow`)**:
+photo=0 后**切照片模式仍卡**的真正原因是 **emit 路径本身的每帧 `VTPixelRotationSession` 旋转 pass**——不是照片节点。动态抓原版 `[vc]` 日志(照片模式 7089 次 transfer)证明:**闭源每帧只做一次 `VTPixelTransferSessionTransferImage`(src 恒为 1080×1920 原始帧),从不做每帧像素旋转**;方向由管线既有的 `BWVideoOrientationMetadataNode` 元数据在显示/编码时施加。OpenVCam 多出的**第二个 GPU pass**(旋转进共享中间 buffer)正是在照片模式多加速器管线里闭合 IOFence 环的那个多余参与者。
+**修复(0.5.0)**:**全局删除每帧像素旋转**,emit/photo 路径都改为**单次直传**(与原版一致);方向依赖管线既有元数据(先不做 override,装机验证,若照片仍偏 90° 再补 `BWVideoOrientationMetadataNode` override)。前摄镜像(原是 VTPixelRotationSession 翻转)一并移除,前摄显示未镜像的 OBS。删除的代码:`VCamCopyRotatedLocked`/`VCamRotBuf`/`VCamAutoOrientDegrees` 及 `VCAM_AUTO_ORIENT`/`VCAM_FRONT_AUTOMIRROR`/`VCAM_DISABLE_ROTATION` 宏。参考 `VCAMERA_DEB_REPLICATION_ROADMAP.md` M6、`VCAMERA_DEB_REVERSE_ANALYSIS.md` §3.9-3.10。**待装机验收**(roadmap §5 基线:切照片模式 + 按快门无冻结/无 `bug_type 284` iofence、存图即 OBS)。
+
 **留存的诊断工具**:独立心跳线程 `VCamStartHeartbeat`(不占采集线程),卡住时打印
 `HEARTBEAT: emits STALLED at N (emitInflight=.. photoInflight=..) -> ... BLOCKED IN PHOTO PATH/LIVE OVERWRITE`;`hooks installed ... VCAM_HOOK_PHOTO_NODES=N` 一行自证跑的是哪个包。CI `workflow_dispatch` 的 `hook_photo_nodes` 输入可一键出 photo=0/1 包(artifact 名带 `photo0`/`photo1`)。
 
@@ -185,7 +189,7 @@ probe 实测:`/var/mobile/vc.plist`、`/var/tmp/vc.plist`、`/var/mobile/Media/v
 | **M1** | mediaserverd 注入 + BWNodeOutput emit hook + 拉流硬解 + VTPixelTransfer 就地覆盖相机 buffer | ✅ 完成 |
 | **M2** | OBS 画面稳定显示在 RootHide 化 TikTok(100% 覆盖) | ✅ 完成 |
 | **M3** | 前后摄自动镜像(6-a)+ 会话复用(6-b)+ 出正式版清理(6-c) | ✅ 完成(v0.2.0,待装机确认镜像方向) |
-| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | 🔶 进行中:视频 GPU fence 死锁已修(单锁原子, §4.8/§4.9),设备实测视频预览稳定;拍照 render 节点 hook 仍死锁 → **改回 photo=0 默认**,拍照靠 emit 共享 surface 继承 OBS(原版主机制);待 photo=0+视频修复版装机确认拍照出 OBS 且稳定 |
+| **M4** | 人脸检测确认 + 拍照替换 + 稳定性 | 🔶 进行中:视频 GPU fence 死锁已修(单锁原子, §4.8/§4.9),设备实测视频预览稳定;**照片模式死锁根因定案=emit 每帧旋转 pass(非照片节点),0.5.0 全局删除像素旋转改单次直传(动态 RE 坐实)**,待装机验收拍照无冻结且存图即 OBS |
 | **M5** | 音频并入(视频+音频一个 deb) | 🔶 v0.3.0 改全局 mediaserverd 音频(原相机也生效),待装机验证原相机稳定性 |
 
 **推进节奏**:每步验证、汇报;动设备的写操作先说明、可回退。
