@@ -259,6 +259,7 @@ static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
 // back every call so the rotation writes into one stable IOSurface. The caller
 // MUST already hold gVTLock (this touches shared cached state and is only ever
 // called from inside the single rotate+transfer critical section).
+__attribute__((unused))
 static CVPixelBufferRef VCamRotBufGet(VCamRotBuf *p, size_t w, size_t h, OSType fmt) {
     if (!p->buf || p->w != w || p->h != h || p->fmt != fmt) {
         if (p->buf) { CVPixelBufferRelease(p->buf); p->buf = NULL; }
@@ -292,6 +293,7 @@ static CFTypeRef gRotationSession;   // VTPixelRotationSessionRef, or NULL
 // uninterrupted critical section (the closed vcamera holds a single lock across
 // rotate+transfer; splitting them let a second emit thread interleave GPU
 // submissions on the shared surfaces and cross the IOSurface fences -> deadlock).
+__attribute__((unused))
 static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirror, long rot,
                                               VCamRotBuf *rotBuf, CFTypeRef *sessionSlot) {
     if (!mirror && rot == 0) return NULL;          // nothing to do -> transfer 'fresh' directly
@@ -431,8 +433,7 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // flow (dynamic RE: it logs one transfer/frame, src stays 1080x1920, no
     // rotation). If photo mode stops freezing with this, the rotation pass is the
     // IOFence culprit. Orientation will be ~90 deg off here — expected, this only
-    // isolates the deadlock. (void the unused rotate helper via cfg params.)
-    CVPixelBufferRef rotated = NULL;
+    // isolates the deadlock.
     (void)shouldMirror; (void)rot;
     CVPixelBufferRef src = fresh;
 #else
