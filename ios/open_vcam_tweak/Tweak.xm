@@ -282,8 +282,8 @@ static CVPixelBufferRef VCamRotBufGet(VCamRotBuf *p, size_t w, size_t h, OSType 
 // camera format. Stored as CFTypeRef so the file-scope declaration needs no
 // availability annotation; every use is inside `if (@available(iOS 16, *))`.
 // On iOS < 16 rotation is skipped (the frame still shows, just unrotated).
-static VCamRotBuf gRotBuf;
-static CFTypeRef gRotationSession;   // VTPixelRotationSessionRef, or NULL
+static VCamRotBuf gRotBuf __attribute__((unused));
+static CFTypeRef gRotationSession __attribute__((unused));   // VTPixelRotationSessionRef, or NULL
 
 // Rotate `fresh` into the single cached rotation buffer and return it (NOT
 // retained — owned by the cache, valid only until the next call). Returns NULL
