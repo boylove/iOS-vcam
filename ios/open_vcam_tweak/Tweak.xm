@@ -73,13 +73,16 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_HOOK_PHOTO_NODES 0
 #endif
 
-// GPU fence flush after each transfer. VTPixelTransferSessionTransferImage submits the
-// GPU write ASYNC and returns immediately; locking the DEST surface forces the CPU to
-// block until the write lands so nothing lingers to cross-fence. Retained from the
-// working video build as low-risk defence-in-depth (the primary IOFence fix is dropping
-// the extra rotation pass). Set -DVCAM_GPU_FENCE_FLUSH=0 to A/B test.
+// GPU fence flush after each transfer. DEFAULT OFF (0): device evidence (2026-07-08,
+// syslog `AppleM2ScalerCSCDriver: IOFence is hung`) showed that locking the DEST
+// surface right after the transfer is what closes the GPU fence cycle in photo mode —
+// mediaserverd survives (not killed) but the scaler stays hung and the preview freezes
+// on the last OBS frame. The closed vcamera does NOT lock the CVPixelBuffer around its
+// transfer (disassembly, memory openvcam-original-gpu-sync-model point 1); it just
+// submits the GPU transfer and returns. Match that: no flush. Set -DVCAM_GPU_FENCE_FLUSH=1
+// only to A/B test the old behavior.
 #ifndef VCAM_GPU_FENCE_FLUSH
-#define VCAM_GPU_FENCE_FLUSH 1
+#define VCAM_GPU_FENCE_FLUSH 0
 #endif
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
@@ -199,6 +202,16 @@ static void VCamEnsureSessions(void) {
             // avoids the stretched look Normal gives when src/dst aspect ratios differ.
             VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
                                  kVTScalingMode_Trim);
+            // GPU-accelerated transfer, matching the closed vcamera's session config
+            // (analysis §3.5 / memory openvcam-original-gpu-sync-model: it sets
+            // EnableGPUAcceleratedTransfer=kCFBooleanTrue at 0x82470–0x8267c). No
+            // public VT constant exists for this key, so it is set by its string name
+            // (the same way the original does). The scaler/CSC work runs on the GPU
+            // (AppleM2ScalerCSC); leaving this unset let VT pick a path whose fence
+            // interaction with photo mode's own still-scaler differed from the original.
+            VTSessionSetProperty(gTransferSession,
+                                 (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                 kCFBooleanTrue);
         }
     });
 }
@@ -260,11 +273,9 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     [gVTLock lock];
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, fresh, cameraBuf);
 #if VCAM_GPU_FENCE_FLUSH
-    // GPU FENCE FLUSH: VTPixelTransferSessionTransferImage submits the GPU write ASYNC
-    // and returns immediately. Locking the DEST surface forces the CPU to block until
-    // the write lands so nothing lingers to cross-fence — retained defence-in-depth
-    // (the primary IOFence fix is dropping the extra rotation pass above). readOnly: we
-    // don't dirty the buffer, so no writeback on unlock.
+    // OFF by default — device-confirmed to CAUSE the photo-mode AppleM2ScalerCSC
+    // IOFence hang (see the macro note). The original does not lock; kept only as an
+    // A/B toggle. When on: lock the DEST surface to force the async GPU write to land.
     if (ts == noErr) {
         CVPixelBufferLockBaseAddress(cameraBuf, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferUnlockBaseAddress(cameraBuf, kCVPixelBufferLock_ReadOnly);
