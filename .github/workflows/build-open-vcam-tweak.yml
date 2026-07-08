@@ -19,6 +19,22 @@ on:
         options:
           - '0'
           - '1'
+      private_dedup_key:
+        description: 'Dedup video overwrite on OpenVCam''s OWN key (1, default) so photo<->video mode-switch buffers get OBS not the blurry lens. 0 = old shared-TransitionID behavior (reintroduces the sharp/blur cycling) for A/B.'
+        required: false
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+      dest_matrix_709:
+        description: 'Write+tag the transfer destination as YCbCr 709 instead of 601 (1). A/B knob for the saved-photo red cast. Default 0 = 601 (matches closed vcamera).'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
   push:
     branches:
       - main
@@ -63,6 +79,8 @@ jobs:
           # fallback here, that silently forces photo=1 on every push build.
           HOOK_PHOTO_NODES: ${{ github.event.inputs.hook_photo_nodes }}
           VCAM_DEBUG: ${{ github.event.inputs.debug }}
+          PRIVATE_DEDUP_KEY: ${{ github.event.inputs.private_dedup_key }}
+          DEST_MATRIX_709: ${{ github.event.inputs.dest_matrix_709 }}
         run: |
           MAKE_ARGS=""
           if [ -n "$HOOK_PHOTO_NODES" ]; then
@@ -70,6 +88,12 @@ jobs:
           fi
           if [ -n "$VCAM_DEBUG" ]; then
             MAKE_ARGS="$MAKE_ARGS VCAM_DEBUG=$VCAM_DEBUG"
+          fi
+          if [ -n "$PRIVATE_DEDUP_KEY" ]; then
+            MAKE_ARGS="$MAKE_ARGS VCAM_PRIVATE_DEDUP_KEY=$PRIVATE_DEDUP_KEY"
+          fi
+          if [ -n "$DEST_MATRIX_709" ]; then
+            MAKE_ARGS="$MAKE_ARGS VCAM_DEST_MATRIX_709=$DEST_MATRIX_709"
           fi
           echo "Building with overrides: [${MAKE_ARGS:-none — using Tweak.xm compiled defaults}]"
           make clean package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 $MAKE_ARGS

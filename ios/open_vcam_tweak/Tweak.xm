@@ -147,6 +147,67 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_VIDEO_DEDUP 1
 #endif
 
+// VCAM_PRIVATE_DEDUP_KEY (default 1 = ON). The dedup above (0.5.4/0.5.5) keyed on
+// the SYSTEM's kCMSampleBufferAttachmentKey_TransitionID: present -> skip. That fixed
+// the freeze but had a side effect on the stock-Camera photo<->video mode switch —
+// the capture stack stamps TransitionID on the buffers it shuffles during the switch,
+// so our hook saw it "already present" and passed those through as the REAL (blurry)
+// lens, ALTERNATING with the buffers we did overwrite (sharp OBS) => the sharp/blur
+// cycling reported on the mode switch. Fix: dedup on our OWN private key instead.
+// Re-emits of a buffer we stamped still carry the key (ShouldPropagate), so they are
+// still skipped — the freeze fix is intact — but system transition buffers do NOT
+// carry it, so we overwrite them too and the switch stays sharp OBS. Set 0 to fall
+// back to the old shared-TransitionID behavior for A/B.
+#ifndef VCAM_PRIVATE_DEDUP_KEY
+#define VCAM_PRIVATE_DEDUP_KEY 1
+#endif
+
+// VCAM_DEST_MATRIX_709 (default 0 = 601, matching the closed vcamera). Selects the
+// transfer session's DESTINATION YCbCr matrix AND the matrix tag we stamp on the
+// output — kept together (VCamDestMatrix) so the chroma we WRITE and the tag we
+// ADVERTISE always agree. The saved photo shifting red is a YCbCr->RGB matrix
+// mismatch: the still JPEG encoder converts our transferred pixels using a matrix,
+// and if it reads the camera buffer's native 709 while we wrote 601 chroma, reds
+// blow out. Flip to 1 to A/B whether writing+tagging 709 (matching the camera's
+// native still format) fixes the photo colour without hooking the encoder nodes.
+#ifndef VCAM_DEST_MATRIX_709
+#define VCAM_DEST_MATRIX_709 0
+#endif
+
+// --- Colour helpers, shared by the video and photo transfer paths ---------------
+// The destination YCbCr matrix used by the transfer sessions, in ONE place so the
+// pixels written and the tag stamped never diverge (see VCAM_DEST_MATRIX_709).
+static CFStringRef VCamDestMatrix(void) {
+#if VCAM_DEST_MATRIX_709
+    return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+#else
+    return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
+#endif
+}
+
+// Stamp the colour tags on a destination buffer with ShouldPropagate so downstream
+// consumers — crucially the still-image JPEG encoder — interpret our transferred OBS
+// pixels with the SAME matrix we wrote them in. The closed vcamera stamps these too
+// (RE 0x90110-0x90174). Missing/mismatched here is the "saved photo goes red" symptom.
+static void VCamStampColour(CVBufferRef buf) {
+    CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(buf, kCVImageBufferYCbCrMatrixKey,
+                          VCamDestMatrix(), kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+}
+
+// The attachment key our dedup keys on. Private key (default) so we only skip buffers
+// WE stamped, not the system's mode-switch transition buffers (see VCAM_PRIVATE_DEDUP_KEY).
+static CFStringRef VCamDedupKey(void) {
+#if VCAM_PRIVATE_DEDUP_KEY
+    return CFSTR("OpenVCamOverwritten");
+#else
+    return kCMSampleBufferAttachmentKey_TransitionID;
+#endif
+}
+
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
 // FigCaptureSourceConfiguration -sourcePosition hook; recorded for diagnostics (the
 // original hooks this too, report §3.8). No longer drives pixel mirroring — front-camera
@@ -290,7 +351,7 @@ static void VCamEnsureSessions(void) {
                                  kCVImageBufferTransferFunction_ITU_R_709_2);
             VTSessionSetProperty(gTransferSession,
                                  kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
-                                 kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+                                 VCamDestMatrix());
 #endif
         }
     });
@@ -438,6 +499,23 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     CVPixelBufferRef src = rotated ? rotated : fresh;
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
+#if VCAM_DEST_COLOR
+    // Stamp the destination buffer's COLOUR so downstream consumers interpret our
+    // transferred OBS pixels correctly — the closed vcamera does exactly this
+    // (RE 0x90110-0x90174): CVBufferSetAttachment(ShouldPropagate) with 709
+    // primaries/transfer + 601 matrix. The live preview looked fine without it, but
+    // the still-image JPEG encoder reads these tags and, when they are missing/
+    // mismatched, the SAVED PHOTO shifts red. ShouldPropagate carries the tags onto
+    // the still buffer derived from this shared surface, fixing the photo colour
+    // without hooking the photo nodes. Set on success only, inside the lock.
+    if (ts == noErr) {
+        // Stamp with the SAME matrix the transfer session wrote (VCamDestMatrix),
+        // so the still-image encoder converts YCbCr->RGB with the matrix our pixels
+        // actually use — otherwise the saved photo shifts red. ShouldPropagate carries
+        // the tags onto the still buffer derived from this shared surface.
+        VCamStampColour(cameraBuf);
+    }
+#endif
 #if VCAM_GPU_FENCE_FLUSH
     // OFF by default — device-confirmed to CAUSE the photo-mode AppleM2ScalerCSC
     // IOFence hang (see the macro note). The original does not lock; kept only as an
@@ -493,6 +571,22 @@ static void VCamEnsurePhotoSession(void) {
             // Trim matches the closed vcamera (kVTScalingMode_Trim).
             VTSessionSetProperty(gPhotoTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
                                  kVTScalingMode_Trim);
+            VTSessionSetProperty(gPhotoTransferSession,
+                                 (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+#if VCAM_DEST_COLOR
+            // Pin the DESTINATION colour like the video session so the still is written
+            // AND tagged with the same matrix — the photo-red fix on the encoder path.
+            VTSessionSetProperty(gPhotoTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(gPhotoTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(gPhotoTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 VCamDestMatrix());
+#endif
         }
     });
 }
@@ -501,6 +595,16 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
     if (!sb) return NO;
     VCamConfig *cfg = [VCamConfig shared];
     if (!cfg.enabled) return NO;
+
+    CVImageBufferRef dst = CMSampleBufferGetImageBuffer(sb);
+#if VCAM_DEST_COLOR
+    // Correct the still buffer's COLOUR tags FIRST, before the dedup early-return and
+    // before the transfer (it is cheap CPU metadata, no GPU work). The still JPEG
+    // encoder reads THIS buffer's matrix to convert YCbCr->RGB, so a wrong/absent tag
+    // is the "saved photo goes red" symptom. Doing it unconditionally means even a
+    // buffer we then skip transferring (already stamped) still carries the right tags.
+    if (dst) VCamStampColour(dst);
+#endif
 
     // Dedup with the REAL TransitionID (report §2.3). Two jobs: (1) a still flows
     // scaler->encoder->preview/thumbnail, so the first node stamps it and the rest
@@ -513,7 +617,6 @@ static BOOL VCamOverwritePhotoInPlace(CMSampleBufferRef sb) {
         return YES;   // already ours, or a system transition buffer -> pass through
     }
 
-    CVImageBufferRef dst = CMSampleBufferGetImageBuffer(sb);
     if (!dst) return NO;
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
@@ -587,20 +690,24 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     BOOL did = NO;
     if (ib) {
 #if VCAM_VIDEO_DEDUP
-        // Overwrite each sample buffer ONCE, exactly like the closed vcamera
-        // (RE 0x84388-0x84450): key on kCMSampleBufferAttachmentKey_TransitionID.
-        // The graph re-emits the same buffer ~10x/frame; transferring every time
-        // overloads the shared-surface GPU fence and wedges the preview. If the
-        // attachment is already present (we stamped it, or it's a system transition
-        // buffer) skip the transfer; otherwise overwrite and stamp with
-        // ShouldPropagate so derived buffers inherit the mark.
-        if (CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) != NULL) {
+        // Overwrite each sample buffer ONCE (RE of the original @0x84388-0x84450).
+        // The graph re-emits the SAME buffer ~10x/frame; transferring every time
+        // overloads the shared-surface GPU fence and wedges the preview. Key on our
+        // OWN private attachment (VCamDedupKey) rather than the system's
+        // kCMSampleBufferAttachmentKey_TransitionID: a re-emit of a buffer WE stamped
+        // still carries our key (ShouldPropagate) -> skipped (freeze fix intact), but
+        // the system's photo<->video mode-switch transition buffers do NOT carry our
+        // key -> we overwrite them too. Keying on the shared TransitionID (0.5.4/0.5.5)
+        // made us pass those transition buffers through as the real blurry lens,
+        // alternating with OBS -> the sharp/blur cycling on the mode switch.
+        CFStringRef dedupKey = VCamDedupKey();
+        if (CMGetAttachment(sb, dedupKey, NULL) != NULL) {
             gRDup++;
-            did = YES;                          // already OBS (or a transition buffer) -> pass through
+            did = YES;                          // already OBS -> pass through
         } else {
             did = VCamOverwriteInPlace(ib);
             if (did) {
-                CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID,
+                CMSetAttachment(sb, dedupKey,
                                 (__bridge CFTypeRef)@(1), kCMAttachmentMode_ShouldPropagate);
             }
         }
@@ -732,8 +839,9 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // is running (photo=1 default vs the -DVCAM_HOOK_PHOTO_NODES=0 diagnostic
         // build) — avoids "fixed it" false positives from flashing the wrong deb.
         VCamLog(@"hooks installed (%lu emit, %lu photo) VCAM_HOOK_PHOTO_NODES=%d "
-                "VIDEO_DEDUP=%d DEST_COLOR=%d GPU_ACCEL=%d FENCE_FLUSH=%d",
+                "VIDEO_DEDUP=%d PRIVATE_DEDUP=%d DEST_COLOR=%d DEST_MATRIX_709=%d GPU_ACCEL=%d FENCE_FLUSH=%d",
                 (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count,
-                VCAM_HOOK_PHOTO_NODES, VCAM_VIDEO_DEDUP, VCAM_DEST_COLOR, VCAM_GPU_ACCEL, VCAM_GPU_FENCE_FLUSH);
+                VCAM_HOOK_PHOTO_NODES, VCAM_VIDEO_DEDUP, VCAM_PRIVATE_DEDUP_KEY,
+                VCAM_DEST_COLOR, VCAM_DEST_MATRIX_709, VCAM_GPU_ACCEL, VCAM_GPU_FENCE_FLUSH);
     }
 }

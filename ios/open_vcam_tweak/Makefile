@@ -43,6 +43,19 @@ endif
 ifdef VCAM_VIDEO_DEDUP
 OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
 endif
+# VCAM_PRIVATE_DEDUP_KEY (default 1): dedup on OpenVCam's own attachment key instead
+# of the shared system TransitionID, so a photo<->video mode switch's transition
+# buffers get overwritten with OBS instead of passing through as the real (blurry)
+# lens (the sharp/blur cycling fix). Set 0 to A/B the old shared-key behavior.
+ifdef VCAM_PRIVATE_DEDUP_KEY
+OpenVCam_CFLAGS += -DVCAM_PRIVATE_DEDUP_KEY=$(VCAM_PRIVATE_DEDUP_KEY)
+endif
+# VCAM_DEST_MATRIX_709 (default 0 = 601): pin the transfer DESTINATION YCbCr matrix
+# (and the tag stamped on the output) to 709 instead of 601 — the photo-red A/B knob
+# (the saved photo shifting red is a YCbCr->RGB matrix mismatch in the still encoder).
+ifdef VCAM_DEST_MATRIX_709
+OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
+endif
 # Orientation (default CCW90 = 270, matching the closed vcamera). Flip to 90 (CW90)
 # if the auto-rotate turns the wrong way on a device.
 ifdef VCAM_AUTO_ORIENT_DIR

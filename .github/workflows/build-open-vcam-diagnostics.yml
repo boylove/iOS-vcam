@@ -1,12 +1,18 @@
-name: Build OpenVCam Diagnostics (freeze hunt)
+name: Build OpenVCam Diagnostics (photo colour / mode-switch)
 
-# Builds the two freeze-hunt diagnostic variants in ONE run so a single push
-# yields both debs to A/B on-device against the ~24-frame preview wedge:
-#   destcolor -> VCAM_DEST_COLOR=1  (pin destination colour like closed vcamera)
-#   cpuxfer   -> VCAM_GPU_ACCEL=0   (force CPU transfer; isolate the GPU fence)
-# Each variant gets a distinct package Version (0.5.2+<label>) so dpkg installs
-# one cleanly over the other, and the tweak logs DEST_COLOR/GPU_ACCEL at startup
-# so the syslog proves which one is running. See Tweak.xm freeze-hunt toggles.
+# Builds the photo-red / mode-switch diagnostic variants in ONE run so a single push
+# yields debs to A/B on-device (0.5.6). The default release build (blur/cycling fix via
+# the private dedup key) comes from build-open-vcam-tweak.yml; these are the opt-in
+# photo-colour candidates:
+#   photored    -> VCAM_HOOK_PHOTO_NODES=1  (stamp colour on the actual still buffer +
+#                  overwrite it; the encoder-path red fix — RE-VERIFY no photo-mode
+#                  GPU deadlock on device before trusting)
+#   matrix709   -> VCAM_DEST_MATRIX_709=1   (write+tag 709 instead of 601; the cheap
+#                  red A/B with NO photo-node hook, so no deadlock risk)
+#   photored709 -> both, for when the still buffer wants 709 AND the encoder hook
+# Each variant gets a distinct package Version (0.5.6+<label>) so dpkg installs one
+# cleanly over the other, and the tweak logs its toggle state at startup so the syslog
+# proves which one is running. See Tweak.xm VCAM_HOOK_PHOTO_NODES / VCAM_DEST_MATRIX_709.
 
 on:
   workflow_dispatch:
@@ -27,12 +33,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: destcolor
-            flags: VCAM_DEST_COLOR=1
-          - label: cpuxfer
-            flags: VCAM_GPU_ACCEL=0
-          - label: fenceflush
-            flags: VCAM_GPU_FENCE_FLUSH=1
+          - label: photored
+            flags: VCAM_HOOK_PHOTO_NODES=1
+          - label: matrix709
+            flags: VCAM_DEST_MATRIX_709=1
+          - label: photored709
+            flags: VCAM_HOOK_PHOTO_NODES=1 VCAM_DEST_MATRIX_709=1
 
     steps:
       - name: Checkout
@@ -57,7 +63,7 @@ jobs:
         run: |
           # Distinct version per variant so the two debs never collide and dpkg
           # installs one over the other cleanly. -i.bak is portable BSD/GNU sed.
-          sed -i.bak 's/^Version: .*/Version: 0.5.3+${{ matrix.label }}/' control
+          sed -i.bak 's/^Version: .*/Version: 0.5.6+${{ matrix.label }}/' control
           rm -f control.bak
           grep '^Version:' control
 
