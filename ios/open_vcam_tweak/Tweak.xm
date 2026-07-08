@@ -85,6 +85,30 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_GPU_FENCE_FLUSH 0
 #endif
 
+// -- Freeze-hunt diagnostic toggles (2026-07-08). Device-confirmed: even the
+// doc-prescribed 0.5.1 config (single transfer, no rotation, no flush) STILL
+// wedges the preview after ~24 in-place transfers into the camera's shared
+// IOSurface pool (soft GPU/IOSurface fence ring; mediaserverd stays alive, the
+// image-bearing emits just stop). These two flags isolate the cause; each build
+// logs its state at startup so the syslog proves which variant is running.
+//
+// VCAM_DEST_COLOR (default 0): set the transfer session's DESTINATION colour
+// properties (ITU-R 709 primaries/transfer, 601 matrix) — the one concrete
+// session-config difference the closed vcamera has that we lack (ANALYSIS §3.5).
+// If a colour-path mismatch is what makes VT pick a fence-conflicting scaler
+// path, pinning the destination colour should stop the wedge.
+#ifndef VCAM_DEST_COLOR
+#define VCAM_DEST_COLOR 0
+#endif
+
+// VCAM_GPU_ACCEL (default 1 = on, matching the closed vcamera). Set 0 to force
+// the CPU transfer path (EnableGPUAcceleratedTransfer=false). The wedge is a GPU
+// fence; if the CPU path does not wedge, that proves the GPU-accelerated transfer
+// into the live camera surface is the culprit and points the real fix.
+#ifndef VCAM_GPU_ACCEL
+#define VCAM_GPU_ACCEL 1
+#endif
+
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
 // FigCaptureSourceConfiguration -sourcePosition hook; recorded for diagnostics (the
 // original hooks this too, report §3.8). No longer drives pixel mirroring — front-camera
@@ -209,9 +233,27 @@ static void VCamEnsureSessions(void) {
             // (the same way the original does). The scaler/CSC work runs on the GPU
             // (AppleM2ScalerCSC); leaving this unset let VT pick a path whose fence
             // interaction with photo mode's own still-scaler differed from the original.
+            // VCAM_GPU_ACCEL=0 forces the CPU path to test whether the GPU fence ring
+            // is what wedges the preview after ~24 in-place transfers.
             VTSessionSetProperty(gTransferSession,
                                  (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                                 kCFBooleanTrue);
+                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+
+#if VCAM_DEST_COLOR
+            // Pin the DESTINATION colour the same way the closed vcamera does
+            // (ANALYSIS §3.5: 709 primaries/transfer, 601 matrix). Without this VT
+            // infers the destination colour, which can push it onto a different
+            // scaler/CSC path than the original — a candidate cause of the fence wedge.
+            VTSessionSetProperty(gTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(gTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(gTransferSession,
+                                 kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+#endif
         }
     });
 }
@@ -542,8 +584,9 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // Log the photo-node compile state so the syslog itself proves WHICH build
         // is running (photo=1 default vs the -DVCAM_HOOK_PHOTO_NODES=0 diagnostic
         // build) — avoids "fixed it" false positives from flashing the wrong deb.
-        VCamLog(@"hooks installed (%lu emit, %lu photo) VCAM_HOOK_PHOTO_NODES=%d",
+        VCamLog(@"hooks installed (%lu emit, %lu photo) VCAM_HOOK_PHOTO_NODES=%d "
+                "DEST_COLOR=%d GPU_ACCEL=%d FENCE_FLUSH=%d",
                 (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count,
-                VCAM_HOOK_PHOTO_NODES);
+                VCAM_HOOK_PHOTO_NODES, VCAM_DEST_COLOR, VCAM_GPU_ACCEL, VCAM_GPU_FENCE_FLUSH);
     }
 }

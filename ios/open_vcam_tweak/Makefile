@@ -28,6 +28,15 @@ endif
 ifdef VCAM_DEBUG
 OpenVCam_CFLAGS += -DVCAM_DEBUG=$(VCAM_DEBUG)
 endif
+# Freeze-hunt diagnostics (see Tweak.xm): VCAM_DEST_COLOR pins the transfer session's
+# destination colour like the closed vcamera; VCAM_GPU_ACCEL=0 forces the CPU transfer
+# path to isolate the ~24-frame GPU fence wedge.
+ifdef VCAM_DEST_COLOR
+OpenVCam_CFLAGS += -DVCAM_DEST_COLOR=$(VCAM_DEST_COLOR)
+endif
+ifdef VCAM_GPU_ACCEL
+OpenVCam_CFLAGS += -DVCAM_GPU_ACCEL=$(VCAM_GPU_ACCEL)
+endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 
 after-install::
