@@ -37,6 +37,12 @@ endif
 ifdef VCAM_GPU_ACCEL
 OpenVCam_CFLAGS += -DVCAM_GPU_ACCEL=$(VCAM_GPU_ACCEL)
 endif
+# VCAM_VIDEO_DEDUP (default 1): overwrite each sample buffer once, keyed by
+# TransitionID, exactly like the closed vcamera (the ~24-frame freeze fix). Set 0 to
+# A/B the old every-emit behavior.
+ifdef VCAM_VIDEO_DEDUP
+OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
+endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 
 after-install::

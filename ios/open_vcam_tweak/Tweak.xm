@@ -109,6 +109,23 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_GPU_ACCEL 1
 #endif
 
+// VCAM_VIDEO_DEDUP (default 1 = ON, matching the closed vcamera). THE FREEZE FIX
+// (instruction-level RE of the original's -[<core> modifyImageBuffer:] at 0x8432c):
+// the original overwrites each sample buffer EXACTLY ONCE, deduped by
+// kCMSampleBufferAttachmentKey_TransitionID with kCMAttachmentMode_ShouldPropagate —
+// CMGetAttachment; if present -> skip; else transfer, then CMSetAttachment(...,@1,
+// ShouldPropagate). The camera graph re-emits the SAME buffer through many outputs
+// (~930 emits/s vs ~90 real frames/s on this device), so WITHOUT this dedup we ran
+// VTPixelTransferSessionTransferImage ~10x per frame into the shared camera IOSurface,
+// piling up GPU writes until the scaler's IOSurface fence ring wedged the preview
+// (device-confirmed: froze at a VARIABLE frame count — 24/210/249 — independent of
+// session config, which we proved is byte-identical to the original). Deduping cuts us
+// to one transfer per buffer like the original, which does the same in-place overwrite
+// on this exact device without freezing. Set 0 only to A/B the old every-emit behavior.
+#ifndef VCAM_VIDEO_DEDUP
+#define VCAM_VIDEO_DEDUP 1
+#endif
+
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
 // FigCaptureSourceConfiguration -sourcePosition hook; recorded for diagnostics (the
 // original hooks this too, report §3.8). No longer drives pixel mirroring — front-camera
@@ -262,7 +279,7 @@ static void VCamEnsureSessions(void) {
 // overwrite was skipped (fail-open): no fresh decoded frame, no transfer session,
 // or the VT transfer failed. Read in the health line; that is the reliable
 // diagnostic (startup-gated debug logs fire before a syslog capture can attach).
-static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
+static uint64_t gRNoFresh, gRNoXfer, gRXferFail, gRDup;
 
 // Overwrites the camera's OWN CVImageBuffer IN PLACE with the decoded RTMP frame,
 // exactly like the closed vcamera's -[<core> modifyImageBuffer:]
@@ -460,7 +477,30 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     gEmitEntries++;                            // heartbeat: entered (before any work)
     [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
-    BOOL did = ib ? VCamOverwriteInPlace(ib) : NO;
+    BOOL did = NO;
+    if (ib) {
+#if VCAM_VIDEO_DEDUP
+        // Overwrite each sample buffer ONCE, exactly like the closed vcamera
+        // (RE 0x84388-0x84450): key on kCMSampleBufferAttachmentKey_TransitionID.
+        // The graph re-emits the same buffer ~10x/frame; transferring every time
+        // overloads the shared-surface GPU fence and wedges the preview. If the
+        // attachment is already present (we stamped it, or it's a system transition
+        // buffer) skip the transfer; otherwise overwrite and stamp with
+        // ShouldPropagate so derived buffers inherit the mark.
+        if (CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) != NULL) {
+            gRDup++;
+            did = YES;                          // already OBS (or a transition buffer) -> pass through
+        } else {
+            did = VCamOverwriteInPlace(ib);
+            if (did) {
+                CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID,
+                                (__bridge CFTypeRef)@(1), kCMAttachmentMode_ShouldPropagate);
+            }
+        }
+#else
+        did = VCamOverwriteInPlace(ib);
+#endif
+    }
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);   // original sb, now overwritten
     gEmitReturns++;                            // heartbeat: orig returned (emit not blocked)
 
@@ -470,9 +510,9 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     calls++;
     if (did) { repl++; if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)"); }
     if ((calls % 600) == 0)
-        VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu] "
+        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu] "
                 "photo[replaced=%llu noFresh=%llu dup=%llu xferFail=%llu]",
-                calls, repl, gRNoFresh, gRNoXfer, gRXferFail,
+                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail,
                 gPhotoReplaced, gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail);
 }
 
@@ -585,8 +625,8 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // is running (photo=1 default vs the -DVCAM_HOOK_PHOTO_NODES=0 diagnostic
         // build) — avoids "fixed it" false positives from flashing the wrong deb.
         VCamLog(@"hooks installed (%lu emit, %lu photo) VCAM_HOOK_PHOTO_NODES=%d "
-                "DEST_COLOR=%d GPU_ACCEL=%d FENCE_FLUSH=%d",
+                "VIDEO_DEDUP=%d DEST_COLOR=%d GPU_ACCEL=%d FENCE_FLUSH=%d",
                 (unsigned long)gEmitOrigs.count, (unsigned long)gRenderOrigs.count,
-                VCAM_HOOK_PHOTO_NODES, VCAM_DEST_COLOR, VCAM_GPU_ACCEL, VCAM_GPU_FENCE_FLUSH);
+                VCAM_HOOK_PHOTO_NODES, VCAM_VIDEO_DEDUP, VCAM_DEST_COLOR, VCAM_GPU_ACCEL, VCAM_GPU_FENCE_FLUSH);
     }
 }
