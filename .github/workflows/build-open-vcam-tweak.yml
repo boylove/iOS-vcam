@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       hook_photo_nodes:
-        description: 'Hook the still-photo nodes (1 = on, matches release; 0 = diagnostic build to test the "moves once then freezes" photo-path regression)'
+        description: 'Hook the still-photo nodes. LEAVE OFF for the release/doc-prescribed build: photo capture inherits OBS from the emitSampleBuffer: shared IOSurface (ROADMAP M6, ANALYSIS §3.10). 1 = opt-in diagnostic that ALSO overwrites the photo render nodes (only try if the shutter still captures the real lens with the default build).'
         required: false
-        default: '1'
+        default: '0'
         type: choice
         options:
-          - '1'
           - '0'
+          - '1'
       debug:
         description: 'Verbose per-frame logging (VCAM_DEBUG=1)'
         required: false

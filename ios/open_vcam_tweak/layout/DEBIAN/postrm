@@ -1,7 +1,13 @@
 #!/bin/sh
-# Remove the RootHide mirror copy the postinst placed in the real ElleKit scan
-# dir (see postinst / memory roothide-tweakinject-path), then restart mediaserverd
-# so it drops the tweak.
-rm -f /usr/lib/TweakInject/OpenVCam.dylib /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+# Remove ONLY the manual mirror copy our postinst placed in the ElleKit scan dir
+# (the raw `dpkg -i` case). Do NOT touch it when RootHide's AutoPatcher owns that
+# path — presence of a `<dylib>.roothidepatch` marker means RootHide mirrored and
+# tracks it (VCAMERA_DEB_REVERSE_ANALYSIS.md §4.1), and RootHide removes it as part
+# of the package removal itself. Deleting a RootHide-managed file (or its plist)
+# out from under it orphans RootHide's patch record and makes ElleKit error on the
+# next scan — the exact "uninstall breaks ellekit" symptom this guard prevents.
+if [ ! -e /usr/lib/TweakInject/OpenVCam.dylib.roothidepatch ]; then
+    rm -f /usr/lib/TweakInject/OpenVCam.dylib /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+fi
 killall -9 mediaserverd 2>/dev/null || true
 exit 0

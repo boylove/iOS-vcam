@@ -16,10 +16,24 @@
 # mediaserverd (no [OpenVCam] logs, real camera shown). Mirror it into the real
 # scan dir. The guard skips this on pure-rootless (Dopamine) devices, which have
 # no writable /usr/lib/TweakInject. See memory roothide-tweakinject-path.
+#
+# ELLEKIT-SAFE MIRROR (do NOT clobber RootHide's own copy): when this deb is
+# installed through a package manager (Sileo/Zebra), RootHide's AutoPatcher ALREADY
+# mirrors + re-signs the dylib into /usr/lib/TweakInject and records it with a
+# `<dylib>.roothidepatch` marker (see VCAMERA_DEB_REVERSE_ANALYSIS.md §4.1). If we
+# then `cp -f` our raw /var/jb copy over that managed file, we (a) replace RootHide's
+# patched/signed binary with an unpatched one and (b) leave RootHide's patch record
+# pointing at a file it no longer owns — which is what makes ElleKit error when the
+# package is later removed. So only place our manual copy when the scan dir does NOT
+# already have the file (the raw `dpkg -i` case, where AutoPatcher never ran). When
+# RootHide already mirrored it, leave it entirely to RootHide.
 SRC="/var/jb/Library/MobileSubstrate/DynamicLibraries"
 if [ -d /usr/lib/TweakInject ] && [ -f "$SRC/OpenVCam.dylib" ]; then
-    cp -f "$SRC/OpenVCam.dylib"  /usr/lib/TweakInject/OpenVCam.dylib  2>/dev/null || true
-    cp -f "$SRC/OpenVCam.plist" /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+    if [ ! -e /usr/lib/TweakInject/OpenVCam.dylib ] \
+       && [ ! -e /usr/lib/TweakInject/OpenVCam.dylib.roothidepatch ]; then
+        cp -f "$SRC/OpenVCam.dylib"  /usr/lib/TweakInject/OpenVCam.dylib  2>/dev/null || true
+        cp -f "$SRC/OpenVCam.plist" /usr/lib/TweakInject/OpenVCam.plist 2>/dev/null || true
+    fi
 fi
 
 killall -9 videodecoderd 2>/dev/null || true
