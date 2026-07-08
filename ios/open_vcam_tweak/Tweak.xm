@@ -92,13 +92,34 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 // image-bearing emits just stop). These two flags isolate the cause; each build
 // logs its state at startup so the syslog proves which variant is running.
 //
-// VCAM_DEST_COLOR (default 0): set the transfer session's DESTINATION colour
-// properties (ITU-R 709 primaries/transfer, 601 matrix) — the one concrete
-// session-config difference the closed vcamera has that we lack (ANALYSIS §3.5).
-// If a colour-path mismatch is what makes VT pick a fence-conflicting scaler
-// path, pinning the destination colour should stop the wedge.
+// VCAM_DEST_COLOR (default 1 = ON, matching the closed vcamera). Sets the transfer
+// session's DESTINATION colour (ITU-R 709 primaries/transfer, 601 matrix), exactly
+// what the original sets on all three of its transfer sessions (RE 0x82494-0x82504).
+// Without it VT infers the destination colour, which comes out WRONG for the
+// still-capture buffer — the "photo colour is off after shutter" symptom. On by
+// default now that dedup (not colour) is confirmed as the freeze fix.
 #ifndef VCAM_DEST_COLOR
-#define VCAM_DEST_COLOR 0
+#define VCAM_DEST_COLOR 1
+#endif
+
+// Orientation. The closed vcamera creates a VTPixelRotationSession(kVTRotation_CCW90)
+// (RE 0x82638-0x8267c) and rotates the decoded OBS frame so it lines up with the
+// camera buffer; the freeze-hunt stripped this out (0.5.0), which is why the preview
+// is 90° off. Restored now that dedup — not the rotation pass — is the confirmed
+// freeze fix; the rotation runs ONCE per buffer (inside the dedup) into a reused
+// buffer under gVTLock, matching the original's single-lock discipline.
+//   VCAM_AUTO_ORIENT: pick 0° vs a quarter-turn by comparing OBS vs camera aspect
+//     (portrait TikTok preview needs 0°, landscape stock-Camera buffer needs a turn).
+//   VCAM_AUTO_ORIENT_DIR: which quarter-turn (270 = CCW90, matching the original).
+//   VCAM_FRONT_AUTOMIRROR: horizontally mirror the front camera (original does too).
+#ifndef VCAM_AUTO_ORIENT
+#define VCAM_AUTO_ORIENT 1
+#endif
+#ifndef VCAM_AUTO_ORIENT_DIR
+#define VCAM_AUTO_ORIENT_DIR 270
+#endif
+#ifndef VCAM_FRONT_AUTOMIRROR
+#define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
 // VCAM_GPU_ACCEL (default 1 = on, matching the closed vcamera). Set 0 to force
@@ -281,6 +302,82 @@ static void VCamEnsureSessions(void) {
 // diagnostic (startup-gated debug logs fire before a syslog capture can attach).
 static uint64_t gRNoFresh, gRNoXfer, gRXferFail, gRDup;
 
+// ---------------------------------------------------------------------------
+// Rotation / front-camera mirror (VTPixelRotationSession), matching the closed
+// vcamera's _pixelRotationSession. The decoded OBS frame is rotated into ONE reused
+// buffer (never a fresh buffer per frame) inside gVTLock, then the transfer session
+// scales/converts it into the camera surface. Reusing the buffer + single lock is
+// the original's discipline; combined with the video dedup this runs once per buffer.
+// ---------------------------------------------------------------------------
+typedef struct { CVPixelBufferRef buf; size_t w, h; OSType fmt; } VCamRotBuf;
+static VCamRotBuf gRotBuf;
+static CFTypeRef gRotationSession;   // VTPixelRotationSessionRef, or NULL
+
+// Cached rotation-output buffer; (re)allocated only when geometry changes. The SAME
+// buffer is returned every call (cache-owned; caller must NOT release). Caller MUST
+// hold gVTLock.
+static CVPixelBufferRef VCamRotBufGet(VCamRotBuf *p, size_t w, size_t h, OSType fmt) {
+    if (!p->buf || p->w != w || p->h != h || p->fmt != fmt) {
+        if (p->buf) { CVPixelBufferRelease(p->buf); p->buf = NULL; }
+        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt,
+                                (__bridge CFDictionaryRef)attrs, &nb) == kCVReturnSuccess) {
+            p->buf = nb; p->w = w; p->h = h; p->fmt = fmt;
+        }
+    }
+    return p->buf;
+}
+
+// Rotate `fresh` into the cached buffer and return it (cache-owned, NOT retained).
+// Returns NULL when no rotation/mirror is needed (caller transfers `fresh` directly)
+// or on failure. Caller MUST already hold gVTLock so rotate+transfer is one
+// uninterrupted critical section (the original holds a single lock across both).
+static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirror, long rot) {
+    if (!mirror && rot == 0) return NULL;
+    CVPixelBufferRef rotated = NULL;
+    if (@available(iOS 16.0, *)) {
+        if (!gRotationSession) {
+            VTPixelRotationSessionRef rs = NULL;
+            VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
+            gRotationSession = rs;
+        }
+        VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
+        if (rs) {
+            CFStringRef rotKey = kVTRotation_0;
+            if (rot == 90) rotKey = kVTRotation_CW90;
+            else if (rot == 180) rotKey = kVTRotation_180;
+            else if (rot == 270) rotKey = kVTRotation_CCW90;
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, rotKey);
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
+                                 mirror ? kCFBooleanTrue : kCFBooleanFalse);
+            size_t fw = CVPixelBufferGetWidth(fresh), fh = CVPixelBufferGetHeight(fresh);
+            OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
+            size_t rw = (rot == 90 || rot == 270) ? fh : fw;   // a quarter turn swaps W/H
+            size_t rh = (rot == 90 || rot == 270) ? fw : fh;
+            CVPixelBufferRef out = VCamRotBufGet(&gRotBuf, rw, rh, ffmt);
+            if (out && VTPixelRotationSessionRotateImage(rs, fresh, out) == noErr) rotated = out;
+        }
+    }
+    return rotated;
+}
+
+// Choose 0° vs a quarter-turn so the OBS source lines up with the destination camera
+// buffer, by comparing aspect ratios (log space so "2x too wide" and "2x too tall"
+// weigh equally). Only 0/90 are considered — a capture buffer is only ever the source
+// turned a quarter. Returns 0 or 90 (the caller maps 90 to VCAM_AUTO_ORIENT_DIR).
+#if VCAM_AUTO_ORIENT
+static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
+    size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
+    size_t dw = CVPixelBufferGetWidth(dst),  dh = CVPixelBufferGetHeight(dst);
+    if (!sw || !sh || !dw || !dh) return 0;
+    double dstAR = (double)dw / (double)dh;
+    double d0  = fabs(log(((double)sw / (double)sh) / dstAR));
+    double d90 = fabs(log(((double)sh / (double)sw) / dstAR));
+    return (d90 < d0) ? 90 : 0;
+}
+#endif
+
 // Overwrites the camera's OWN CVImageBuffer IN PLACE with the decoded RTMP frame,
 // exactly like the closed vcamera's -[<core> modifyImageBuffer:]
 // (see ../../VCAMERA_FRAME_REPLACEMENT_DEEP_REVERSE.md §2.2): it calls
@@ -302,9 +399,21 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     VCamEnsureSessions();
     if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NO; }
 
+    // Orientation: front-camera mirror + auto-rotate so the OBS frame lines up with
+    // THIS client's camera buffer. mirror comes from the sourcePosition hook (config
+    // files are unreadable in mediaserverd). Auto-orient turns the portrait OBS frame
+    // a quarter (CCW90, VCAM_AUTO_ORIENT_DIR) for a landscape stock-Camera buffer and
+    // leaves a portrait TikTok preview at 0°. Matches the closed vcamera's CCW90
+    // rotation session; runs once per buffer thanks to the emit dedup.
+    BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && (gSourcePosition == 2));
+    long rot = ((cfg.rotation % 360) + 360) % 360;
+#if VCAM_AUTO_ORIENT
+    if (VCamAutoOrientDegrees(fresh, cameraBuf) == 90) rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
+#endif
+
     // One-time geometry diagnostic: log the first few distinct destination sizes
-    // seen (each client hands us a different buffer), so orientation can be judged
-    // from src/dst dims + which physical camera without guessing.
+    // seen (each client hands us a different buffer) with the chosen orientation, so a
+    // wrong-way rotation can be diagnosed from src/dst dims without guessing.
     {
         static long loggedDst[6]; static int nLogged = 0;
         long key = (long)CVPixelBufferGetWidth(cameraBuf) * 100000 + (long)CVPixelBufferGetHeight(cameraBuf);
@@ -312,25 +421,23 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
         for (int i = 0; i < nLogged; i++) if (loggedDst[i] == key) { seen = YES; break; }
         if (!seen && nLogged < 6) {
             loggedDst[nLogged++] = key;
-            VCamLog(@"geom: src=%zux%zu dst=%zux%zu front=%d",
+            VCamLog(@"geom: src=%zux%zu dst=%zux%zu front=%d rot=%ld mirror=%d",
                     CVPixelBufferGetWidth(fresh), CVPixelBufferGetHeight(fresh),
                     CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                    (gSourcePosition == 2));
+                    (gSourcePosition == 2), rot, shouldMirror);
         }
     }
 
-    // ONE GPU pass, under gVTLock — exactly like the closed vcamera's photo-mode
-    // flow (dynamic RE openvcam-photomode-original-flow: one transfer/frame, src stays
-    // raw, no VTPixelRotationSession). Transfer the raw OBS frame straight into the
-    // camera's shared IOSurface; the pipeline's existing BWVideoOrientationMetadataNode
-    // metadata rotates it at display/encode. An earlier build added a SECOND GPU pass
-    // (rotate into a shared intermediate) — that extra pass on a shared surface is what
-    // closed the GPU IOSurface fence cycle (bug_type 284 iofence) and froze
-    // mediaserverd on the video<->photo switch. Serialise all our submits on this
-    // surface with the single lock. ScalingMode=Trim (set on the session) aspect-fills.
-    size_t srcW = CVPixelBufferGetWidth(fresh), srcH = CVPixelBufferGetHeight(fresh);
+    // Rotate + transfer as ONE atomic critical section under gVTLock — the closed
+    // vcamera holds a single lock across the whole rotate->transfer. Rotate into the
+    // REUSED buffer (never a per-frame new one), then transfer into the camera
+    // surface. This is safe from the old IOFence wedge now that the emit dedup limits
+    // us to one pass per buffer. ScalingMode=Trim (set on the session) aspect-fills.
     [gVTLock lock];
-    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, fresh, cameraBuf);
+    CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot);
+    CVPixelBufferRef src = rotated ? rotated : fresh;
+    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
+    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
 #if VCAM_GPU_FENCE_FLUSH
     // OFF by default — device-confirmed to CAUSE the photo-mode AppleM2ScalerCSC
     // IOFence hang (see the macro note). The original does not lock; kept only as an

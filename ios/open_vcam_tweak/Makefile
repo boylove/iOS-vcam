@@ -43,6 +43,11 @@ endif
 ifdef VCAM_VIDEO_DEDUP
 OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
 endif
+# Orientation (default CCW90 = 270, matching the closed vcamera). Flip to 90 (CW90)
+# if the auto-rotate turns the wrong way on a device.
+ifdef VCAM_AUTO_ORIENT_DIR
+OpenVCam_CFLAGS += -DVCAM_AUTO_ORIENT_DIR=$(VCAM_AUTO_ORIENT_DIR)
+endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 
 after-install::
