@@ -211,6 +211,9 @@ static void VCamStampColour(CVBufferRef buf) {
 
 // The attachment key our dedup keys on. Private key (default) so we only skip buffers
 // WE stamped, not the system's mode-switch transition buffers (see VCAM_PRIVATE_DEDUP_KEY).
+// Marked unused: only referenced when VCAM_VIDEO_DEDUP=1 (now default 0), so the Theos
+// release -Werror,-Wunused-function must not fail the build when dedup is compiled out.
+__attribute__((unused))
 static CFStringRef VCamDedupKey(void) {
 #if VCAM_PRIVATE_DEDUP_KEY
     return CFSTR("OpenVCamOverwritten");
