@@ -155,7 +155,22 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 // device; the old "24-frame freeze" was fixed by the single-lock session model, not by
 // dedup. Set 1 only to A/B the old buggy behavior.
 #ifndef VCAM_VIDEO_DEDUP
-#define VCAM_VIDEO_DEDUP 1
+#define VCAM_VIDEO_DEDUP 0
+#endif
+
+// VCAM_LANDSCAPE_GATE (default 1 = ON). Match the closed vcamera's emit gate: only
+// overwrite LANDSCAPE (width>=height) destination buffers. The stock-Camera CAPTURE
+// buffers (2304x1728 preview, 4224x3168 still) are landscape; the PORTRAIT buffers
+// (e.g. 1170x2532 screen preview) inherit OBS from the shared landscape capture surface,
+// so skipping them is invisible. This is what lets us run WITHOUT the video dedup safely:
+// the dedup was skipping ~52% of emits (device-confirmed) and its pool-recycle mis-skips
+// let the REAL lens bleed through intermittently ("偶尔出现真实画面"). Removing the dedup
+// makes every landscape buffer OBS (no bleed) like the original — but only the landscape
+// gate keeps the overwrite rate at the original's ~88/s so the shared IOSurface does not
+// fence-wedge (the historic ~24-frame freeze). RE: original emit hook 0x7516c-74
+// (getLive && w>=h) -> modifyImageBuffer.
+#ifndef VCAM_LANDSCAPE_GATE
+#define VCAM_LANDSCAPE_GATE 1
 #endif
 
 // VCAM_PRIVATE_DEDUP_KEY (default 1 = ON). The dedup above (0.5.4/0.5.5) keyed on
@@ -474,10 +489,23 @@ static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
 // CIContext), on the terminal emit only (not the PixelTransfer node), is why the
 // original neither crashes stock-Camera recording nor lags. Returns YES on
 // overwrite; on any failure returns NO and the caller passes the real frame.
+static uint64_t gRPortrait;   // landscape-gate skips (health diagnostic)
+
 static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     if (!cameraBuf) return NO;
     VCamConfig *cfg = [VCamConfig shared];
     if (!cfg.enabled) return NO;
+
+#if VCAM_LANDSCAPE_GATE
+    // Overwrite only LANDSCAPE buffers, like the closed vcamera (see VCAM_LANDSCAPE_GATE).
+    // Portrait buffers inherit OBS from the shared landscape capture surface, so skipping
+    // them is invisible AND keeps the overwrite rate at the original's level (safe without
+    // the dedup). Not a failure: a portrait dst legitimately needs no direct overwrite.
+    if (CVPixelBufferGetWidth(cameraBuf) < CVPixelBufferGetHeight(cameraBuf)) {
+        gRPortrait++;
+        return NO;
+    }
+#endif
 
     CVPixelBufferRef fresh = [[VCamFrameStore shared] copyFreshFrameWithMaxAge:kVCamFrameMaxAge];
     if (!fresh) { gRNoFresh++; return NO; }             // stale/no stream -> real camera
@@ -758,9 +786,9 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     calls++;
     if (did) { repl++; if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)"); }
     if ((calls % 600) == 0)
-        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu] "
+        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu] "
                 "photo[replaced=%llu noFresh=%llu dup=%llu xferFail=%llu]",
-                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail,
+                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait,
                 gPhotoReplaced, gRPhotoNoFresh, gRPhotoDup, gRPhotoXferFail);
 }
 
