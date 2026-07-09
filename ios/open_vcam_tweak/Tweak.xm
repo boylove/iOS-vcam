@@ -338,53 +338,47 @@ void VCamLog(NSString *format, ...) {
 // per frame — no VTPixelRotationSession; orientation is left to the pipeline's
 // existing metadata (see the header note).
 // ---------------------------------------------------------------------------
-static VTPixelTransferSessionRef gTransferSession;
+static VTPixelTransferSessionRef gTransferSession;       // video/preview path (601 matrix)
+static VTPixelTransferSessionRef gStillTransferSession;  // stock-Camera full-res still (709)
 static NSLock *gVTLock;
+
+// Configure a transfer session like the closed vcamera (Trim scaling + GPU-accel +
+// pinned 709 primaries/transfer) EXCEPT the destination YCbCr matrix, which the caller
+// passes. Two paths need DIFFERENT matrices (device-confirmed A/B, 2026-07-09):
+//   * VIDEO/preview  -> VCamDestMatrix() (601 default): the live preview looks right.
+//   * stock-Camera STILL -> 709: the saved photo goes through iOS16 Deferred processing
+//     whose encoder reads the full-res still with the 709 matrix; writing it 601 (as the
+//     video preview needs) reds the saved photo, and forcing 709 GLOBALLY breaks the
+//     video preview. So keep two sessions and route by destination-buffer SIZE in
+//     VCamOverwriteInPlace (the still buffer is far larger than any preview buffer).
+static void VCamConfigXferSession(VTPixelTransferSessionRef s, CFStringRef destMatrix) {
+    if (!s) return;
+    // Without a scaling mode the transfer FAILS whenever src/dst sizes differ (the
+    // normal case) -> NULL replacement -> real camera. Trim matches the closed vcamera.
+    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+    // GPU-accelerated transfer (string key; no public constant), matching the original.
+    VTSessionSetProperty(s, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                         VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+#if VCAM_DEST_COLOR
+    // Pin the destination colour like the closed vcamera (709 primaries/transfer); the
+    // matrix is per-path (601 video / 709 still — see above).
+    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                         kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                         kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, destMatrix);
+#endif
+}
 
 static void VCamEnsureSessions(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         gVTLock = [[NSLock alloc] init];
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
-        if (gTransferSession) {
-            // CRITICAL: without a scaling mode, VTPixelTransferSessionTransferImage
-            // FAILS whenever the source (decoded RTMP frame, e.g. 1080x1920) and the
-            // destination (camera buffer, a different size) differ — which is the
-            // normal case. That silent failure => replacement NULL => real camera.
-            // Trim = scale preserving aspect ratio, cropping overflow — matches the
-            // closed vcamera (it sets kVTScalingMode_Trim, RE'd at 0x84928). Trim
-            // avoids the stretched look Normal gives when src/dst aspect ratios differ.
-            VTSessionSetProperty(gTransferSession, kVTPixelTransferPropertyKey_ScalingMode,
-                                 kVTScalingMode_Trim);
-            // GPU-accelerated transfer, matching the closed vcamera's session config
-            // (analysis §3.5 / memory openvcam-original-gpu-sync-model: it sets
-            // EnableGPUAcceleratedTransfer=kCFBooleanTrue at 0x82470–0x8267c). No
-            // public VT constant exists for this key, so it is set by its string name
-            // (the same way the original does). The scaler/CSC work runs on the GPU
-            // (AppleM2ScalerCSC); leaving this unset let VT pick a path whose fence
-            // interaction with photo mode's own still-scaler differed from the original.
-            // VCAM_GPU_ACCEL=0 forces the CPU path to test whether the GPU fence ring
-            // is what wedges the preview after ~24 in-place transfers.
-            VTSessionSetProperty(gTransferSession,
-                                 (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
-
-#if VCAM_DEST_COLOR
-            // Pin the DESTINATION colour the same way the closed vcamera does
-            // (ANALYSIS §3.5: 709 primaries/transfer, 601 matrix). Without this VT
-            // infers the destination colour, which can push it onto a different
-            // scaler/CSC path than the original — a candidate cause of the fence wedge.
-            VTSessionSetProperty(gTransferSession,
-                                 kVTPixelTransferPropertyKey_DestinationColorPrimaries,
-                                 kCVImageBufferColorPrimaries_ITU_R_709_2);
-            VTSessionSetProperty(gTransferSession,
-                                 kVTPixelTransferPropertyKey_DestinationTransferFunction,
-                                 kCVImageBufferTransferFunction_ITU_R_709_2);
-            VTSessionSetProperty(gTransferSession,
-                                 kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
-                                 VCamDestMatrix());
-#endif
-        }
+        VCamConfigXferSession(gTransferSession, VCamDestMatrix());   // video: 601 (default)
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gStillTransferSession);
+        VCamConfigXferSession(gStillTransferSession,                 // still: 709
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     });
 }
 
@@ -529,7 +523,14 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
-    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
+    // Per-path matrix: the stock-Camera full-res still (e.g. 4224x3168) needs the 709
+    // session (else the saved photo reds); every preview/video buffer is far smaller and
+    // needs the 601 session. Route by destination size (see VCamConfigXferSession).
+    size_t dstW = CVPixelBufferGetWidth(cameraBuf), dstH = CVPixelBufferGetHeight(cameraBuf);
+    BOOL isStill = (dstW >= 3000 || dstH >= 3000);
+    VTPixelTransferSessionRef xfer =
+        (isStill && gStillTransferSession) ? gStillTransferSession : gTransferSession;
+    OSStatus ts = VTPixelTransferSessionTransferImage(xfer, src, cameraBuf);
 #if VCAM_DEST_COLOR
     // Stamp the destination buffer's COLOUR so downstream consumers interpret our
     // transferred OBS pixels correctly — the closed vcamera does exactly this
