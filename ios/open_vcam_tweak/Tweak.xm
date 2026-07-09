@@ -155,7 +155,7 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 // device; the old "24-frame freeze" was fixed by the single-lock session model, not by
 // dedup. Set 1 only to A/B the old buggy behavior.
 #ifndef VCAM_VIDEO_DEDUP
-#define VCAM_VIDEO_DEDUP 0
+#define VCAM_VIDEO_DEDUP 1
 #endif
 
 // VCAM_PRIVATE_DEDUP_KEY (default 1 = ON). The dedup above (0.5.4/0.5.5) keyed on
@@ -185,6 +185,22 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_DEST_MATRIX_709 0
 #endif
 
+// VCAM_STAMP_DEST — whether to CVBufferSetAttachment colour tags onto the DESTINATION
+// camera buffer after the transfer (VCamStampColour(cameraBuf)). DEFAULT 0 (OFF) as of
+// the 2026-07-09 clean-state RE + forensic-photo diagnosis: the closed vcamera stamps
+// ONLY its own decoded SOURCE frame (RE: stamp fn 0x900a4 tags the buffer it CREATES
+// from its decoded-data ivars; modifyImageBuffer 0x84458 does NOT re-tag the dest) and
+// leaves the camera's destination buffer's NATIVE colour attachments untouched. The
+// stock-Camera still buffer is Display P3 (confirmed from a saved HEIC: ICC desc
+// "Display P3"); stamping it ColorPrimaries=709 makes the iOS16 Deferred photo pipeline
+// re-colour-manage an already-finished P3 buffer as 709, producing the gross red cast
+// (measured R/G≈2.7 on the saved photo). The transfer session's own Destination* config
+// (VCAM_DEST_COLOR) still governs the pixels we WRITE, so video preview is unaffected.
+// Set to 1 only to A/B-restore the old dest-stamp behaviour.
+#ifndef VCAM_STAMP_DEST
+#define VCAM_STAMP_DEST 0
+#endif
+
 // --- Colour helpers, shared by the video and photo transfer paths ---------------
 // The destination YCbCr matrix used by the transfer sessions, in ONE place so the
 // pixels written and the tag stamped never diverge (see VCAM_DEST_MATRIX_709).
@@ -200,6 +216,7 @@ static CFStringRef VCamDestMatrix(void) {
 // consumers — crucially the still-image JPEG encoder — interpret our transferred OBS
 // pixels with the SAME matrix we wrote them in. The closed vcamera stamps these too
 // (RE 0x90110-0x90174). Missing/mismatched here is the "saved photo goes red" symptom.
+__attribute__((unused))
 static void VCamStampColour(CVBufferRef buf) {
     CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
                           kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -523,11 +540,13 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // the still buffer derived from this shared surface, fixing the photo colour
     // without hooking the photo nodes. Set on success only, inside the lock.
     if (ts == noErr) {
-        // Stamp with the SAME matrix the transfer session wrote (VCamDestMatrix),
-        // so the still-image encoder converts YCbCr->RGB with the matrix our pixels
-        // actually use — otherwise the saved photo shifts red. ShouldPropagate carries
-        // the tags onto the still buffer derived from this shared surface.
+#if VCAM_STAMP_DEST
+        // (OFF by default — see VCAM_STAMP_DEST.) Historically stamped the dest so the
+        // still encoder read our matrix; but the closed vcamera does NOT stamp the dest,
+        // and doing so mis-tags the camera's native Display-P3 still buffer as 709 →
+        // Deferred pipeline reds the saved photo. Left as an A/B toggle only.
         VCamStampColour(cameraBuf);
+#endif
     }
 #endif
 #if VCAM_GPU_FENCE_FLUSH
