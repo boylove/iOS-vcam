@@ -143,8 +143,19 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 // session config, which we proved is byte-identical to the original). Deduping cuts us
 // to one transfer per buffer like the original, which does the same in-place overwrite
 // on this exact device without freezing. Set 0 only to A/B the old every-emit behavior.
+// DEFAULT 0 (matching the original): instruction-level RE of the original's video
+// -[<core> modifyImageBuffer:] @0x84458 shows it does NO dedup — no CMGetAttachment,
+// no TransitionID, exactly ONE VTPixelTransferSessionTransferImage per call, an
+// unconditional in-place overwrite every emit. Our private-key dedup (VCamDedupKey +
+// ShouldPropagate) was device-confirmed to CAUSE the sharp<->blur cycling: the camera
+// pool RECYCLES buffers, so a surface we stamped gets reused for a fresh REAL-camera
+// frame with our key still attached -> we see the key, skip the overwrite, and that
+// real (blurry) frame shows through, alternating ~47% of emits with OBS (health line:
+// dup~=replaced). The original proves per-frame overwrite does not freeze on this
+// device; the old "24-frame freeze" was fixed by the single-lock session model, not by
+// dedup. Set 1 only to A/B the old buggy behavior.
 #ifndef VCAM_VIDEO_DEDUP
-#define VCAM_VIDEO_DEDUP 1
+#define VCAM_VIDEO_DEDUP 0
 #endif
 
 // VCAM_PRIVATE_DEDUP_KEY (default 1 = ON). The dedup above (0.5.4/0.5.5) keyed on
