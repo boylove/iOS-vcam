@@ -42,7 +42,14 @@
 - (void)dealloc {
     if (_raw) CVPixelBufferRelease(_raw);
     if (_rotated) CVPixelBufferRelease(_rotated);
-    if (_rotSession) { VTPixelRotationSessionInvalidate(_rotSession); CFRelease(_rotSession); }
+    if (_rotSession) {
+        // _rotSession is only ever created inside the iOS 16 @available block below, so a
+        // non-NULL value means we are on iOS 16+; the guard is for the compiler.
+        if (@available(iOS 16.0, *)) {
+            VTPixelRotationSessionInvalidate((VTPixelRotationSessionRef)_rotSession);
+        }
+        CFRelease(_rotSession);
+    }
 }
 
 static NSTimeInterval VCamNow(void) {
