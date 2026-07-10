@@ -79,26 +79,29 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
-// VCAM_GPU_ACCEL (default 1 = on, matching the closed vcamera). Set 0 to force the CPU
-// transfer path (EnableGPUAcceleratedTransfer=false).
+// VCAM_GPU_ACCEL (default 0 = CPU transfer). The closed vcamera ships GPU-accel=true, but
+// device testing showed the GPU-accelerated transfer into the shared 2304x1728 landscape
+// IOSurface is ASYNC and had not landed before the stock-Camera live-preview crop
+// (1170x2532, downstream) read it — so with the faithful landscape gate the preview froze
+// on the last frame and only refreshed at the ~3s ZSL/Live-Photo re-read (the
+// clear->stutter->blur cycle), even though decode stayed a healthy 30fps and every
+// landscape emit was overwritten. Setting EnableGPUAcceleratedTransfer=false writes the
+// shared surface via CPU synchronously, so the preview crop reads the new bytes
+// immediately. Set 1 to A/B-restore the GPU path. See memory openvcam-photo-preview-queue-restart.
 #ifndef VCAM_GPU_ACCEL
-#define VCAM_GPU_ACCEL 1
+#define VCAM_GPU_ACCEL 0
 #endif
 
-// VCAM_LANDSCAPE_GATE (default 0 = OFF). When ON it overwrites only LANDSCAPE
-// (width>=height) destination buffers, so the PORTRAIT screen-preview buffer (1170x2532)
-// is skipped and merely INHERITS OBS by propagation from the shared landscape capture
-// surface. Device-confirmed that inheritance has a timing GAP at the stock-Camera
-// Photo-mode ZSL/Live-Photo queue restart (~every 3s): the preview freezes on the last
-// frame and only refreshes at each restart -> the clear->stutter->gaussian-blur cycle
-// (memory openvcam-photo-preview-queue-restart). Turning the gate OFF overwrites the
-// portrait preview buffer DIRECTLY, so it never depends on propagation and the cycle
-// stops. A portrait OBS frame -> portrait dst needs NO rotation (VCamAutoOrientDegrees
-// returns 0), so this is a single cheap transfer that avoids the old rotation-pass
-// IOSurface fence wedge that once made overwriting portrait buffers unsafe. Set 1 to
-// A/B-restore the landscape-only gate if a wedge ever reappears.
+// VCAM_LANDSCAPE_GATE (default 1 = ON, faithful to the closed vcamera). Overwrite only
+// LANDSCAPE (width>=height) destination buffers; the PORTRAIT screen-preview buffer
+// (1170x2532) is skipped and INHERITS OBS by propagation from the shared landscape
+// capture surface. Device-confirmed that overwriting the portrait DISPLAY buffer directly
+// (gate OFF) fences/wedges the GPU (OBS flashes -> freeze -> real camera), so the gate
+// stays ON; the freeze between ZSL restarts is fixed instead by making the landscape
+// overwrite land synchronously (VCAM_GPU_ACCEL=0, CPU transfer) so propagation is fresh.
+// RE: original emit hook 0x7516c-74 (getLive && w>=h) -> modifyImageBuffer.
 #ifndef VCAM_LANDSCAPE_GATE
-#define VCAM_LANDSCAPE_GATE 0
+#define VCAM_LANDSCAPE_GATE 1
 #endif
 
 // VCAM_DEST_MATRIX_709 (default 0 = 601, matching the closed vcamera). Selects the VIDEO
