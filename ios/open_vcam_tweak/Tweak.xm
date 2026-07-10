@@ -292,16 +292,15 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
         if (!gRotationSession) {
             VTPixelRotationSessionRef rs = NULL;
             VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
-            // GPU-accelerate the rotation too, matching the closed vcamera's rotation-session
-            // init (@0x82650). OpenVCam previously set EnableGPUAcceleratedTransfer only on
-            // the TRANSFER session, leaving rotation on the CPU path — so the rotated buffer
-            // feeding the GPU transfer was not GPU-synced. Photo mode is the ONLY mode that
-            // hits the rotation path (portrait OBS -> landscape still/preview dst; TikTok /
-            // portrait dst skips rotation), which is why ONLY the stock-Camera photo preview
-            // froze/cycled clear->stutter->blur at the ~3s ZSL restart while decode stayed a
-            // healthy 30fps. See commit 93c3104, memory openvcam-photo-preview-queue-restart.
+            // Keep the ROTATION session on the CPU path (EnableGPUAcceleratedTransfer=false),
+            // decoupled from VCAM_GPU_ACCEL (which drives the TRANSFER session). Device-
+            // confirmed: GPU-accelerating the rotation composes FlipHorizontalOrientation and
+            // the CCW90 rotation in the OPPOSITE ORDER, so the front-camera left/right mirror
+            // renders as a 180° rotation instead. The CPU path composes flip-then-rotate the
+            // way the front mirror expects. (This GPU-rotation flag was a speculative fix for
+            // the Photo-preview cycle that never helped, so dropping it costs nothing.)
             if (rs) VTSessionSetProperty(rs, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                                         VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+                                         kCFBooleanFalse);
             gRotationSession = rs;
         }
         VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
