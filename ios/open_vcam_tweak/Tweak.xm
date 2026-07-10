@@ -208,21 +208,18 @@ void VCamLog(NSString *format, ...) {
 // is the ONLY GPU pass per frame — no VTPixelRotationSession; orientation is left to the
 // pipeline's existing metadata (see the header note).
 // ---------------------------------------------------------------------------
-static VTPixelTransferSessionRef gTransferSession;       // video/preview path (601 matrix)
-static VTPixelTransferSessionRef gStillTransferSession;  // stock-Camera full-res still (709)
+// ONE transfer session for ALL buffers (preview, video, AND the full-res still), 601
+// matrix — exactly like the closed vcamera, which creates three IDENTICAL 601 sessions
+// but its modifyImageBuffer uses only one (ivar 0x88) for every overwrite (decisive
+// disas, memory openvcam-emit-throttle-not-dedup). No per-path 709 still split.
+static VTPixelTransferSessionRef gTransferSession;
 // NSRecursiveLock, matching the closed vcamera's engine _lock (@0x823f8) — the rotate +
 // transfer critical section can re-enter, and a plain NSLock would self-deadlock.
 static NSRecursiveLock *gVTLock;
 
-// Configure a transfer session like the closed vcamera (Trim scaling + GPU-accel +
-// pinned 709 primaries/transfer) EXCEPT the destination YCbCr matrix, which the caller
-// passes. Two paths need DIFFERENT matrices (device-confirmed A/B, 2026-07-09):
-//   * VIDEO/preview  -> VCamDestMatrix() (601 default): the live preview looks right.
-//   * stock-Camera STILL -> 709: the saved photo goes through iOS16 Deferred processing
-//     whose encoder reads the full-res still with the 709 matrix; writing it 601 (as the
-//     video preview needs) reds the saved photo, and forcing 709 GLOBALLY breaks the
-//     video preview. So keep two sessions and route by destination-buffer SIZE in
-//     VCamOverwriteInPlace (the still buffer is far larger than any preview buffer).
+// Configure the transfer session exactly like the closed vcamera: Trim scaling +
+// GPU-accel + pinned 709 primaries/transfer + 601 destination YCbCr matrix. One config
+// for every buffer (preview, video, still) — the original does not split video/still.
 static void VCamConfigXferSession(VTPixelTransferSessionRef s, CFStringRef destMatrix) {
     if (!s) return;
     // Without a scaling mode the transfer FAILS whenever src/dst sizes differ (the normal
@@ -247,10 +244,7 @@ static void VCamEnsureSessions(void) {
     dispatch_once(&once, ^{
         gVTLock = [[NSRecursiveLock alloc] init];
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
-        VCamConfigXferSession(gTransferSession, VCamDestMatrix());   // video: 601 (default)
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gStillTransferSession);
-        VCamConfigXferSession(gStillTransferSession,                 // still: 709
-                              kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+        VCamConfigXferSession(gTransferSession, VCamDestMatrix());   // 601 for everything
     });
 }
 
@@ -413,14 +407,9 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
-    // Per-path matrix: the stock-Camera full-res still (e.g. 4224x3168) needs the 709
-    // session (else the saved photo reds); every preview/video buffer is far smaller and
-    // needs the 601 session. Route by destination size (see VCamConfigXferSession).
-    size_t dstW = CVPixelBufferGetWidth(cameraBuf), dstH = CVPixelBufferGetHeight(cameraBuf);
-    BOOL isStill = (dstW >= 3000 || dstH >= 3000);
-    VTPixelTransferSessionRef xfer =
-        (isStill && gStillTransferSession) ? gStillTransferSession : gTransferSession;
-    OSStatus ts = VTPixelTransferSessionTransferImage(xfer, src, cameraBuf);
+    // One 601 session for every buffer — preview, video, and the full-res still —
+    // exactly like the closed vcamera (no per-size routing).
+    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
     [gVTLock unlock];
 
     CVPixelBufferRelease(fresh);
