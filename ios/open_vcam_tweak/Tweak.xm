@@ -310,7 +310,12 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
             else if (rot == 180) rotKey = kVTRotation_180;
             else if (rot == 270) rotKey = kVTRotation_CCW90;
             VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, rotKey);
-            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
+            // The original mirrors with FlipVerticalOrientation (its only imported flip key —
+            // it does NOT import FlipHorizontal). With the CCW90 rotation, FlipVertical is the
+            // correct left/right selfie mirror; FlipHorizontal here came out exactly 180° off
+            // (FlipVertical = Rotate180 ∘ FlipHorizontal). RE: _re_static/macho_full.txt
+            // imports kVTPixelRotationPropertyKey_FlipVerticalOrientation only.
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipVerticalOrientation,
                                  mirror ? kCFBooleanTrue : kCFBooleanFalse);
             size_t fw = CVPixelBufferGetWidth(fresh), fh = CVPixelBufferGetHeight(fresh);
             OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
