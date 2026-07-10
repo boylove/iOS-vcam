@@ -24,8 +24,8 @@ OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 #                     closed vcamera; 0 lets VT infer it.
 #   VCAM_GPU_ACCEL    (default 1) GPU-accelerated transfer; 0 forces the CPU path.
 #   VCAM_DEST_MATRIX_709 (default 0 = 601) VIDEO-path destination YCbCr matrix A/B knob.
-#   VCAM_AUTO_ORIENT_DIR (default 270 = CCW90) auto-rotate direction; flip to 90 (CW90)
-#                     if the preview turns the wrong way on a device.
+# Rotation direction + front mirror are no longer knobs: they are driven by camera position
+# (back CW90 / front CCW90+FlipVertical), faithful to the closed vcamera (RE 0x83e20).
 ifdef VCAM_DEST_COLOR
 OpenVCam_CFLAGS += -DVCAM_DEST_COLOR=$(VCAM_DEST_COLOR)
 endif
@@ -34,9 +34,6 @@ OpenVCam_CFLAGS += -DVCAM_GPU_ACCEL=$(VCAM_GPU_ACCEL)
 endif
 ifdef VCAM_DEST_MATRIX_709
 OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
-endif
-ifdef VCAM_AUTO_ORIENT_DIR
-OpenVCam_CFLAGS += -DVCAM_AUTO_ORIENT_DIR=$(VCAM_AUTO_ORIENT_DIR)
 endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 

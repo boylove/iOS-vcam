@@ -61,22 +61,20 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_DEST_COLOR 1
 #endif
 
-// Orientation. The closed vcamera creates a VTPixelRotationSession(kVTRotation_CCW90)
-// (RE 0x82638-0x8267c) and rotates the decoded OBS frame so it lines up with the camera
-// buffer; it runs ONCE per buffer into a reused buffer under gVTLock, matching the
-// original's single-lock discipline.
-//   VCAM_AUTO_ORIENT: pick 0° vs a quarter-turn by comparing OBS vs camera aspect
-//     (portrait TikTok preview needs 0°, landscape stock-Camera buffer needs a turn).
-//   VCAM_AUTO_ORIENT_DIR: which quarter-turn (270 = CCW90, matching the original).
-//   VCAM_FRONT_AUTOMIRROR: horizontally mirror the front camera (original does too).
+// Orientation — FAITHFUL to the closed vcamera (RE 0x83e20-0x83e7c). The engine drives
+// its VTPixelRotationSession from CAMERA POSITION (its ivar 0x100 = AVCaptureDevicePosition,
+// written by the setter @0x82878), NOT from aspect and NOT from a hand-rolled front
+// FlipHorizontal:
+//   back  (position <= 1): kVTRotation_CW90,  no flip.
+//   front (position == 2): kVTRotation_CCW90 + kVTPixelRotationPropertyKey_FlipVerticalOrientation
+//                          (the selfie mirror — the original imports ONLY FlipVertical).
+// It rotates ONCE per buffer into a reused buffer under gVTLock (single-lock discipline).
+//   VCAM_AUTO_ORIENT: pick raw (0°) vs a quarter-turn by comparing OBS vs camera aspect —
+//     this is the original's emit-side raw-vs-prerotated selection (RE 0x8477c): a portrait
+//     TikTok preview matches portrait OBS -> raw; a landscape stock-Camera buffer differs
+//     -> the rotated buffer. Set 0 to disable auto-rotate (diagnostic; relies on cfg.rotation).
 #ifndef VCAM_AUTO_ORIENT
 #define VCAM_AUTO_ORIENT 1
-#endif
-#ifndef VCAM_AUTO_ORIENT_DIR
-#define VCAM_AUTO_ORIENT_DIR 270
-#endif
-#ifndef VCAM_FRONT_AUTOMIRROR
-#define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
 // VCAM_GPU_ACCEL (default 0 = CPU transfer). Device-confirmed the practical choice on this
@@ -284,8 +282,8 @@ static CVPixelBufferRef VCamRotBufGet(VCamRotBuf *p, size_t w, size_t h, OSType 
 // Returns NULL when no rotation/mirror is needed (caller transfers `fresh` directly) or
 // on failure. Caller MUST already hold gVTLock so rotate+transfer is one uninterrupted
 // critical section (the original holds a single lock across both).
-static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirror, long rot) {
-    if (!mirror && rot == 0) return NULL;
+static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL flipVertical, long rot) {
+    if (!flipVertical && rot == 0) return NULL;
     CVPixelBufferRef rotated = NULL;
     if (@available(iOS 16.0, *)) {
         if (!gRotationSession) {
@@ -300,12 +298,12 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
             else if (rot == 180) rotKey = kVTRotation_180;
             else if (rot == 270) rotKey = kVTRotation_CCW90;
             VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, rotKey);
-            // FlipHorizontalOrientation — restored to 0.5.9's proven behavior. NOTE: this is
-            // OpenVCam's own approximation, NOT the original's method (the original drives
-            // CW90/CCW90+FlipVertical from a video-orientation value, ivar 0x100). See memory
-            // openvcam-original-rotation-flipvertical; a faithful replica is a separate task.
-            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
-                                 mirror ? kCFBooleanTrue : kCFBooleanFalse);
+            // FlipVerticalOrientation — the original's ONLY imported flip key (RE 0x83e68).
+            // The closed vcamera mirrors the FRONT camera with FlipVertical coupled to the
+            // CCW90 rotation, NEVER FlipHorizontal (which is exactly 180° off). See memory
+            // openvcam-original-rotation-flipvertical.
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipVerticalOrientation,
+                                 flipVertical ? kCFBooleanTrue : kCFBooleanFalse);
             size_t fw = CVPixelBufferGetWidth(fresh), fh = CVPixelBufferGetHeight(fresh);
             OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
             size_t rw = (rot == 90 || rot == 270) ? fh : fw;   // a quarter turn swaps W/H
@@ -320,7 +318,7 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
 // Choose 0° vs a quarter-turn so the OBS source lines up with the destination camera
 // buffer, by comparing aspect ratios (log space so "2x too wide" and "2x too tall" weigh
 // equally). Only 0/90 are considered — a capture buffer is only ever the source turned a
-// quarter. Returns 0 or 90 (the caller maps 90 to VCAM_AUTO_ORIENT_DIR).
+// quarter. Returns 0 or 90 (the caller maps 90 to a position-driven CW90/CCW90).
 #if VCAM_AUTO_ORIENT
 static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
     size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
@@ -364,16 +362,32 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     VCamEnsureSessions();
     if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NO; }
 
-    // Orientation: front-camera mirror + auto-rotate so the OBS frame lines up with THIS
-    // client's camera buffer. mirror comes from the sourcePosition hook (config files are
-    // unreadable in mediaserverd). Auto-orient turns the portrait OBS frame a quarter
-    // (CCW90, VCAM_AUTO_ORIENT_DIR) for a landscape stock-Camera buffer and leaves a
-    // portrait TikTok preview at 0°. Matches the closed vcamera's CCW90 rotation session.
-    BOOL shouldMirror = cfg.mirror || (VCAM_FRONT_AUTOMIRROR && (gSourcePosition == 2));
-    long rot = ((cfg.rotation % 360) + 360) % 360;
+    // Orientation — FAITHFUL to the closed vcamera's ingest rotation dispatch (RE
+    // 0x83e20-0x83e7c): the rotation DIRECTION and the mirror are driven by CAMERA
+    // POSITION (the engine's ivar 0x100 = AVCaptureDevicePosition), NOT by aspect and NOT
+    // by a hand-rolled FlipHorizontal:
+    //   back  (gSourcePosition != 2): kVTRotation_CW90,  no flip.
+    //   front (gSourcePosition == 2): kVTRotation_CCW90 + FlipVerticalOrientation (mirror).
+    // The aspect compare (VCamAutoOrientDegrees) only decides WHETHER a quarter-turn is
+    // needed — the original's emit-side raw-vs-prerotated selection (RE 0x8477c-0x847b4):
+    // same src/dst orientation -> raw (no rotation/flip); differing -> the rotated buffer.
+    // gSourcePosition comes from the -sourcePosition hook (config unreadable in mediaserverd).
+    BOOL front = (gSourcePosition == 2);
+    long rot = 0;
+    BOOL flipVertical = NO;
 #if VCAM_AUTO_ORIENT
-    if (VCamAutoOrientDegrees(fresh, cameraBuf) == 90) rot = (rot + VCAM_AUTO_ORIENT_DIR) % 360;
+    BOOL needTurn = (VCamAutoOrientDegrees(fresh, cameraBuf) == 90);
+#else
+    BOOL needTurn = NO;
 #endif
+    if (needTurn) {
+        rot = front ? 270 : 90;   // CCW90 for front, CW90 for back (original 0x83e40/0x83e4c)
+        flipVertical = front;     // front camera adds FlipVertical (original 0x83e5c-0x83e7c)
+    }
+    // Manual config overrides (only matter if a build ever makes cfg readable in
+    // mediaserverd): a non-zero cfg.rotation adds on top; cfg.mirror forces the flip.
+    rot = (((rot + cfg.rotation) % 360) + 360) % 360;
+    if (cfg.mirror) flipVertical = YES;
 
     // One-time geometry diagnostic: log the first few distinct destination sizes seen
     // (each client hands us a different buffer) with the chosen orientation, so a
@@ -385,10 +399,10 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
         for (int i = 0; i < nLogged; i++) if (loggedDst[i] == key) { seen = YES; break; }
         if (!seen && nLogged < 6) {
             loggedDst[nLogged++] = key;
-            VCamLog(@"geom: src=%zux%zu dst=%zux%zu front=%d rot=%ld mirror=%d",
+            VCamLog(@"geom: src=%zux%zu dst=%zux%zu front=%d rot=%ld flipV=%d",
                     CVPixelBufferGetWidth(fresh), CVPixelBufferGetHeight(fresh),
                     CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                    (gSourcePosition == 2), rot, shouldMirror);
+                    (gSourcePosition == 2), rot, flipVertical);
         }
     }
 
@@ -397,7 +411,7 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // (never a per-frame new one), then transfer into the camera surface.
     // ScalingMode=Trim (set on the session) aspect-fills.
     [gVTLock lock];
-    CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, shouldMirror, rot);
+    CVPixelBufferRef rotated = VCamCopyRotatedLocked(fresh, flipVertical, rot);
     CVPixelBufferRef src = rotated ? rotated : fresh;
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     // One 601 session for every buffer — preview, video, and the full-res still —
