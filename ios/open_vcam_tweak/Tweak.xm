@@ -79,17 +79,16 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
-// VCAM_GPU_ACCEL (default 0 = CPU transfer). The closed vcamera ships GPU-accel=true, but
-// device testing showed the GPU-accelerated transfer into the shared 2304x1728 landscape
-// IOSurface is ASYNC and had not landed before the stock-Camera live-preview crop
-// (1170x2532, downstream) read it — so with the faithful landscape gate the preview froze
-// on the last frame and only refreshed at the ~3s ZSL/Live-Photo re-read (the
-// clear->stutter->blur cycle), even though decode stayed a healthy 30fps and every
-// landscape emit was overwritten. Setting EnableGPUAcceleratedTransfer=false writes the
-// shared surface via CPU synchronously, so the preview crop reads the new bytes
-// immediately. Set 1 to A/B-restore the GPU path. See memory openvcam-photo-preview-queue-restart.
+// VCAM_GPU_ACCEL (default 1 = GPU, faithful to the closed vcamera, which sets
+// EnableGPUAcceleratedTransfer=true on all its transfer sessions AND its rotation session).
+// A prior device run with GPU on (0.6.1) cycled the stock-Camera Photo preview, but that
+// test was on a GPU-fence-DEGRADED environment (a preceding gate-off build had wedged the
+// IOSurface fence, which persists until reboot); on a clean/re-jailbroken environment the
+// GPU path should behave like the original. Set 0 to force the CPU (synchronous) transfer
+// path — a fallback if the GPU-accelerated write proves too async for the live-preview
+// crop on a genuinely clean env. See memory openvcam-photo-preview-queue-restart.
 #ifndef VCAM_GPU_ACCEL
-#define VCAM_GPU_ACCEL 0
+#define VCAM_GPU_ACCEL 1
 #endif
 
 // VCAM_LANDSCAPE_GATE (default 1 = ON, faithful to the closed vcamera). Overwrite only
