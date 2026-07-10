@@ -2,12 +2,11 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <time.h>
 
-// VCAM_GPU_ACCEL default (0 = CPU) mirrors Tweak.xm. The original configures its rotation
-// session GPU-accelerated (init 0x82650); we currently use the device-stable CPU path
-// (0.6.3) for BOTH the transfer and this rotation, kept consistent here. (The GPU-vs-CPU
-// fidelity is a separate step.)
+// VCAM_GPU_ACCEL default (1 = GPU) mirrors Tweak.xm and the closed vcamera, which configures
+// its rotation session GPU-accelerated (init 0x82650). Fall back to 0 (CPU) if the device
+// preview freezes on the GPU path.
 #ifndef VCAM_GPU_ACCEL
-#define VCAM_GPU_ACCEL 0
+#define VCAM_GPU_ACCEL 1
 #endif
 
 @implementation VCamFrameStore {

@@ -75,15 +75,16 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_AUTO_ORIENT 1
 #endif
 
-// VCAM_GPU_ACCEL (default 0 = CPU transfer). Device-confirmed the practical choice on this
-// device: CPU transfer (0.6.3) gives a smooth Photo preview (no ~3s cycle) AND a correct
-// front-camera mirror, whereas GPU transfer (0.6.5/0.6.6) both re-froze the preview and
-// flipped the mirror 180° (the GPU path appears to write with an inverted vertical origin).
-// The closed vcamera ships GPU-accel=true, but it also uses a different orientation-driven
-// rotation scheme (ivar 0x100), so matching its GPU path faithfully is a separate task —
-// until then CPU transfer is the working config. Set 1 only to A/B the GPU path.
+// VCAM_GPU_ACCEL (default 1 = GPU, faithful to the closed vcamera). The original ships
+// EnableGPUAcceleratedTransfer=YES on BOTH its transfer session (RE 0x82530) and its
+// rotation session (RE 0x82650). Earlier GPU attempts (0.6.5/0.6.6) re-froze the preview,
+// but those were on the NON-faithful architecture (emit-side double rotation + a poisoned
+// GPU-fence environment). Now that rotation is a single CCW90 pass on ingest under one
+// engine lock (the original's discipline), the GPU path should behave like the original.
+// Fall back to 0 (CPU, the device-stable 0.6.11 config) if the preview freezes on a clean
+// (re-jailbroken) device.
 #ifndef VCAM_GPU_ACCEL
-#define VCAM_GPU_ACCEL 0
+#define VCAM_GPU_ACCEL 1
 #endif
 
 // VCAM_LANDSCAPE_GATE (default 1 = ON, faithful to the closed vcamera). Overwrite only
