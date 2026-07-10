@@ -79,16 +79,15 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_FRONT_AUTOMIRROR 1
 #endif
 
-// VCAM_GPU_ACCEL (default 1 = GPU, faithful to the closed vcamera, which sets
-// EnableGPUAcceleratedTransfer=true on all its transfer sessions AND its rotation session).
-// A prior device run with GPU on (0.6.1) cycled the stock-Camera Photo preview, but that
-// test was on a GPU-fence-DEGRADED environment (a preceding gate-off build had wedged the
-// IOSurface fence, which persists until reboot); on a clean/re-jailbroken environment the
-// GPU path should behave like the original. Set 0 to force the CPU (synchronous) transfer
-// path — a fallback if the GPU-accelerated write proves too async for the live-preview
-// crop on a genuinely clean env. See memory openvcam-photo-preview-queue-restart.
+// VCAM_GPU_ACCEL (default 0 = CPU transfer). Device-confirmed the practical choice on this
+// device: CPU transfer (0.6.3) gives a smooth Photo preview (no ~3s cycle) AND a correct
+// front-camera mirror, whereas GPU transfer (0.6.5/0.6.6) both re-froze the preview and
+// flipped the mirror 180° (the GPU path appears to write with an inverted vertical origin).
+// The closed vcamera ships GPU-accel=true, but it also uses a different orientation-driven
+// rotation scheme (ivar 0x100), so matching its GPU path faithfully is a separate task —
+// until then CPU transfer is the working config. Set 1 only to A/B the GPU path.
 #ifndef VCAM_GPU_ACCEL
-#define VCAM_GPU_ACCEL 1
+#define VCAM_GPU_ACCEL 0
 #endif
 
 // VCAM_LANDSCAPE_GATE (default 1 = ON, faithful to the closed vcamera). Overwrite only
@@ -292,15 +291,6 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
         if (!gRotationSession) {
             VTPixelRotationSessionRef rs = NULL;
             VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
-            // Keep the ROTATION session on the CPU path (EnableGPUAcceleratedTransfer=false),
-            // decoupled from VCAM_GPU_ACCEL (which drives the TRANSFER session). Device-
-            // confirmed: GPU-accelerating the rotation composes FlipHorizontalOrientation and
-            // the CCW90 rotation in the OPPOSITE ORDER, so the front-camera left/right mirror
-            // renders as a 180° rotation instead. The CPU path composes flip-then-rotate the
-            // way the front mirror expects. (This GPU-rotation flag was a speculative fix for
-            // the Photo-preview cycle that never helped, so dropping it costs nothing.)
-            if (rs) VTSessionSetProperty(rs, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                                         kCFBooleanFalse);
             gRotationSession = rs;
         }
         VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
@@ -310,12 +300,11 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
             else if (rot == 180) rotKey = kVTRotation_180;
             else if (rot == 270) rotKey = kVTRotation_CCW90;
             VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, rotKey);
-            // The original mirrors with FlipVerticalOrientation (its only imported flip key —
-            // it does NOT import FlipHorizontal). With the CCW90 rotation, FlipVertical is the
-            // correct left/right selfie mirror; FlipHorizontal here came out exactly 180° off
-            // (FlipVertical = Rotate180 ∘ FlipHorizontal). RE: _re_static/macho_full.txt
-            // imports kVTPixelRotationPropertyKey_FlipVerticalOrientation only.
-            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipVerticalOrientation,
+            // FlipHorizontalOrientation — restored to 0.5.9's proven behavior. NOTE: this is
+            // OpenVCam's own approximation, NOT the original's method (the original drives
+            // CW90/CCW90+FlipVertical from a video-orientation value, ivar 0x100). See memory
+            // openvcam-original-rotation-flipvertical; a faithful replica is a separate task.
+            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_FlipHorizontalOrientation,
                                  mirror ? kCFBooleanTrue : kCFBooleanFalse);
             size_t fw = CVPixelBufferGetWidth(fresh), fh = CVPixelBufferGetHeight(fresh);
             OSType ffmt = CVPixelBufferGetPixelFormatType(fresh);
