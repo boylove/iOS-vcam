@@ -163,7 +163,7 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
                      CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
     }
 #endif
-    [[VCamFrameStore shared] setLatestFrame:(CVPixelBufferRef)imageBuffer];
+    [[VCamFrameStore shared] ingestFrame:(CVPixelBufferRef)imageBuffer];
 }
 
 - (BOOL)buildSession {
@@ -188,57 +188,43 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         .decompressionOutputRefCon = (__bridge void *)self,
     };
 
-    // Match the closed vcamera's decoder setup, which does NOT hit the err 1100
-    // our old forced-software / NULL-destination path did. Reverse-engineered from
-    // vcamera.dylib initDecoder:...:
-    //   * let VideoToolbox choose the decoder (default spec => hardware); do NOT
-    //     force EnableHardwareAcceleratedVideoDecoder=NO (the forced-software path
-    //     was what failed to create inside mediaserverd),
-    //   * give it explicit destination attributes (native size, biplanar YCbCr,
-    //     IOSurface-backed) so VT allocates cleanly,
-    //   * then mark the session realtime with a bounded thread count.
+    // Decoder setup, reverse-engineered from the closed vcamera (RE 0x86f78-0x872a8):
+    //   * let VideoToolbox choose the decoder (default spec => hardware),
+    //   * destination attributes = { 420f, width, height, OpenGLCompatibility } (below),
+    //   * mark the session realtime with a bounded thread count (2).
+    // (Dimensions: the original hand-parses the SPS; we use CMVideoFormatDescriptionGetDimensions,
+    // which derives the same width/height from the same parameter sets.)
     CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(_formatDesc);
     NSDictionary *dstAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        // Decode to 420f = 420YpCbCr8BiPlanarFullRange, EXACTLY like the closed vcamera
+        // whose decoder hardcodes this format (RE _orig_vcamera.dylib 0x86f3c-0x86f44:
+        // mov #0x3066 / movk #0x3432 -> 0x34323066 '420f', stored to decoder ivar 0x2c,
+        // then read into VTDecompressionSessionCreate's dstAttrs at 0x870b8). OpenVCam
+        // previously used VideoRange (420v); FullRange matches the original's luma levels.
+        (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
         (id)kCVPixelBufferWidthKey               : @(dims.width),
         (id)kCVPixelBufferHeightKey              : @(dims.height),
-        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-        // The original vcamera sets OpenGL compatibility here (its renderer is
-        // GPUImage/OpenGL ES). We keep it for fidelity + so the decoded buffer is
-        // GPU-friendly for the downstream VTPixelTransfer/Rotation sessions.
+        // Faithful to the closed vcamera's decode dstAttrs (RE 0x870a0-0x87160): exactly
+        // 4 keys — PixelFormatType, Width, Height, OpenGLCompatibility. NO explicit
+        // IOSurfaceProperties (the original omits it and its overwrite works fine, because
+        // OpenGLCompatibility:YES already implies IOSurface backing on iOS, and the source
+        // buffer doesn't need to be IOSurface anyway — only the camera destination buffer
+        // does, and that always is).
         (id)kCVPixelBufferOpenGLCompatibilityKey : @YES,
     };
 
+    // Single create with NO fallback, faithful to the closed vcamera (RE 0x87238): one
+    // VTDecompressionSessionCreate, videoDecoderSpecification left to default (the original
+    // passes an ineffective/ignored dict there, functionally identical to NULL -> VT picks
+    // hardware). The old forced-SOFTWARE fallback is removed: the err 1100 it guarded was
+    // caused by OpenVCam's OWN earlier wrong setup (forced-SW / NULL dest attrs); now that
+    // the setup matches the original, that failure mode is gone (the original ships no
+    // fallback and works).
     status = VTDecompressionSessionCreate(
         kCFAllocatorDefault, _formatDesc, NULL,
         (__bridge CFDictionaryRef)dstAttrs, &callback, &_session);
     if (status != noErr || !_session) {
-        // Hardware session create can fail with err 1100 when mediaserverd's
-        // hardware H264 decode-session pool (AppleAVE) is wedged — e.g. after heavy
-        // mediaserverd churn — and it can persist across a userspace reboot. Fall
-        // back to a forced SOFTWARE decoder so the OBS frame still decodes (more CPU
-        // but no dependence on the stuck hardware sessions). Only used when hardware
-        // fails, so normal operation is unchanged.
-        VCamLog(@"decoder: HW create failed (%d) %dx%d — trying software fallback",
-                (int)status, dims.width, dims.height);
-        _session = NULL;
-        // Use the raw CFString values, not the named constants: those constants are
-        // annotated iOS 17+ in the SDK (-Werror,-Wunguarded-availability-new blocks
-        // them) but the underlying string keys are honoured on earlier iOS. If this
-        // device's iOS 16 has no software H264 decoder at all, VT ignores them and
-        // create still fails — no worse off; a hardware reset (power cycle) is then
-        // the only fix.
-        NSDictionary *swSpec = @{
-            (__bridge id)CFSTR("EnableHardwareAcceleratedVideoDecoder")  : @NO,
-            (__bridge id)CFSTR("RequireHardwareAcceleratedVideoDecoder") : @NO,
-        };
-        status = VTDecompressionSessionCreate(
-            kCFAllocatorDefault, _formatDesc,
-            (__bridge CFDictionaryRef)swSpec,
-            (__bridge CFDictionaryRef)dstAttrs, &callback, &_session);
-    }
-    if (status != noErr || !_session) {
-        VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d (hw+sw)",
+        VCamLog(@"decoder: VTDecompressionSessionCreate failed (%d) %dx%d",
                 (int)status, dims.width, dims.height);
         _session = NULL;
         // Leave no half-built state: drop the format description too, so we don't
