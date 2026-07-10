@@ -61,14 +61,13 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_DEST_COLOR 1
 #endif
 
-// Orientation — FAITHFUL to the closed vcamera (RE 0x83e20-0x83e7c). The engine drives
-// its VTPixelRotationSession from CAMERA POSITION (its ivar 0x100 = AVCaptureDevicePosition,
-// written by the setter @0x82878), NOT from aspect and NOT from a hand-rolled front
-// FlipHorizontal:
-//   back  (position <= 1): kVTRotation_CW90,  no flip.
-//   front (position == 2): kVTRotation_CCW90 + kVTPixelRotationPropertyKey_FlipVerticalOrientation
-//                          (the selfie mirror — the original imports ONLY FlipVertical).
-// It rotates ONCE per buffer into a reused buffer under gVTLock (single-lock discipline).
+// Orientation. FLIP AXIS is faithful to the closed vcamera (RE 0x83e68): the front-camera
+// selfie mirror is kVTPixelRotationPropertyKey_FlipVerticalOrientation (the original imports
+// ONLY FlipVertical), never FlipHorizontal. The original drives its rotation DIRECTION from
+// camera position (ivar 0x100, RE 0x83e20: back CW90 / front CCW90) — but those keys are
+// relative to ITS OWN decoded frame; OpenVCam's decoder delivers a different origin, so
+// device-empirically BOTH cameras need CCW90 here (literal CW90 inverted the back camera
+// 180°). It rotates ONCE per buffer into a reused buffer under gVTLock (single-lock).
 //   VCAM_AUTO_ORIENT: pick raw (0°) vs a quarter-turn by comparing OBS vs camera aspect —
 //     this is the original's emit-side raw-vs-prerotated selection (RE 0x8477c): a portrait
 //     TikTok preview matches portrait OBS -> raw; a landscape stock-Camera buffer differs
@@ -362,16 +361,17 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     VCamEnsureSessions();
     if (!gTransferSession) { gRNoXfer++; CVPixelBufferRelease(fresh); return NO; }
 
-    // Orientation — FAITHFUL to the closed vcamera's ingest rotation dispatch (RE
-    // 0x83e20-0x83e7c): the rotation DIRECTION and the mirror are driven by CAMERA
-    // POSITION (the engine's ivar 0x100 = AVCaptureDevicePosition), NOT by aspect and NOT
-    // by a hand-rolled FlipHorizontal:
-    //   back  (gSourcePosition != 2): kVTRotation_CW90,  no flip.
-    //   front (gSourcePosition == 2): kVTRotation_CCW90 + FlipVerticalOrientation (mirror).
-    // The aspect compare (VCamAutoOrientDegrees) only decides WHETHER a quarter-turn is
-    // needed — the original's emit-side raw-vs-prerotated selection (RE 0x8477c-0x847b4):
-    // same src/dst orientation -> raw (no rotation/flip); differing -> the rotated buffer.
-    // gSourcePosition comes from the -sourcePosition hook (config unreadable in mediaserverd).
+    // Orientation. The FLIP AXIS is faithful to the closed vcamera (RE 0x83e68): the front
+    // camera selfie-mirror is kVTPixelRotationPropertyKey_FlipVerticalOrientation, NEVER
+    // FlipHorizontal (that was the real 180°-off bug). The ROTATION DIRECTION, however, is
+    // PIPELINE-RELATIVE, not literally copyable: the original's per-position keys (back CW90
+    // / front CCW90, RE 0x83e20-0x83e4c) are defined against ITS OWN decoded frame, but
+    // OpenVCam's H264 decoder hands us the OBS frame at a different origin — so replicating
+    // the original's literal CW90 for the back camera came out 180° (upside down) on-device
+    // (user 2026-07-10). Device-correct here: CCW90 for BOTH cameras; only the FRONT adds the
+    // FlipVertical mirror. The aspect compare (VCamAutoOrientDegrees) only decides WHETHER a
+    // quarter-turn is needed — the original's emit-side raw-vs-prerotated selection (RE
+    // 0x8477c-0x847b4). gSourcePosition comes from the -sourcePosition hook.
     BOOL front = (gSourcePosition == 2);
     long rot = 0;
     BOOL flipVertical = NO;
@@ -381,8 +381,8 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     BOOL needTurn = NO;
 #endif
     if (needTurn) {
-        rot = front ? 270 : 90;   // CCW90 for front, CW90 for back (original 0x83e40/0x83e4c)
-        flipVertical = front;     // front camera adds FlipVertical (original 0x83e5c-0x83e7c)
+        rot = 270;                // CCW90 for both cameras (device-correct on OpenVCam's decode)
+        flipVertical = front;     // front camera adds FlipVertical (the selfie mirror, RE 0x83e68)
     }
     // Manual config overrides (only matter if a build ever makes cfg readable in
     // mediaserverd): a non-zero cfg.rotation adds on top; cfg.mirror forces the flip.
