@@ -203,7 +203,9 @@ void VCamLog(NSString *format, ...) {
 // ---------------------------------------------------------------------------
 static VTPixelTransferSessionRef gTransferSession;       // video/preview path (601 matrix)
 static VTPixelTransferSessionRef gStillTransferSession;  // stock-Camera full-res still (709)
-static NSLock *gVTLock;
+// NSRecursiveLock, matching the closed vcamera's engine _lock (@0x823f8) — the rotate +
+// transfer critical section can re-enter, and a plain NSLock would self-deadlock.
+static NSRecursiveLock *gVTLock;
 
 // Configure a transfer session like the closed vcamera (Trim scaling + GPU-accel +
 // pinned 709 primaries/transfer) EXCEPT the destination YCbCr matrix, which the caller
@@ -236,7 +238,7 @@ static void VCamConfigXferSession(VTPixelTransferSessionRef s, CFStringRef destM
 static void VCamEnsureSessions(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        gVTLock = [[NSLock alloc] init];
+        gVTLock = [[NSRecursiveLock alloc] init];
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
         VCamConfigXferSession(gTransferSession, VCamDestMatrix());   // video: 601 (default)
         VTPixelTransferSessionCreate(kCFAllocatorDefault, &gStillTransferSession);
@@ -289,6 +291,16 @@ static CVPixelBufferRef VCamCopyRotatedLocked(CVPixelBufferRef fresh, BOOL mirro
         if (!gRotationSession) {
             VTPixelRotationSessionRef rs = NULL;
             VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs);
+            // GPU-accelerate the rotation too, matching the closed vcamera's rotation-session
+            // init (@0x82650). OpenVCam previously set EnableGPUAcceleratedTransfer only on
+            // the TRANSFER session, leaving rotation on the CPU path — so the rotated buffer
+            // feeding the GPU transfer was not GPU-synced. Photo mode is the ONLY mode that
+            // hits the rotation path (portrait OBS -> landscape still/preview dst; TikTok /
+            // portrait dst skips rotation), which is why ONLY the stock-Camera photo preview
+            // froze/cycled clear->stutter->blur at the ~3s ZSL restart while decode stayed a
+            // healthy 30fps. See commit 93c3104, memory openvcam-photo-preview-queue-restart.
+            if (rs) VTSessionSetProperty(rs, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                         VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
             gRotationSession = rs;
         }
         VTPixelRotationSessionRef rs = (VTPixelRotationSessionRef)gRotationSession;
