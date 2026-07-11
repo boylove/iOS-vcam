@@ -12,20 +12,12 @@
 - (double)nextOutputTimestamp;
 @end
 
-// Monotonic seconds, for backing off decoder-session rebuild attempts.
-static double VCamMonoSeconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
 @implementation VCamH264Decoder {
     CMVideoFormatDescriptionRef _formatDesc;
     VTDecompressionSessionRef _session;
     int _naluLengthSize;
     NSData *_sps;
     NSData *_pps;
-    double _lastBuildFail;     // VCamMonoSeconds() of the last failed buildSession, or 0
     double _outputTimestamp;   // synthetic output PTS counter, +20.0/frame (== Helper ivar 0x30)
 }
 
@@ -108,29 +100,17 @@ static double VCamMonoSeconds(void) {
         return NO;
     }
 
-    // Session reuse: many encoders re-send the AVC sequence header on every GOP.
-    // If SPS/PPS and the NAL length size are unchanged and we already have a live
-    // session, keep it — rebuilding each time is wasteful and repeatedly
-    // creating/destroying VT sessions risks the decoder-pool exhaustion (err 1100)
-    // documented in EXECUTION-PLAN §4.3.
-    if (_session && _formatDesc && naluLengthSize == _naluLengthSize &&
-        [sps isEqualToData:_sps] && [pps isEqualToData:_pps]) {
-        return YES;
-    }
-
-    // Back off after a failed create: without a live session every GOP header
-    // would otherwise call buildSession again (~every 1-2s), and hammering
-    // VTDecompressionSessionCreate is exactly what wedges the decode-session pool.
-    if (!_session && _lastBuildFail > 0 && (VCamMonoSeconds() - _lastBuildFail) < 2.0) {
-        return NO;
-    }
-
+    // Always (re)build on each sequence header — faithful to the original. Its decoder-config
+    // method (0x86f78, reached UNCONDITIONALLY from Helper -outputVideo:sps_size:pps:pps_size:
+    // via objc_msgSend) releases the old session, frees the old SPS/PPS and creates a new
+    // session EVERY time; there is NO "SPS/PPS unchanged -> reuse" and NO failure back-off. Those
+    // were OpenVCam's own err-1100 workarounds; the err-1100 root cause (the old forced-software /
+    // NULL-destination decoder setup) is already fixed by matching the original's config, so the
+    // workarounds are removed too — exactly like the software-decoder fallback.
     _sps = sps;
     _pps = pps;
     _naluLengthSize = naluLengthSize;
-    BOOL ok = [self buildSession];
-    _lastBuildFail = ok ? 0 : VCamMonoSeconds();
-    return ok;
+    return [self buildSession];
 }
 
 static void VCamDecodeOutput(void *decompressionOutputRefCon,
