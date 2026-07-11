@@ -1047,6 +1047,15 @@ static void IVCAMMediaActiveStartBackground(void) {
             return;
         }
 
+        // A/B fps diagnostic: if /var/mobile/Media/vcam_noaudio exists, the audio subsystem does
+        // NOT install its AudioUnitRender hook / producer, so mediaserverd runs video-only. Lets us
+        // test whether the audio hook drags recording from 30fps to 15fps — toggle over SSH (Media
+        // is a path mediaserverd's sandbox CAN stat, unlike /var/tmp), relaunch the camera app.
+        if (IVCAMMediaActivePathExists(@"/var/mobile/Media/vcam_noaudio")) {
+            IVCAMMediaActiveLog(@"MEDIA_ACTIVE_DISABLED by /var/mobile/Media/vcam_noaudio (video-only fps test)");
+            return;
+        }
+
         if (!targetProcess) {
             IVCAMMediaActiveLog(@"MEDIA_ACTIVE_INACTIVE not media target");
             return;
