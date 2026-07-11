@@ -91,9 +91,19 @@
 //   [2..] AudioSpecificConfig (seq header) OR one raw AAC access unit
 - (void)handleAudioTag:(const uint8_t *)data length:(size_t)len timestampMs:(uint32_t)ts {
     (void)ts;   // the ring/render path is rate-driven + jitter-buffered, not PTS-driven
-    if (len < 2) return;
+    if (len < 1) return;
     uint8_t soundFormat = (data[0] >> 4) & 0x0F;
+
+    // Health/diagnostic (throttled): proves audio tags reach here and shows the AAC packet type
+    // — decisively distinguishing "no audio delivered" from "seq header (type 0) never arrives".
+    static uint64_t audTags = 0;
+    audTags++;
+    if (audTags <= 8 || (audTags % 500) == 0)
+        VCamLog(@"rtmp: audio tag #%llu len=%zu fmt=%u aacType=%d", audTags, len, soundFormat,
+                (soundFormat == 10 && len >= 2) ? (int)data[1] : -1);
+
     if (soundFormat != 10) return;            // AAC only
+    if (len < 2) return;
 
     uint8_t aacPacketType = data[1];
     const uint8_t *body = data + 2;
