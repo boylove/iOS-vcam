@@ -82,12 +82,16 @@ typedef struct {
         return NO;
     }
 
-    // The AudioSpecificConfig is the decompression magic cookie for raw AAC. Best-effort: AAC-LC
-    // decodes straight from the ASBD (rate/channels/1024 frames-per-packet), so a codec that
-    // rejects the cookie ('!dat' = kAudioCodecBadDataError, seen on this iOS AAC decoder for the
-    // 2-byte LC ASC) is NOT fatal — log and keep the converter.
-    st = AudioConverterSetProperty(_conv, kAudioConverterDecompressionMagicCookie,
-                                   (UInt32)asc.length, asc.bytes);
+    // Magic cookie = a CANONICAL 2-byte AAC-LC AudioSpecificConfig (objectType 2, freqIdx,
+    // chanConfig) rebuilt from the parsed values — NOT the raw stream ASC. OBS's ASC can be 5
+    // bytes with SBR/PS extension signalling that this iOS AAC decoder rejects as a cookie
+    // ('!dat'); without a valid cookie it decodes only ~2 frames from the ASBD then silently
+    // stalls at 0 frames. The clean 2-byte LC cookie (its first two bytes equal the stream's, e.g.
+    // 12 10) is accepted and gives the decoder proper continuous state. Still non-fatal.
+    uint8_t cookie[2];
+    cookie[0] = (uint8_t)((2u << 3) | ((freqIdx & 0x0F) >> 1));
+    cookie[1] = (uint8_t)(((freqIdx & 0x01) << 7) | (((uint32_t)channels & 0x0F) << 3));
+    st = AudioConverterSetProperty(_conv, kAudioConverterDecompressionMagicCookie, 2, cookie);
     if (st != noErr) {
         VCamLog(@"aac: magic cookie rejected (%d) — decoding AAC-LC from ASBD", (int)st);
     }
@@ -146,7 +150,10 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
     // The input proc supplies a single packet then returns 0, so a benign "ran out of input"
     // status alongside produced frames is expected — push whatever was decoded.
     if (outPackets == 0) {
-        if (st != noErr) VCamLog(@"aac: decode produced 0 frames (%d)", (int)st);
+        static uint64_t zeroCalls = 0;   // throttled: catches a silent 0-frame stall
+        zeroCalls++;
+        if (zeroCalls <= 5 || (zeroCalls % 500) == 0)
+            VCamLog(@"aac: decode produced 0 frames #%llu (st=%d)", zeroCalls, (int)st);
         return NO;
     }
     IVCAMMediaActivePushPCM(_outBuf, outPackets, _rate, _channels);
