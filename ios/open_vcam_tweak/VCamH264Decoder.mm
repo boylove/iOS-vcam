@@ -296,15 +296,17 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         return NO;
     }
 
-    CMSampleTimingInfo timing;
-    timing.duration = kCMTimeInvalid;
-    timing.presentationTimeStamp = CMTimeMake(dtsMs + compositionTimeMs, 1000);
-    timing.decodeTimeStamp = CMTimeMake(dtsMs, 1000);
-
+    // NO sample timing — faithful to the closed vcamera's decode input (RE 0x87440):
+    // CMSampleBufferCreateReady with numSampleTimingEntries=0 and sampleTimingArray=NULL. The
+    // original does NOT feed the RTMP PTS/DTS to the decoder — it lets VideoToolbox order by
+    // the bitstream, which avoids RTMP-timestamp-driven reordering (B-frames, mode-switch
+    // residual frames, network jitter). The RTMP dtsMs/compositionTimeMs stay in the method
+    // signature but are no longer used for decode timing, exactly like the original.
+    (void)compositionTimeMs; (void)dtsMs;
     size_t sampleSize = avccData.length;
     CMSampleBufferRef sampleBuffer = NULL;
     status = CMSampleBufferCreateReady(
-        kCFAllocatorDefault, blockBuffer, _formatDesc, 1, 1, &timing,
+        kCFAllocatorDefault, blockBuffer, _formatDesc, 1, 0, NULL,
         1, &sampleSize, &sampleBuffer);
     CFRelease(blockBuffer);
     if (status != noErr || !sampleBuffer) return NO;
