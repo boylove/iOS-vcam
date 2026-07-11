@@ -24,6 +24,9 @@
     VTPixelTransferSessionRef _transferSession; // scale/convert session (== engine ivar 0x88)
     BOOL _live;                              // overwrite gate           (== engine ivar 9 / _bLive)
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
+    CVPixelBufferPoolRef _rotPool;           // RECYCLES rotated dst buffers (bounds IOSurface churn)
+    size_t _rotPoolSrcW, _rotPoolSrcH;       // source dims the pool was sized for (rebuild if changed)
+    OSType _rotPoolFmt;
 }
 
 + (instancetype)shared {
@@ -83,6 +86,7 @@
 - (void)dealloc {
     if (_rawSample) CFRelease(_rawSample);
     if (_rotated) CVPixelBufferRelease(_rotated);
+    if (_rotPool) CVPixelBufferPoolRelease(_rotPool);
     if (_rotSession) {
         // _rotSession is only ever created inside the iOS 16 @available block below, so a
         // non-NULL value means we are on iOS 16+; the guard is for the compiler.
@@ -120,16 +124,38 @@
         // the downstream pipeline's job. (GPU-accel was set once at init, 0x82650.)
         VTSessionSetProperty(_rotSession, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CCW90);
 
-        NSDictionary *ioSurface = @{
-            (__bridge id)CFSTR("IOSurfacePreallocPages")     : @0,
-            (__bridge id)CFSTR("IOSurfacePurgeWhenNotInUse") : @1,
-        };
-        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : ioSurface };
+        // Rotated destination comes from a RECYCLING CVPixelBufferPool, not a fresh
+        // CVPixelBufferCreate per frame. The rotation swaps W/H, so the pool holds (h x w) buffers.
+        // A per-frame create+release churned a new IOSurface every frame; on this memory-tight
+        // (re-jailbroken) device that churn exhausted the camera ISP's own IOSurface pool
+        // (H13ISP "Unable to allocate a replacement buffer") and HALVED the capture fps (30->15).
+        // The pool recycles released surfaces and settles at the in-flight working set (a few
+        // buffers held by the async GPU emit), so allocation is bounded — while still handing back a
+        // DISTINCT free buffer while the previous is in flight (preserves the anti-alias reason the
+        // per-frame create existed). Rebuild the pool only if the source dims/format change.
+        if (!_rotPool || _rotPoolSrcW != w || _rotPoolSrcH != h || _rotPoolFmt != fmt) {
+            if (_rotPool) { CVPixelBufferPoolRelease(_rotPool); _rotPool = NULL; }
+            NSDictionary *ioSurface = @{
+                (__bridge id)CFSTR("IOSurfacePreallocPages")     : @0,
+                (__bridge id)CFSTR("IOSurfacePurgeWhenNotInUse") : @1,
+            };
+            NSDictionary *pbAttrs = @{
+                (id)kCVPixelBufferWidthKey               : @(h),   // swapped W/H for the quarter turn
+                (id)kCVPixelBufferHeightKey              : @(w),
+                (id)kCVPixelBufferPixelFormatTypeKey     : @(fmt),
+                (id)kCVPixelBufferIOSurfacePropertiesKey : ioSurface,
+            };
+            CVPixelBufferPoolRef pool = NULL;
+            if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                                        (__bridge CFDictionaryRef)pbAttrs, &pool) != kCVReturnSuccess || !pool) {
+                return NULL;
+            }
+            _rotPool = pool;
+            _rotPoolSrcW = w; _rotPoolSrcH = h; _rotPoolFmt = fmt;
+        }
 
         CVPixelBufferRef dst = NULL;
-        // Swapped W/H for the quarter turn (0x82af4: CVPixelBufferCreate width=srcH, height=srcW).
-        if (CVPixelBufferCreate(kCFAllocatorDefault, h, w, fmt,
-                                (__bridge CFDictionaryRef)attrs, &dst) != kCVReturnSuccess || !dst) {
+        if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _rotPool, &dst) != kCVReturnSuccess || !dst) {
             return NULL;
         }
         if (VTPixelRotationSessionRotateImage(_rotSession, src, dst) != noErr) {
