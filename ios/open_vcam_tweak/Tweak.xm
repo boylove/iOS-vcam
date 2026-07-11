@@ -96,23 +96,12 @@
 #define VCAM_LANDSCAPE_GATE 1
 #endif
 
-// VCAM_DEST_MATRIX_709 (default 0 = 601, matching the closed vcamera). Selects the VIDEO
-// transfer session's DESTINATION YCbCr matrix. The full-res still always uses a separate
-// 709 session (see VCamConfigXferSession); this flag only A/B-tests the video/preview
-// path. See memory openvcam-photo-red-dest-stamp-p3 for the saved-photo colour history.
+// VCAM_DEST_MATRIX_709 (default 0 = 601, matching the closed vcamera). Selects the transfer
+// session's DESTINATION YCbCr matrix (the session is configured in VCamFrameStore -init). See
+// memory openvcam-photo-red-dest-stamp-p3 for the saved-photo colour history.
 #ifndef VCAM_DEST_MATRIX_709
 #define VCAM_DEST_MATRIX_709 0
 #endif
-
-// --- Colour helper, shared by the video and photo transfer paths ---------------
-// The destination YCbCr matrix used by the VIDEO transfer session.
-static CFStringRef VCamDestMatrix(void) {
-#if VCAM_DEST_MATRIX_709
-    return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
-#else
-    return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
-#endif
-}
 
 
 // ---------------------------------------------------------------------------
@@ -197,44 +186,11 @@ void VCamLog(NSString *format, ...) {
 // capture graph can service several source nodes concurrently. This is the ONLY GPU pass in
 // the emit hot path — the CCW90 pre-rotation happens once per frame on the decode thread.
 // ---------------------------------------------------------------------------
-// ONE transfer session for ALL buffers (preview, video, AND the full-res still), 601
-// matrix — exactly like the closed vcamera, which creates three IDENTICAL 601 sessions
-// but its modifyImageBuffer uses only one (ivar 0x88) for every overwrite (decisive
-// disas, memory openvcam-emit-throttle-not-dedup). No per-path 709 still split.
-static VTPixelTransferSessionRef gTransferSession;
-// The single engine lock (== closed vcamera ivar 0x18) now lives in VCamFrameStore and is
-// held across BOTH the ingest rotation AND the emit transfer below — there is no separate
-// transfer lock here (two locks are exactly what caused the 0.5.7 GPU-fence deadlock).
-
-// Configure the transfer session exactly like the closed vcamera: Trim scaling +
-// GPU-accel + pinned 709 primaries/transfer + 601 destination YCbCr matrix. One config
-// for every buffer (preview, video, still) — the original does not split video/still.
-static void VCamConfigXferSession(VTPixelTransferSessionRef s, CFStringRef destMatrix) {
-    if (!s) return;
-    // Without a scaling mode the transfer FAILS whenever src/dst sizes differ (the normal
-    // case) -> NULL replacement -> real camera. Trim matches the closed vcamera.
-    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
-    // GPU-accelerated transfer (string key; no public constant), matching the original.
-    VTSessionSetProperty(s, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                         VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
-#if VCAM_DEST_COLOR
-    // Pin the destination colour like the closed vcamera (709 primaries/transfer); the
-    // matrix is per-path (601 video / 709 still — see above).
-    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
-                         kCVImageBufferColorPrimaries_ITU_R_709_2);
-    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationTransferFunction,
-                         kCVImageBufferTransferFunction_ITU_R_709_2);
-    VTSessionSetProperty(s, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, destMatrix);
-#endif
-}
-
-static void VCamEnsureSessions(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &gTransferSession);
-        VCamConfigXferSession(gTransferSession, VCamDestMatrix());   // 601 for everything
-    });
-}
+// The transfer session (== engine ivar 0x88) is created + configured at init INSIDE
+// VCamFrameStore, alongside the rotation session — both eager, both faithful to the closed
+// vcamera's engine init (0x82494 transfer / 0x82650 rotation). The emit gets it via
+// [store transferSession] and runs its single VTPixelTransferSessionTransferImage under the
+// same engine lock.
 
 // Always-on failure-reason counters so the periodic health line reports WHY an overwrite
 // was skipped (fail-open): no fresh decoded frame, no transfer session, or the VT
@@ -293,10 +249,9 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     }
 #endif
 
-    VCamEnsureSessions();
-    if (!gTransferSession) { gRNoXfer++; return NO; }
-
     VCamFrameStore *store = [VCamFrameStore shared];
+    VTPixelTransferSessionRef xfer = [store transferSession];   // created eagerly at store init
+    if (!xfer) { gRNoXfer++; return NO; }
     // Single engine-lock critical section across pick + transfer — the SAME lock the ingest
     // holds while pre-rotating (faithful to the original's one ivar-0x18 lock across
     // setYUVSampleBuffer: and modifyImageBuffer:). NO rotation and NO flip here: the ingest
@@ -317,7 +272,7 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
     // ONE transfer, one 601 session for every buffer (preview, video, still) — no per-size
     // routing, like the closed vcamera. ScalingMode=Trim (on the session) aspect-fills.
-    OSStatus ts = VTPixelTransferSessionTransferImage(gTransferSession, src, cameraBuf);
+    OSStatus ts = VTPixelTransferSessionTransferImage(xfer, src, cameraBuf);
     [store endEmitAccess];
 
     // One-time geometry diagnostic (first few distinct dst sizes), logged AFTER unlock so

@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -38,6 +39,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable CVPixelBufferRef)rawFrameLocked;
 - (nullable CVPixelBufferRef)rotatedFrameLocked;
 - (void)endEmitAccess;
+
+/// The scale/pixel-format transfer session (== engine ivar 0x88), created + configured at init
+/// (Trim + GPU-accel + 709/601), NOT lazily. The emit does its single VTPixelTransferSessionTransferImage
+/// with this. NULL only if the session failed to create.
+- (nullable VTPixelTransferSessionRef)transferSession;
 
 /// Set the engine "live" flag (== _bLive / -setLive:, ivar 9). The emit overwrites ONLY when
 /// live AND a frame exists. The RTMP layer sets YES on connect and NO on disconnect WITHOUT

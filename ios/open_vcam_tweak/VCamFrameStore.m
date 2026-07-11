@@ -8,11 +8,20 @@
 #ifndef VCAM_GPU_ACCEL
 #define VCAM_GPU_ACCEL 1
 #endif
+// Transfer-session destination colour, mirroring Tweak.xm and the closed vcamera (0x82494):
+// VCAM_DEST_COLOR pins 709 primaries/transfer; VCAM_DEST_MATRIX_709 picks 709 (else 601) matrix.
+#ifndef VCAM_DEST_COLOR
+#define VCAM_DEST_COLOR 1
+#endif
+#ifndef VCAM_DEST_MATRIX_709
+#define VCAM_DEST_MATRIX_709 0
+#endif
 
 @implementation VCamFrameStore {
     CMSampleBufferRef _rawSample;            // raw decoded frame as CMSampleBuffer (== ivar 0x50)
     CVPixelBufferRef _rotated;               // CCW90 pre-rotated copy   (== engine ivar 0x70)
     VTPixelRotationSessionRef _rotSession;   // CCW90 rotation session   (== engine ivar 0x98)
+    VTPixelTransferSessionRef _transferSession; // scale/convert session (== engine ivar 0x88)
     BOOL _live;                              // overwrite gate           (== engine ivar 9 / _bLive)
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
 }
@@ -47,6 +56,26 @@
                 _rotSession = rs;
             }
         }
+        // Transfer session (== engine ivar 0x88) — created + configured HERE at init too, at the
+        // SAME time as the rotation session, faithful to the closed vcamera's engine init
+        // (0x82494: ScalingMode=Trim, GPU-accel, 709 primaries/transfer + 601/709 matrix). Not
+        // iOS-16-gated (VTPixelTransferSession predates it).
+        VTPixelTransferSessionRef ts = NULL;
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &ts) == noErr && ts) {
+            VTSessionSetProperty(ts, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            VTSessionSetProperty(ts, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+#if VCAM_DEST_COLOR
+            VTSessionSetProperty(ts, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(ts, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(ts, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 VCAM_DEST_MATRIX_709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                                                      : kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+#endif
+            _transferSession = ts;
+        }
     }
     return self;
 }
@@ -62,7 +91,13 @@
         }
         CFRelease(_rotSession);
     }
+    if (_transferSession) {
+        VTPixelTransferSessionInvalidate(_transferSession);
+        CFRelease(_transferSession);
+    }
 }
+
+- (VTPixelTransferSessionRef)transferSession { return _transferSession; }
 
 // Faithful port of the closed vcamera's `create90ImageBuffer:` (0x829e0): CCW90-rotate
 // `src` into a FRESH buffer with swapped W/H, whose IOSurface uses exactly
