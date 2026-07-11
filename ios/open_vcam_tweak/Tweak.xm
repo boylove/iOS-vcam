@@ -256,19 +256,20 @@ static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
 // GPU (splitting that into two locks is what caused the 0.5.7 IOSurface-fence deadlock).
 // ---------------------------------------------------------------------------
 
-// Choose 0° vs a quarter-turn so the OBS source lines up with the destination camera
-// buffer, by comparing aspect ratios (log space so "2x too wide" and "2x too tall" weigh
-// equally). Only 0/90 are considered — a capture buffer is only ever the source turned a
-// quarter. Returns 0 or 90 (the caller maps 90 to a position-driven CW90/CCW90).
+// Pick raw (return 0) vs the CCW90 pre-rotated (return 90), FAITHFUL to the closed vcamera's
+// modifyImageBuffer: select (RE 0x8477c-0x847b4): a plain orientation-CLASS comparison on the
+// integer w/h, NOT an aspect-ratio distance. Rotated iff src and dst orientations DIFFER —
+// src landscape (w>h) with dst portrait (w<h), or src portrait with dst landscape. Square
+// (w==h) on either side -> raw (matches the original's >= / <= boundaries: 0x84790 b.ge,
+// 0x84798 b.le). This is robust to atypical/near-square/transient buffer geometries, unlike
+// an aspect-ratio minimiser.
 #if VCAM_AUTO_ORIENT
 static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
     size_t sw = CVPixelBufferGetWidth(src),  sh = CVPixelBufferGetHeight(src);
     size_t dw = CVPixelBufferGetWidth(dst),  dh = CVPixelBufferGetHeight(dst);
     if (!sw || !sh || !dw || !dh) return 0;
-    double dstAR = (double)dw / (double)dh;
-    double d0  = fabs(log(((double)sw / (double)sh) / dstAR));
-    double d90 = fabs(log(((double)sh / (double)sw) / dstAR));
-    return (d90 < d0) ? 90 : 0;
+    if ((sw > sh && dw < dh) || (sw < sh && dw > dh)) return 90;   // orientations differ
+    return 0;
 }
 #endif
 
