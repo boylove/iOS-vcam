@@ -10,7 +10,7 @@
 #endif
 
 @implementation VCamFrameStore {
-    CVPixelBufferRef _raw;                   // raw decoded frame        (== engine ivar 0x50)
+    CMSampleBufferRef _rawSample;            // raw decoded frame as CMSampleBuffer (== ivar 0x50)
     CVPixelBufferRef _rotated;               // CCW90 pre-rotated copy   (== engine ivar 0x70)
     VTPixelRotationSessionRef _rotSession;   // CCW90 rotation session   (== engine ivar 0x98)
     NSTimeInterval _updatedAt;
@@ -27,7 +27,7 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _raw = NULL;
+        _rawSample = NULL;
         _rotated = NULL;
         _rotSession = NULL;
         _updatedAt = 0;
@@ -39,7 +39,7 @@
 }
 
 - (void)dealloc {
-    if (_raw) CVPixelBufferRelease(_raw);
+    if (_rawSample) CFRelease(_rawSample);
     if (_rotated) CVPixelBufferRelease(_rotated);
     if (_rotSession) {
         // _rotSession is only ever created inside the iOS 16 @available block below, so a
@@ -104,35 +104,39 @@ static NSTimeInterval VCamNow(void) {
     return NULL;
 }
 
-- (void)ingestFrame:(CVPixelBufferRef)pixelBuffer {
-    if (!pixelBuffer) return;
+- (void)ingestSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!sampleBuffer) return;
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) return;
     [_lock lock];
-    // Raw copy -> _raw (== CMSampleBufferCreateCopy into ivar 0x50).
-    CVPixelBufferRetain(pixelBuffer);
-    if (_raw) CVPixelBufferRelease(_raw);
-    _raw = pixelBuffer;
-    // CCW90 pre-rotated -> _rotated (== create90ImageBuffer: into ivar 0x70). Both stored
-    // under the one lock, exactly like setYUVSampleBuffer:.
+    // Store the raw sample buffer -> _rawSample (== CMSampleBufferCreateCopy into ivar 0x50).
+    CFRetain(sampleBuffer);
+    if (_rawSample) CFRelease(_rawSample);
+    _rawSample = sampleBuffer;
+    // CCW90 pre-rotated of its image buffer -> _rotated (== create90ImageBuffer: into ivar
+    // 0x70). Both stored under the one lock, exactly like setYUVSampleBuffer:.
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
-    _rotated = [self create90Locked:pixelBuffer];
+    _rotated = [self create90Locked:(CVPixelBufferRef)imageBuffer];
     _updatedAt = VCamNow();
     [_lock unlock];
 }
 
 - (BOOL)beginEmitAccessWithMaxAge:(NSTimeInterval)maxAgeSeconds {
     [_lock lock];
-    if (_raw && (VCamNow() - _updatedAt) <= maxAgeSeconds) return YES;   // lock stays held
+    if (_rawSample && (VCamNow() - _updatedAt) <= maxAgeSeconds) return YES;   // lock stays held
     [_lock unlock];
     return NO;
 }
 
-- (CVPixelBufferRef)rawFrameLocked { return _raw; }
+- (CVPixelBufferRef)rawFrameLocked {
+    return _rawSample ? (CVPixelBufferRef)CMSampleBufferGetImageBuffer(_rawSample) : NULL;
+}
 - (CVPixelBufferRef)rotatedFrameLocked { return _rotated; }
 - (void)endEmitAccess { [_lock unlock]; }
 
 - (void)clear {
     [_lock lock];
-    if (_raw) { CVPixelBufferRelease(_raw); _raw = NULL; }
+    if (_rawSample) { CFRelease(_rawSample); _rawSample = NULL; }
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
     _updatedAt = 0;
     [_lock unlock];

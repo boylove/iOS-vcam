@@ -63,7 +63,7 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 
 // Orientation. Faithful to the closed vcamera's camera-overwrite path: the pre-rotation is
 // `create90ImageBuffer:` (RE 0x829e0) = kVTRotation_CCW90, NO flip, for BOTH cameras — done
-// on INGEST (VCamFrameStore -ingestFrame:), not here. The front-camera selfie mirror is the
+// on INGEST (VCamFrameStore -ingestSampleBuffer:), not here. The front-camera selfie mirror is the
 // downstream capture pipeline's job (as for the real front camera), so the tweak adds no
 // flip. (The "back CW90 / front CCW90+FlipVertical by position" at 0x83e20 is the `run`
 // loop's DIFFERENT path (ivars 0xc8/0xd0), which the camera overwrite never reads.)
@@ -75,14 +75,12 @@ static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 #define VCAM_AUTO_ORIENT 1
 #endif
 
-// VCAM_GPU_ACCEL (default 1 = GPU, faithful to the closed vcamera). The original ships
-// EnableGPUAcceleratedTransfer=YES on BOTH its transfer session (RE 0x82530) and its
-// rotation session (RE 0x82650). Earlier GPU attempts (0.6.5/0.6.6) re-froze the preview,
-// but those were on the NON-faithful architecture (emit-side double rotation + a poisoned
-// GPU-fence environment). Now that rotation is a single CCW90 pass on ingest under one
-// engine lock (the original's discipline), the GPU path should behave like the original.
-// Fall back to 0 (CPU, the device-stable 0.6.11 config) if the preview freezes on a clean
-// (re-jailbroken) device.
+// VCAM_GPU_ACCEL (default 1 = GPU, FAITHFUL to the closed vcamera). The original ships
+// EnableGPUAcceleratedTransfer=YES on BOTH its transfer session (RE 0x82530) and rotation
+// session (RE 0x82650). This STAYS GPU — the photo->video preview cycling on GPU means we are
+// still missing something the original does across the mode transition (to be found by RE),
+// NOT a reason to switch to CPU. Do not deviate to CPU: replicate whatever keeps the
+// original's GPU path stable.
 #ifndef VCAM_GPU_ACCEL
 #define VCAM_GPU_ACCEL 1
 #endif
@@ -251,7 +249,7 @@ static uint64_t gRNoFresh, gRNoXfer, gRXferFail;
 
 // ---------------------------------------------------------------------------
 // Rotation moved to INGEST — faithful to the closed vcamera. The decoded OBS frame is
-// pre-rotated CCW90 on the decode thread inside VCamFrameStore (-ingestFrame: ->
+// pre-rotated CCW90 on the decode thread inside VCamFrameStore (-ingestSampleBuffer: ->
 // create90ImageBuffer: equivalent, ivar 0x70); the emit hot path below does NO rotation —
 // it only picks raw-vs-prerotated + one transfer (== modifyImageBuffer: 0x84458). Both run
 // under VCamFrameStore's single engine lock, so rotate and transfer never overlap on the

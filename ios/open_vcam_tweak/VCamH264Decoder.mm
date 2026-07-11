@@ -163,7 +163,31 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
                      CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer));
     }
 #endif
-    [[VCamFrameStore shared] ingestFrame:(CVPixelBufferRef)imageBuffer];
+    // Wrap the decoded CVPixelBuffer into a CMSampleBuffer with a SYNTHETIC MONOTONIC
+    // timestamp, EXACTLY like the closed vcamera's Helper -imageBufferToSampleBuffer:timeStamp:
+    // (0x77c30) + -outputFrame: (0x77d24), then hand THAT to the engine (== setYUVSampleBuffer:).
+    // The original does NOT use the RTMP DTS/CTS here: it drives its own counter that steps
+    // +20.0 per frame, PTS = CMTimeMake((int64)(counter*600), 600) (timescale 600, flags valid),
+    // duration/DTS invalid. It also CVPixelBufferLockBaseAddress's the buffer across the wrap —
+    // which forces the GPU-decoded pixels to land (a sync point) — so we replicate that too.
+    static double vcamOutTs = 0.0;   // decode-thread only; monotonic like the original's ivar 0x30
+    CVPixelBufferLockBaseAddress((CVPixelBufferRef)imageBuffer, 0);
+    CMVideoFormatDescriptionRef fmt = NULL;
+    if (CMVideoFormatDescriptionCreateForImageBuffer(NULL, imageBuffer, &fmt) == noErr && fmt) {
+        CMSampleTimingInfo timing;
+        timing.duration = kCMTimeInvalid;
+        timing.presentationTimeStamp = CMTimeMake((int64_t)(vcamOutTs * 600.0), 600);
+        timing.decodeTimeStamp = kCMTimeInvalid;
+        CMSampleBufferRef sb = NULL;
+        if (CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, imageBuffer, true, NULL, NULL,
+                                               fmt, &timing, &sb) == noErr && sb) {
+            [[VCamFrameStore shared] ingestSampleBuffer:sb];
+            CFRelease(sb);
+        }
+        CFRelease(fmt);
+    }
+    CVPixelBufferUnlockBaseAddress((CVPixelBufferRef)imageBuffer, 0);
+    vcamOutTs += 20.0;
 }
 
 - (BOOL)buildSession {
