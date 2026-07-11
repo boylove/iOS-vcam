@@ -38,6 +38,10 @@ endif
 ifdef VCAM_DEST_MATRIX_709
 OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
 endif
+# VCAM_AUDIO_DISABLE (default 0) — video-only A/B build: audio subsystem installs nothing.
+ifdef VCAM_AUDIO_DISABLE
+OpenVCam_CFLAGS += -DVCAM_AUDIO_DISABLE=$(VCAM_AUDIO_DISABLE)
+endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
 
 after-install::

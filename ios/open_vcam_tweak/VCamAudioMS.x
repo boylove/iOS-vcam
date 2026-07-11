@@ -1027,6 +1027,13 @@ static void IVCAMMediaActiveStartBackground(void) {
 
 %ctor {
     @autoreleasepool {
+#if VCAM_AUDIO_DISABLE
+        // Video-only A/B build: the audio subsystem installs NOTHING (no AudioUnitRender hook, no
+        // producer, no ring). Isolates whether the audio subsystem's render load / IOSurface
+        // pressure is what halves the recording fps. The PushPCM/SetVideoPTS/SetOBSStreaming
+        // symbols still link (called by the video path) but are inert no-ops here.
+        return;
+#endif
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
         NSString *processName = [[NSProcessInfo processInfo] processName] ?: @"";
         NSString *executablePath = [[NSProcessInfo processInfo] arguments].firstObject ?: @"";
