@@ -103,6 +103,18 @@
 #define VCAM_DEST_MATRIX_709 0
 #endif
 
+// VCAM_DIAG_ORIENT (default 0 = OFF). Pure log-only diagnostic for the front-camera
+// recorded-video 180° investigation. When 1, VCamEmit dumps, for the first couple of
+// buffers of each distinct (node, geometry) branch: the emitting BWNodeOutput subclass +
+// pointer, the dst dims, the image-buffer attachments, and the format-description
+// extensions. Recording FRONT then BACK and diffing the two logs reveals (a) whether the
+// record branch is a DISTINCT emit from preview (different node class/ptr) — if so the fix
+// is a front-only pixel 180° on that branch, no metadata — and (b) how front/back is
+// signalled. Changes nothing; safe but noisy, so it ships only in the diag build.
+#ifndef VCAM_DIAG_ORIENT
+#define VCAM_DIAG_ORIENT 0
+#endif
+
 
 // ---------------------------------------------------------------------------
 // Stall watchdog / heartbeat (diagnostic for the "moves once then freezes" bug).
@@ -317,6 +329,35 @@ static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) 
     return NULL;
 }
 
+#if VCAM_DIAG_ORIENT
+// Log-only: dump the first 2 buffers of each distinct (emitting node, geometry) branch, so a
+// FRONT vs BACK recording can be diffed to locate the record branch + front/back signal. See
+// VCAM_DIAG_ORIENT. Never mutates anything.
+static void VCamDiagDumpEmit(id node, CMSampleBufferRef sb, CVImageBufferRef ib) {
+    if (!ib) return;
+    size_t w = CVPixelBufferGetWidth(ib), h = CVPixelBufferGetHeight(ib);
+    static struct { void *node; long dims; int n; } seen[48];
+    static int nseen = 0;
+    long dims = (long)w * 100000 + (long)h;
+    int idx = -1;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i].node == (__bridge void *)node && seen[i].dims == dims) { idx = i; break; }
+    if (idx < 0) {
+        if (nseen >= 48) return;
+        idx = nseen++; seen[idx].node = (__bridge void *)node; seen[idx].dims = dims; seen[idx].n = 0;
+    }
+    if (seen[idx].n >= 2) return;
+    seen[idx].n++;
+
+    CFDictionaryRef ibAtt = CVBufferGetAttachments(ib, kCVAttachmentMode_ShouldPropagate);
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
+    CFDictionaryRef ext = fmt ? CMFormatDescriptionGetExtensions(fmt) : NULL;
+    VCamLog(@"DIAG-EMIT node=%p cls=%s dims=%zux%zu\n  ibAtt=%@\n  ext=%@",
+            (void *)node, class_getName(object_getClass(node)), w, h,
+            (__bridge NSDictionary *)ibAtt, (__bridge NSDictionary *)ext);
+}
+#endif
+
 // -[BWNodeOutput emitSampleBuffer:] — overwrite the camera's image buffer IN PLACE
 // (exactly like vcamera's -[<core> modifyImageBuffer:]), then call the original with the
 // ORIGINAL sample buffer. This is the ONLY node the original modifies; the render nodes
@@ -327,6 +368,9 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     gEmitEntries++;                            // heartbeat: entered (before any work)
     [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+#if VCAM_DIAG_ORIENT
+    VCamDiagDumpEmit(self, sb, ib);
+#endif
     BOOL did = NO;
     if (ib) {
         // Overwrite every landscape buffer, no dedup — instruction-level RE of the
