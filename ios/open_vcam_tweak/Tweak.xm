@@ -103,18 +103,6 @@
 #define VCAM_DEST_MATRIX_709 0
 #endif
 
-// VCAM_DIAG_ORIENT (default 0 = OFF). Pure log-only diagnostic for the front-camera
-// recorded-video 180° investigation. When 1, VCamEmit dumps, for the first couple of
-// buffers of each distinct (node, geometry) branch: the emitting BWNodeOutput subclass +
-// pointer, the dst dims, the image-buffer attachments, and the format-description
-// extensions. Recording FRONT then BACK and diffing the two logs reveals (a) whether the
-// record branch is a DISTINCT emit from preview (different node class/ptr) — if so the fix
-// is a front-only pixel 180° on that branch, no metadata — and (b) how front/back is
-// signalled. Changes nothing; safe but noisy, so it ships only in the diag build.
-#ifndef VCAM_DIAG_ORIENT
-#define VCAM_DIAG_ORIENT 0
-#endif
-
 
 // ---------------------------------------------------------------------------
 // Stall watchdog / heartbeat (diagnostic for the "moves once then freezes" bug).
@@ -329,41 +317,6 @@ static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) 
     return NULL;
 }
 
-#if VCAM_DIAG_ORIENT
-// Log-only: dump the first 2 buffers of each distinct (emitting node, geometry) branch, so a
-// FRONT vs BACK recording can be diffed to locate the record branch + front/back signal. See
-// VCAM_DIAG_ORIENT. Never mutates anything.
-static void VCamDiagDumpEmit(id node, CMSampleBufferRef sb, CVImageBufferRef ib) {
-    if (!ib) return;
-    size_t w = CVPixelBufferGetWidth(ib), h = CVPixelBufferGetHeight(ib);
-    static struct { void *node; long dims; int n; } seen[48];
-    static int nseen = 0;
-    long dims = (long)w * 100000 + (long)h;
-    int idx = -1;
-    for (int i = 0; i < nseen; i++)
-        if (seen[i].node == (__bridge void *)node && seen[i].dims == dims) { idx = i; break; }
-    if (idx < 0) {
-        if (nseen >= 48) return;
-        idx = nseen++; seen[idx].node = (__bridge void *)node; seen[idx].dims = dims; seen[idx].n = 0;
-    }
-    if (seen[idx].n >= 2) return;
-    seen[idx].n++;
-
-    CFDictionaryRef ibAtt = CVBufferCopyAttachments(ib, kCVAttachmentMode_ShouldPropagate);
-    CFDictionaryRef sbAtt = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
-                                                          kCMAttachmentMode_ShouldPropagate);
-    IOSurfaceRef surf = CVPixelBufferGetIOSurface(ib);
-    // ib ptr + IOSurface ptr answer whether the record and preview branches share the same
-    // backing surface (in-place rotate would then hit both) or hold separate copies.
-    VCamLog(@"DIAG-EMIT node=%p cls=%s dims=%zux%zu ib=%p surf=%p\n  ibAtt=%@\n  sbAtt=%@",
-            (__bridge void *)node, class_getName(object_getClass(node)), w, h,
-            (void *)ib, (void *)surf,
-            (__bridge NSDictionary *)ibAtt, (__bridge NSDictionary *)sbAtt);
-    if (ibAtt) CFRelease(ibAtt);
-    if (sbAtt) CFRelease(sbAtt);
-}
-#endif
-
 // -[BWNodeOutput emitSampleBuffer:] — overwrite the camera's image buffer IN PLACE
 // (exactly like vcamera's -[<core> modifyImageBuffer:]), then call the original with the
 // ORIGINAL sample buffer. This is the ONLY node the original modifies; the render nodes
@@ -374,9 +327,6 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     gEmitEntries++;                            // heartbeat: entered (before any work)
     [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
-#if VCAM_DIAG_ORIENT
-    VCamDiagDumpEmit(self, sb, ib);
-#endif
     BOOL did = NO;
     if (ib) {
         // Overwrite every landscape buffer, no dedup — instruction-level RE of the
@@ -399,42 +349,6 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
                 calls, repl, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);
 }
 
-
-#if VCAM_DIAG_ORIENT
-// Pass-through probe on the orientation-metadata node (the node the original also hooks,
-// pass-through — safe). Dumps, per distinct geometry, the RotationDegrees/Mirrored the record
-// path carries here, so we can see the front record-path 180° lever downstream of the shared
-// emit. Never mutates.
-static NSMutableDictionary<NSValue *, NSValue *> *gOrientOrigs;
-
-static void VCamDiagDumpOrient(id node, CMSampleBufferRef sb) {
-    CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
-    size_t w = ib ? CVPixelBufferGetWidth(ib) : 0, h = ib ? CVPixelBufferGetHeight(ib) : 0;
-    static struct { long dims; int n; } seen[24];
-    static int nseen = 0;
-    long dims = (long)w * 100000 + (long)h;
-    int idx = -1;
-    for (int i = 0; i < nseen; i++) if (seen[i].dims == dims) { idx = i; break; }
-    if (idx < 0) { if (nseen >= 24) return; idx = nseen++; seen[idx].dims = dims; seen[idx].n = 0; }
-    if (seen[idx].n >= 3) return;
-    seen[idx].n++;
-    CFDictionaryRef ibAtt = ib ? CVBufferCopyAttachments(ib, kCVAttachmentMode_ShouldPropagate) : NULL;
-    CFDictionaryRef sbAtt = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, sb,
-                                                          kCMAttachmentMode_ShouldPropagate);
-    VCamLog(@"DIAG-ORIENT node=%p imgbuf=%d dims=%zux%zu\n  ibAtt=%@\n  sbAtt=%@",
-            (__bridge void *)node, ib != NULL, w, h,
-            (__bridge NSDictionary *)ibAtt, (__bridge NSDictionary *)sbAtt);
-    if (ibAtt) CFRelease(ibAtt);
-    if (sbAtt) CFRelease(sbAtt);
-}
-
-static id VCamOrientRender(id self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    IMP orig = VCamFindOrig(gOrientOrigs, self);
-    VCamDiagDumpOrient(self, sb);
-    if (!orig) return nil;
-    return ((id (*)(id, SEL, CMSampleBufferRef, id))orig)(self, _cmd, sb, input);
-}
-#endif
 
 static void VCamHook(const char *clsName, SEL sel, IMP repl,
                      NSMutableDictionary<NSValue *, NSValue *> *origMap) {
@@ -473,14 +387,6 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // The still-image pipeline reads the same already-overwritten shared surface, so
         // the shutter captures OBS with no dedicated photo hook.
         VCamHook("BWNodeOutput", @selector(emitSampleBuffer:), (IMP)VCamEmit, gEmitOrigs);
-
-#if VCAM_DIAG_ORIENT
-        // Log-only probe on the orientation-metadata node (pass-through, like the original's
-        // own hook) to observe the record-path orientation. Diagnostic build only.
-        gOrientOrigs = [NSMutableDictionary dictionary];
-        VCamHook("BWVideoOrientationMetadataNode", @selector(renderSampleBuffer:forInput:),
-                 (IMP)VCamOrientRender, gOrientOrigs);
-#endif
 
         // Start the stall watchdog BEFORE frames flow: it reports from its own thread if
         // the capture thread ever wedges inside our hook, so the "moves once then freezes"

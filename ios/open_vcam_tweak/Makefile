@@ -35,10 +35,6 @@ endif
 ifdef VCAM_DEST_MATRIX_709
 OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
 endif
-# VCAM_DIAG_ORIENT (default 0) log-only emit dump for the front-video-180 investigation.
-ifdef VCAM_DIAG_ORIENT
-OpenVCam_CFLAGS += -DVCAM_DIAG_ORIENT=$(VCAM_DIAG_ORIENT)
-endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
 
 after-install::
