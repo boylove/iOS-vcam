@@ -784,6 +784,13 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         if (muteLeak) IVCAMMediaActiveMuteRT(ioData);
         return status;
     }
+    // This IS the latched unit rendering. Stamp liveness NOW — on EVERY render, even while still
+    // priming (before the first replace) — so a unit that is merely warming up is not mistaken for
+    // idle and STOLEN by another unit. That mis-steal caused perpetual re-latching so the unit
+    // never finished priming (primed=0, replaced flat) -> silent, e.g. a freshly-opened TikTok
+    // recorder. Goes stale only when the latched unit truly stops rendering (app switched away).
+    IVCAMAtomicStore64(&gCtx.lastRenderUs, IVCAMNowUs());
+
     // formatReady (acquire) publishes consumerBus + the tgt* fields written before
     // its release at latch, so read them only after this gate.
     if (!IVCAMAtomicLoad32(&gCtx.formatReady)) return status;
