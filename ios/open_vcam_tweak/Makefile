@@ -11,9 +11,12 @@ TWEAK_NAME := OpenVCam
 # VTPixelTransferSessionTransferImage (one GPU pass, no per-frame pixel rotation) —
 # exactly like the closed vcamera's photo-mode flow (VCAMERA_OPENVCAM_COMPLETE_REFERENCE.md
 # §2, memory openvcam-photomode-original-flow). Orientation is carried by the pipeline's
-# existing metadata. Audio (VCamAudioMS.x) is intentionally OUT of the build here — it is
-# kept in the tree for the upcoming OBS audio-replacement work.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm vendor/rtmp/vcam_rtmp.c
+# existing metadata. Audio (VCamAudioMS.x + VCamAACDecoder): OBS audio is demuxed from the SAME
+# RTMP stream the video path pulls (VCamRTMPSource msg_type 8 -> AAC decode -> the mic-replacement
+# ring the AudioUnitRender hook consumes). One tweak, one stream, both A/V. Audio is fail-open and
+# runtime-gated (default on; disable flag / Enabled=false pref), so it can never wedge the video
+# path. For a video-only build, drop VCamAudioMS.x + VCamAACDecoder.mm from FILES below.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS
@@ -35,7 +38,7 @@ endif
 ifdef VCAM_DEST_MATRIX_709
 OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
 endif
-OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox
+OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox AudioUnit
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."

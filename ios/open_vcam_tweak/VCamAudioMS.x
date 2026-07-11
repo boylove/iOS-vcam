@@ -157,6 +157,12 @@ static uint32_t gSrcChHint = 1;
 static uint32_t gJitterMs = IVCAM_JITTER_MS_DEFAULT;
 static uint32_t gProducerStarted = 0;
 
+// Audio source mode. 1 (default) = OBS audio is demuxed from the SAME RTMP stream the video
+// path already pulls (VCamRTMPSource pushes decoded PCM via IVCAMMediaActivePushPCM). 0 = the
+// legacy standalone PCM bridge on :1936. In RTMP mode the :1936 socket producer stays dormant so
+// there is exactly ONE producer feeding the SPSC ring/scratch.
+static uint32_t gAudioSourceRTMP = 1;
+
 static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
                                             AudioUnitRenderActionFlags *ioActionFlags,
                                             const AudioTimeStamp *inTimeStamp,
@@ -438,6 +444,53 @@ static uint32_t IVCAMResampleLinear(const int16_t *in, uint32_t inFrames, uint32
     return o;
 }
 
+// Adapt `srcFrames` interleaved int16 PCM (srcRate/srcCh) to the latched consumer format and
+// enqueue into the ring. Producer-thread-only (uses the single-owner producer scratch). Parks
+// (drops + counts) until the render thread has latched a unit and published its target format,
+// so wrong-rate data can never enter the ring. Called by BOTH the :1936 socket producer AND the
+// RTMP-audio producer (VCamRTMPSource, msg_type 8) — but only ONE of them runs at a time (see
+// gAudioSourceRTMP), so the shared scratch + SPSC ring stay single-producer-safe. NOT real-time
+// safe (allocation-free but not for the render thread); call only from an off-RT producer thread.
+void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
+                             uint32_t srcRate, uint32_t srcCh) {
+    if (!pcm || srcFrames == 0 || !(srcCh == 1 || srcCh == 2)) return;
+
+    // Park until a unit has latched its target format (no wrong-rate data into the ring).
+    if (!IVCAMAtomicLoad32(&gCtx.formatReady)) {
+        IVCAMAtomicAdd64(&gCtx.parkedFrames, 1);
+        return;
+    }
+    uint32_t tgtRate = gCtx.tgtRate;
+    uint32_t tgtCh = gCtx.tgtChannels;
+    if (!(tgtCh == 1 || tgtCh == 2) || tgtRate == 0) return;
+
+    // 1) channel map source -> target channels (at source rate)
+    const int16_t *mixed;
+    uint32_t mixedFrames = srcFrames;
+    if (srcCh == tgtCh) {
+        mixed = pcm;
+    } else {
+        if (srcFrames * tgtCh > IVCAM_PROD_MIX_SAMPLES) return;
+        IVCAMChannelMap(pcm, srcFrames, srcCh, gProducerMix, tgtCh);
+        mixed = gProducerMix;
+    }
+
+    // 2) resample source rate -> target rate
+    const int16_t *finalPcm;
+    uint32_t finalFrames;
+    if (srcRate == tgtRate) {
+        finalPcm = mixed;
+        finalFrames = mixedFrames;
+    } else {
+        finalFrames = IVCAMResampleLinear(mixed, mixedFrames, tgtCh, srcRate, tgtRate,
+                                          gProducerOut, IVCAM_PROD_OUT_SAMPLES / tgtCh);
+        finalPcm = gProducerOut;
+    }
+
+    // 3) enqueue
+    IVCAMRingWrite(finalPcm, finalFrames * tgtCh);
+}
+
 #pragma mark - Producer network loop
 
 static void IVCAMMediaActiveProducerLoop(void) {
@@ -446,6 +499,12 @@ static void IVCAMMediaActiveProducerLoop(void) {
         // Idle (do not connect) while disabled; stay alive so a later enable can
         // reconnect without needing to respawn the thread.
         if (!IVCAMAtomicLoad32(&gCtx.enabled)) {
+            sleep(1);
+            continue;
+        }
+        // In RTMP-source mode the audio comes from VCamRTMPSource (single producer), so the
+        // legacy :1936 socket producer must stay dormant to preserve the SPSC invariant.
+        if (gAudioSourceRTMP) {
             sleep(1);
             continue;
         }
@@ -523,47 +582,9 @@ static void IVCAMMediaActiveProducerLoop(void) {
                 }
                 if (!IVCAMMediaActiveReadExact(fd, gProducerRecv, header.payloadLength)) break;
 
-                // Park (drop + count) until the render thread has latched a unit and
-                // published its target format; this guarantees no wrong-rate data
-                // ever enters the ring.
-                if (!IVCAMAtomicLoad32(&gCtx.formatReady)) {
-                    IVCAMAtomicAdd64(&gCtx.parkedFrames, 1);
-                    continue;
-                }
-
-                uint32_t tgtRate = gCtx.tgtRate;
-                uint32_t tgtCh = gCtx.tgtChannels;
-                if (!(tgtCh == 1 || tgtCh == 2) || tgtRate == 0) continue;
-
-                const int16_t *pcm = (const int16_t *)gProducerRecv;
+                // Adapt to the latched target format and enqueue (parks until formatReady).
                 uint32_t srcFrames = header.payloadLength / (srcCh * 2u);
-                if (srcFrames == 0) continue;
-
-                // 1) channel map source -> target channels (at source rate)
-                const int16_t *mixed;
-                uint32_t mixedFrames = srcFrames;
-                if (srcCh == tgtCh) {
-                    mixed = pcm;
-                } else {
-                    if (srcFrames * tgtCh > IVCAM_PROD_MIX_SAMPLES) continue;
-                    IVCAMChannelMap(pcm, srcFrames, srcCh, gProducerMix, tgtCh);
-                    mixed = gProducerMix;
-                }
-
-                // 2) resample source rate -> target rate
-                const int16_t *finalPcm;
-                uint32_t finalFrames;
-                if (srcRate == tgtRate) {
-                    finalPcm = mixed;
-                    finalFrames = mixedFrames;
-                } else {
-                    finalFrames = IVCAMResampleLinear(mixed, mixedFrames, tgtCh, srcRate, tgtRate,
-                                                      gProducerOut, IVCAM_PROD_OUT_SAMPLES / tgtCh);
-                    finalPcm = gProducerOut;
-                }
-
-                // 3) enqueue
-                IVCAMRingWrite(finalPcm, finalFrames * tgtCh);
+                IVCAMMediaActivePushPCM((const int16_t *)gProducerRecv, srcFrames, srcRate, srcCh);
             }
 
             close(fd);

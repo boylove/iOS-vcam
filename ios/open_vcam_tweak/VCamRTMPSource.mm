@@ -1,6 +1,7 @@
 #import "VCamRTMPSource.h"
 #import "VCamConfig.h"
 #import "VCamH264Decoder.h"
+#import "VCamAACDecoder.h"
 #import "VCamFrameStore.h"
 #import "vcam_rtmp.h"
 
@@ -8,6 +9,7 @@
 
 @interface VCamRTMPSource ()
 @property (nonatomic, strong) VCamH264Decoder *decoder;
+@property (nonatomic, strong) VCamAACDecoder *aacDecoder;
 @property (nonatomic, assign) BOOL started;
 @property (nonatomic, assign) volatile int stopFlag;
 @end
@@ -27,6 +29,7 @@
     self = [super init];
     if (self) {
         _decoder = [[VCamH264Decoder alloc] init];
+        _aacDecoder = [[VCamAACDecoder alloc] init];
         _started = NO;
         _stopFlag = 0;
     }
@@ -82,13 +85,40 @@
     }
 }
 
+// FLV audio tag body handed up from the RTMP layer:
+//   [0] (soundFormat<<4)|(soundRate<<2)|(soundSize<<1)|soundType ; soundFormat 10 = AAC
+//   [1] AACPacketType (0 = AudioSpecificConfig seq header, 1 = raw AAC frame)  [AAC only]
+//   [2..] AudioSpecificConfig (seq header) OR one raw AAC access unit
+- (void)handleAudioTag:(const uint8_t *)data length:(size_t)len timestampMs:(uint32_t)ts {
+    (void)ts;   // the ring/render path is rate-driven + jitter-buffered, not PTS-driven
+    if (len < 2) return;
+    uint8_t soundFormat = (data[0] >> 4) & 0x0F;
+    if (soundFormat != 10) return;            // AAC only
+
+    uint8_t aacPacketType = data[1];
+    const uint8_t *body = data + 2;
+    size_t bodyLen = len - 2;
+
+    if (aacPacketType == 0) {                  // AudioSpecificConfig (sequence header)
+        NSData *asc = [NSData dataWithBytes:body length:bodyLen];
+        if (![self.aacDecoder configureWithAudioSpecificConfig:asc]) {
+            VCamLog(@"rtmp: aac configure failed");
+        }
+    } else if (aacPacketType == 1) {           // raw AAC access unit
+        [self.aacDecoder decodeFrame:body length:bodyLen];
+    }
+}
+
 static void VCamRTMPMediaCallback(void *ctx, uint8_t msg_type,
                                   uint32_t timestamp_ms,
                                   const uint8_t *data, size_t len) {
-    if (msg_type != 9) return;                // video only (audio = phase 3)
     VCamRTMPSource *self = (__bridge VCamRTMPSource *)ctx;
     @autoreleasepool {
-        [self handleVideoTag:data length:len timestampMs:timestamp_ms];
+        if (msg_type == 9) {                   // video (AVC/H264)
+            [self handleVideoTag:data length:len timestampMs:timestamp_ms];
+        } else if (msg_type == 8) {            // audio (AAC) -> mic replacement
+            [self handleAudioTag:data length:len timestampMs:timestamp_ms];
+        }
     }
 }
 
