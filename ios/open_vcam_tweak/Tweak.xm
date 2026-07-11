@@ -114,14 +114,6 @@ static CFStringRef VCamDestMatrix(void) {
 #endif
 }
 
-// AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
-// FigCaptureSourceConfiguration -sourcePosition hook. CURRENTLY UNUSED: the camera-overwrite
-// path is position-independent (create90 = CCW90 for both cameras, no flip — the front mirror
-// is the downstream pipeline's job, since 0.6.11). The original DOES consume its position, but
-// in the run-loop rotation path (ivar 0x100 -> 0x83e20, buffers 0xc8/0xd0) which OpenVCam does
-// NOT replicate — so this hook has no consumer here. Pending decision: remove it, or replicate
-// that run-loop path.
-static volatile long gSourcePosition = 0;
 
 // ---------------------------------------------------------------------------
 // Stall watchdog / heartbeat (diagnostic for the "moves once then freezes" bug).
@@ -402,26 +394,6 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
                 calls, repl, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);
 }
 
-// -[FigCaptureSourceConfiguration sourcePosition] — records which physical camera is
-// active (front/back) so the overwrite path can auto-mirror the front camera. Pure
-// observer: always returns the original value, never fails the call.
-static long (*gSourcePositionOrig)(id, SEL) = NULL;
-static long VCamSourcePosition(id self, SEL _cmd) {
-    long pos = gSourcePositionOrig ? gSourcePositionOrig(self, _cmd) : 0;
-    gSourcePosition = pos;
-    return pos;
-}
-
-static void VCamHookSourcePosition(void) {
-    Class c = objc_getClass("FigCaptureSourceConfiguration");
-    SEL sel = @selector(sourcePosition);
-    if (!c || !class_getInstanceMethod(c, sel)) {
-        VCamLog(@"sourcePosition hook unavailable; front auto-mirror off");
-        return;
-    }
-    MSHookMessageEx(c, sel, (IMP)VCamSourcePosition, (IMP *)&gSourcePositionOrig);
-    if (gSourcePositionOrig) VCamLog(@"hooked FigCaptureSourceConfiguration sourcePosition");
-}
 
 static void VCamHook(const char *clsName, SEL sel, IMP repl,
                      NSMutableDictionary<NSValue *, NSValue *> *origMap) {
@@ -460,9 +432,6 @@ static void VCamHook(const char *clsName, SEL sel, IMP repl,
         // The still-image pipeline reads the same already-overwritten shared surface, so
         // the shutter captures OBS with no dedicated photo hook.
         VCamHook("BWNodeOutput", @selector(emitSampleBuffer:), (IMP)VCamEmit, gEmitOrigs);
-
-        // Front/back detection for auto-mirror (config files unreadable here).
-        VCamHookSourcePosition();
 
         // Start the stall watchdog BEFORE frames flow: it reports from its own thread if
         // the capture thread ever wedges inside our hook, so the "moves once then freezes"
