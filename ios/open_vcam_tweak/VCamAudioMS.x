@@ -398,7 +398,8 @@ static void IVCAMRingWrite(const int16_t *src, uint32_t n) {
     // the whole backlog and resume writing fresh from the read point, so audio latency is bounded
     // regardless of the consumer. SPSC-safe: the producer owns writeIdx, and a consumer this far
     // behind is not draining, so no live read is corrupted (worst case one faded frame).
-    uint32_t backlogCap = gCtx.targetWaterSamples ? (3u * gCtx.targetWaterSamples) : 16384u;
+    uint32_t backlogCap = gCtx.targetWaterSamples
+        ? (gCtx.targetWaterSamples + (gCtx.targetWaterSamples >> 1)) : 16384u;  // 1.5x water
     if (w - r > backlogCap) {
         IVCAMAtomicAdd64(&gCtx.overflowDrops, w - r);
         w = r;
@@ -817,10 +818,12 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         gCtx.primed = 1;
     }
 
-    // Smooth overload drop: if we are more than ~2x over the water level, advance our
-    // own readIdx (consumer-owned, SPSC-safe) to shed the oldest whole frames and
-    // bound latency. Capped per render so trims stay small.
-    if (water > 0 && avail > 2u * water) {
+    // Keep the buffer CLOSE to the water level so audio latency ≈ the sync target instead of
+    // wandering up toward the producer's backlog cap (heard as a large drifting lag). Trim the
+    // oldest whole frames back toward water once avail exceeds it by a ¼-water margin. Consumer-
+    // owned readIdx (SPSC-safe). Capped at one render's worth per call -> each trim is a small,
+    // near-inaudible skip. Pure arithmetic; no added realtime cost (does not touch the overload).
+    if (water > 0 && avail > water + (water >> 2)) {
         uint32_t excess = avail - water;
         uint32_t cap = need;  // never trim more than one render's worth per call
         if (excess > cap) excess = cap;
