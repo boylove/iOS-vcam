@@ -284,17 +284,14 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
 #endif
     if (!_session || !_formatDesc || avccData.length == 0) return NO;
 
+    // Wrap the AVCC data WITHOUT copying, faithful to the original (RE 0x873ec:
+    // CMBlockBufferCreateWithMemoryBlock, blockAllocator = kCFAllocatorNull). Safe because the
+    // decode below is SYNCHRONOUS (flags=0), so avccData outlives the whole decode call.
     CMBlockBufferRef blockBuffer = NULL;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault, NULL, avccData.length, kCFAllocatorDefault,
+        kCFAllocatorDefault, (void *)avccData.bytes, avccData.length, kCFAllocatorNull,
         NULL, 0, avccData.length, 0, &blockBuffer);
     if (status != noErr || !blockBuffer) return NO;
-
-    status = CMBlockBufferReplaceDataBytes(avccData.bytes, blockBuffer, 0, avccData.length);
-    if (status != noErr) {
-        CFRelease(blockBuffer);
-        return NO;
-    }
 
     // NO sample timing — faithful to the closed vcamera's decode input (RE 0x87440):
     // CMSampleBufferCreateReady with numSampleTimingEntries=0 and sampleTimingArray=NULL. The
