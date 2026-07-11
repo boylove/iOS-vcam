@@ -9,6 +9,7 @@
 #import "VCamConfig.h"
 #import "VCamFrameStore.h"
 #import "VCamRTMPSource.h"
+#import "VCamAudioSink.h"
 #import "VCamLog.h"
 
 // ---------------------------------------------------------------------------
@@ -343,7 +344,12 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     // "decoder idle / fail-open" via syslog; the why[] counters pinpoint the cause.
     static uint64_t calls = 0, repl = 0;
     calls++;
-    if (did) { repl++; if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)"); }
+    if (did) {
+        IVCAMSetOBSStreaming(1);   // OBS content confirmed live -> audio hook mutes the real mic
+                                   // during the audio-startup window instead of recording it
+        repl++;
+        if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
+    }
     if ((calls % 600) == 0)
         VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu]",
                 calls, repl, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);

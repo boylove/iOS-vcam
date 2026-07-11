@@ -163,6 +163,13 @@ static uint32_t gProducerStarted = 0;
 // there is exactly ONE producer feeding the SPSC ring/scratch.
 static uint32_t gAudioSourceRTMP = 1;
 
+// Set by the RTMP source (VCamRTMPSource) on connect/disconnect: 1 = OBS is streaming, so OBS
+// audio is expected. While set, a mic-input render (bus 1) is NEVER allowed to record the real
+// mic — it is muted whenever it can't yet be replaced with OBS audio (latching, priming, or a
+// non-latched mic unit). Cleared when OBS stops, so a no-OBS recording falls open to the real mic.
+static volatile int32_t gVCamOBSStreaming = 0;
+void IVCAMSetOBSStreaming(int on) { __atomic_store_n(&gVCamOBSStreaming, on ? 1 : 0, __ATOMIC_RELEASE); }
+
 static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
                                             AudioUnitRenderActionFlags *ioActionFlags,
                                             const AudioTimeStamp *inTimeStamp,
@@ -686,6 +693,14 @@ static BOOL IVCAMMediaActiveTryLatch(AudioUnit inUnit, UInt32 bus, AudioBufferLi
     return YES;
 }
 
+// Real-time-safe: zero every buffer (silence the render output). Used to keep the real mic out
+// of a recording when OBS is streaming but we can't (yet) supply OBS audio on this unit.
+static inline void IVCAMMediaActiveMuteRT(AudioBufferList *ioData) {
+    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++)
+        if (ioData->mBuffers[i].mData)
+            memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+}
+
 static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
                                                 AudioUnitRenderActionFlags *ioActionFlags,
                                                 const AudioTimeStamp *inTimeStamp,
@@ -702,13 +717,24 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
     if (inOutputBusNumber > 1) return status;
     if (!IVCAMAtomicLoad32(&gCtx.enabled)) return status;
 
+    // A mic-INPUT element (bus 1) must never leak the real mic into a recording while OBS is
+    // streaming: it is replaced with OBS audio when latched, otherwise MUTED. Output elements
+    // (bus 0 = speaker) are never touched. When OBS is not streaming, muteLeak is false so mic
+    // inputs fall open to the real mic (normal recording keeps working).
+    BOOL muteLeak = (inOutputBusNumber == 1) &&
+                    (__atomic_load_n(&gVCamOBSStreaming, __ATOMIC_ACQUIRE) != 0);
+
     void *consumer = __atomic_load_n(&gCtx.consumerUnit, __ATOMIC_ACQUIRE);
     if (consumer == NULL) {
-        // Not latched yet: try to latch this unit, then fall open this call.
+        // Not latched yet: try to latch this unit; mute (not real mic) while OBS is streaming.
         IVCAMMediaActiveTryLatch(inUnit, inOutputBusNumber, ioData);
+        if (muteLeak) IVCAMMediaActiveMuteRT(ioData);
         return status;
     }
-    if (consumer != (void *)inUnit) return status;  // some other unit -> fall open
+    if (consumer != (void *)inUnit) {               // a different mic unit -> mute, never real mic
+        if (muteLeak) IVCAMMediaActiveMuteRT(ioData);
+        return status;
+    }
     // formatReady (acquire) publishes consumerBus + the tgt* fields written before
     // its release at latch, so read them only after this gate.
     if (!IVCAMAtomicLoad32(&gCtx.formatReady)) return status;
@@ -745,11 +771,10 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
     // mic, so a no-stream recording keeps working (fail-open).
     if (!gCtx.primed) {
         if (water == 0 || avail < water) {
-            if (avail > 0) {
-                for (uint32_t i = 0; i < ioData->mNumberBuffers; i++)
-                    if (ioData->mBuffers[i].mData)
-                        memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
-            }
+            // Priming: mute the real mic if OBS audio is already arriving (avail>0) OR OBS is
+            // streaming (muteLeak) — the latter covers the startup window before the first PCM
+            // lands, so the ~5s of external sound at record start is silenced instead of recorded.
+            if (avail > 0 || muteLeak) IVCAMMediaActiveMuteRT(ioData);
             return status;
         }
         gCtx.primed = 1;

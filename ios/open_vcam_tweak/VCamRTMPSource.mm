@@ -2,6 +2,7 @@
 #import "VCamConfig.h"
 #import "VCamH264Decoder.h"
 #import "VCamAACDecoder.h"
+#import "VCamAudioSink.h"
 #import "VCamFrameStore.h"
 #import "vcam_rtmp.h"
 
@@ -153,6 +154,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 if (!cfg.enabled) {
                     [[VCamFrameStore shared] setLive:NO];
                     [[VCamFrameStore shared] clear];
+                    IVCAMSetOBSStreaming(0);   // audio hook: fall open to the real mic
                     sleep(1);
                     continue;
                 }
@@ -180,6 +182,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 // real camera; a reconnect resumes from the kept frame. The decoder is kept too —
                 // it rebuilds on the reconnect's sequence header (configure always rebuilds).
                 [[VCamFrameStore shared] setLive:NO];
+                IVCAMSetOBSStreaming(0);   // OBS gone: audio hook falls open to the real mic
 
                 if (!self.stopFlag) {
                     VCamLog(@"rtmp: disconnected; retrying");

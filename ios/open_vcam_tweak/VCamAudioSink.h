@@ -16,6 +16,11 @@ extern "C" {
 void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
                              uint32_t srcRate, uint32_t srcCh);
 
+// Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). While set, mic-input renders
+// are muted rather than leaking the real mic when OBS audio can't yet be supplied; when clear,
+// mic inputs fall open to the real mic. Lets the audio hook silence the startup window.
+void IVCAMSetOBSStreaming(int on);
+
 #ifdef __cplusplus
 }
 #endif
