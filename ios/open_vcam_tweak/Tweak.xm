@@ -349,12 +349,13 @@ static void VCamDiagDumpEmit(id node, CMSampleBufferRef sb, CVImageBufferRef ib)
     if (seen[idx].n >= 2) return;
     seen[idx].n++;
 
-    CFDictionaryRef ibAtt = CVBufferGetAttachments(ib, kCVAttachmentMode_ShouldPropagate);
+    CFDictionaryRef ibAtt = CVBufferCopyAttachments(ib, kCVAttachmentMode_ShouldPropagate);
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sb);
     CFDictionaryRef ext = fmt ? CMFormatDescriptionGetExtensions(fmt) : NULL;
     VCamLog(@"DIAG-EMIT node=%p cls=%s dims=%zux%zu\n  ibAtt=%@\n  ext=%@",
-            (void *)node, class_getName(object_getClass(node)), w, h,
+            (__bridge void *)node, class_getName(object_getClass(node)), w, h,
             (__bridge NSDictionary *)ibAtt, (__bridge NSDictionary *)ext);
+    if (ibAtt) CFRelease(ibAtt);
 }
 #endif
 
