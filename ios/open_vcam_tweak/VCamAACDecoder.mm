@@ -56,6 +56,8 @@ typedef struct {
     }
 
     [self invalidate];   // rebuild cleanly on reconfigure
+    VCamLog(@"aac: ASC %lu bytes [%02x %02x] freqIdx=%u -> rate=%u chan=%u",
+            (unsigned long)asc.length, b[0], (asc.length > 1 ? b[1] : 0), freqIdx, rate, channels);
 
     AudioStreamBasicDescription in = {};
     in.mFormatID = kAudioFormatMPEG4AAC;
@@ -80,13 +82,14 @@ typedef struct {
         return NO;
     }
 
-    // Raw AAC (not ADTS): the AudioSpecificConfig IS the decompression magic cookie.
+    // The AudioSpecificConfig is the decompression magic cookie for raw AAC. Best-effort: AAC-LC
+    // decodes straight from the ASBD (rate/channels/1024 frames-per-packet), so a codec that
+    // rejects the cookie ('!dat' = kAudioCodecBadDataError, seen on this iOS AAC decoder for the
+    // 2-byte LC ASC) is NOT fatal — log and keep the converter.
     st = AudioConverterSetProperty(_conv, kAudioConverterDecompressionMagicCookie,
                                    (UInt32)asc.length, asc.bytes);
     if (st != noErr) {
-        VCamLog(@"aac: set magic cookie failed (%d)", (int)st);
-        AudioConverterDispose(_conv); _conv = NULL;
-        return NO;
+        VCamLog(@"aac: magic cookie rejected (%d) — decoding AAC-LC from ASBD", (int)st);
     }
 
     _outBuf = (int16_t *)malloc((size_t)kVCamAACMaxOutFrames * channels * sizeof(int16_t));
