@@ -39,7 +39,15 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable CVPixelBufferRef)rotatedFrameLocked;
 - (void)endEmitAccess;
 
-/// Drop the stored frames (e.g. on RTMP disconnect).
+/// Set the engine "live" flag (== _bLive / -setLive:, ivar 9). The emit overwrites ONLY when
+/// live AND a frame exists. The RTMP layer sets YES on connect and NO on disconnect WITHOUT
+/// clearing the frame — so a disconnected stream falls open to the real camera via this gate
+/// (not by dropping the frame), and a reconnect resumes from the kept last frame, exactly like
+/// the closed vcamera (whose clearCache never touches the camera frame 0x50/0x70; setLive: is
+/// driven from the RTMP accept callback).
+- (void)setLive:(BOOL)live;
+
+/// Drop the stored frames (e.g. on full stop). Does NOT change the live flag.
 - (void)clear;
 
 @end

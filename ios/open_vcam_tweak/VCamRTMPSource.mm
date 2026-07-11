@@ -108,6 +108,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
             @autoreleasepool {
                 VCamConfig *cfg = [VCamConfig shared];
                 if (!cfg.enabled) {
+                    [[VCamFrameStore shared] setLive:NO];
                     [[VCamFrameStore shared] clear];
                     sleep(1);
                     continue;
@@ -123,12 +124,19 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 }
 
                 VCamLog(@"rtmp: connecting %@", url);
+                // Live for the duration of the connection (== the original's setLive:YES from the
+                // RTMP accept callback). The emit overwrites only while live && a frame exists.
+                [[VCamFrameStore shared] setLive:YES];
                 vcam_rtmp_run(client, VCamRTMPMediaCallback,
                               (__bridge void *)self, &self->_stopFlag);
                 vcam_rtmp_destroy(client);
 
-                [[VCamFrameStore shared] clear];
-                [self.decoder invalidate];      // force fresh SPS/PPS on reconnect
+                // Disconnected: drop the live gate but KEEP the last OBS frame — faithful to the
+                // original, whose clearCache never clears the camera frame (0x50/0x70) and whose
+                // disconnect only does setLive:NO. The gate (not a frame drop) falls open to the
+                // real camera; a reconnect resumes from the kept frame. The decoder is kept too —
+                // it rebuilds on the reconnect's sequence header (configure always rebuilds).
+                [[VCamFrameStore shared] setLive:NO];
 
                 if (!self.stopFlag) {
                     VCamLog(@"rtmp: disconnected; retrying");
@@ -145,7 +153,8 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
 
 - (void)stop {
     self.stopFlag = 1;
-    [[VCamFrameStore shared] clear];
+    [[VCamFrameStore shared] setLive:NO];
+    [[VCamFrameStore shared] clear];   // full teardown: dropping the frame here is fine
 }
 
 @end

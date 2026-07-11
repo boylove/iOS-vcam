@@ -13,6 +13,7 @@
     CMSampleBufferRef _rawSample;            // raw decoded frame as CMSampleBuffer (== ivar 0x50)
     CVPixelBufferRef _rotated;               // CCW90 pre-rotated copy   (== engine ivar 0x70)
     VTPixelRotationSessionRef _rotSession;   // CCW90 rotation session   (== engine ivar 0x98)
+    BOOL _live;                              // overwrite gate           (== engine ivar 9 / _bLive)
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
 }
 
@@ -29,6 +30,7 @@
         _rawSample = NULL;
         _rotated = NULL;
         _rotSession = NULL;
+        _live = NO;
         // NSRecursiveLock, matching the closed vcamera's engine _lock (0x823f8) — the ingest
         // rotate and the emit transfer share it, and it can re-enter without self-deadlock.
         _lock = [[NSRecursiveLock alloc] init];
@@ -119,9 +121,18 @@
 
 - (BOOL)beginEmitAccess {
     [_lock lock];
-    if (_rawSample) return YES;   // lock stays held; NO age check (== modifyImageBuffer: 0x84498)
+    // Gate on _bLive AND a frame != NULL, exactly like modifyImageBuffer: (0x8448c: ldrb [x0,#9];
+    // 0x84498: ldr [x0,#0x50]). NO age check. On disconnect the RTMP layer sets _live = NO but
+    // KEEPS the frame, so this returns NO -> real camera, without dropping the last OBS frame.
+    if (_live && _rawSample) return YES;   // lock stays held
     [_lock unlock];
     return NO;
+}
+
+- (void)setLive:(BOOL)live {
+    [_lock lock];
+    _live = live;
+    [_lock unlock];
 }
 
 - (CVPixelBufferRef)rawFrameLocked {
