@@ -79,7 +79,7 @@
 // 150 ms cushion (was 80): the audio arrives over an SSH reverse tunnel that
 // batches TCP, so it comes in bursts; a bigger jitter buffer absorbs them and
 // cuts the start-up underruns. Raise via the JitterMs pref if the tunnel is worse.
-#define IVCAM_JITTER_MS_DEFAULT 150u
+#define IVCAM_JITTER_MS_DEFAULT 120u
 #define IVCAM_JITTER_MS_MIN 20u
 #define IVCAM_JITTER_MS_MAX 400u
 #define IVCAM_RELATCH_IDLE_US 3000000ull
@@ -639,6 +639,60 @@ static void IVCAMMediaActiveStartProducer(void) {
     });
 }
 
+#pragma mark - Control socket (live A/V-sync base tuning; no reboot)
+
+// mediaserverd's sandbox blocks every prefs FILE path, but it CAN use localhost sockets. This
+// tiny control server lets the A/V-sync base (JitterMs) be tuned LIVE over the USB tunnel with no
+// rebuild/reboot: listen on 127.0.0.1:47824, read one line ("jitter <ms>" or just "<ms>"), clamp
+// it, and apply. Forward the PC to it with `iproxy 47824 47824` and e.g. `echo 200 | nc 127.0.0.1
+// 47824`. If the bind is denied it just logs and exits (harmless; the compiled default stands).
+static void IVCAMMediaActiveControlLoop(void) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return;
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(47824);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        IVCAMMediaActiveLog(@"CONTROL bind 127.0.0.1:47824 failed errno=%d (live tuning unavailable)", errno);
+        close(lfd);
+        return;
+    }
+    if (listen(lfd, 4) != 0) { close(lfd); return; }
+    IVCAMMediaActiveLog(@"CONTROL listening on 127.0.0.1:47824 — send 'jitter <ms>' to tune A/V sync live");
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd < 0) { if (errno == EINTR) continue; break; }
+        char buf[128];
+        ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
+        if (n > 0) {
+            buf[n] = '\0';
+            int ms = 0;
+            if (sscanf(buf, "jitter %d", &ms) == 1 || sscanf(buf, "%d", &ms) == 1) {
+                if (ms < (int)IVCAM_JITTER_MS_MIN) ms = (int)IVCAM_JITTER_MS_MIN;
+                if (ms > (int)IVCAM_JITTER_MS_MAX) ms = (int)IVCAM_JITTER_MS_MAX;
+                gJitterMs = (uint32_t)ms;
+                IVCAMMediaActiveRecomputeWater();
+                IVCAMMediaActiveLog(@"CONTROL jitterMs set to %u (live)", gJitterMs);
+                char reply[64];
+                int rn = snprintf(reply, sizeof(reply), "OK jitterMs=%u\n", gJitterMs);
+                if (rn > 0) send(cfd, reply, (size_t)rn, 0);
+            }
+        }
+        close(cfd);
+    }
+    close(lfd);
+}
+
+static void IVCAMMediaActiveStartControl(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        IVCAMMediaActiveControlLoop();
+    });
+}
+
 #pragma mark - Render hook (render thread; real-time safe)
 
 // Attempt to latch this unit as the single consumer. Runs on the render thread but
@@ -817,12 +871,15 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         gCtx.primed = 1;
     }
 
-    // Smooth overload drop: if we are more than ~2x over the water level, advance our
-    // own readIdx (consumer-owned, SPSC-safe) to shed the oldest whole frames and
-    // bound latency. Capped per render so trims stay small.
-    if (water > 0 && avail > 2u * water) {
+    // Keep the buffer CLOSE to the water level so the audio latency stays ≈ the sync target
+    // (not wandering up to ~2.5x it, which is heard as a large, drifting lag). Trim the oldest
+    // whole frames back toward water whenever avail exceeds water by a small (¼-water) margin.
+    // Consumer-owned readIdx (SPSC-safe). Capped per render so each trim is a small, near-
+    // inaudible skip; the tiny sustained over-feed from the network just trims a frame now and
+    // then. The producer's 3x-water backlog cap is the hard bound for bursts.
+    if (water > 0 && avail > water + (water >> 2)) {
         uint32_t excess = avail - water;
-        uint32_t cap = need;  // never trim more than one render's worth per call
+        uint32_t cap = need;  // one render's worth per call -> small skips
         if (excess > cap) excess = cap;
         excess -= excess % tgtCh;
         if (excess > 0) {
@@ -1058,6 +1115,7 @@ static void IVCAMMediaActiveStartBackground(void) {
         // The producer thread runs for the process lifetime and idles while disabled,
         // so a later CFPreferences enable can reconnect without respawning it.
         IVCAMMediaActiveStartProducer();
+        IVCAMMediaActiveStartControl();   // live A/V-sync base tuning over 127.0.0.1:47824
 
         MSHookFunction((void *)AudioUnitRender, (void *)IVCAMMediaActiveAudioUnitRender,
                        (void **)&gOriginalAudioUnitRender);
