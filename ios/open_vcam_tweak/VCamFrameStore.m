@@ -34,6 +34,19 @@
         // NSRecursiveLock, matching the closed vcamera's engine _lock (0x823f8) — the ingest
         // rotate and the emit transfer share it, and it can re-enter without self-deadlock.
         _lock = [[NSRecursiveLock alloc] init];
+        // Create + configure the rotation session HERE at init — faithful to the closed vcamera's
+        // engine init (0x82650: EnableGPUAcceleratedTransfer + Rotation = CCW90) — NOT lazily on
+        // the first frame. VTPixelRotationSession is iOS 16+; on iOS 15 it stays NULL and
+        // create90Locked fails open (no rotation).
+        if (@available(iOS 16.0, *)) {
+            VTPixelRotationSessionRef rs = NULL;
+            if (VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs) == noErr && rs) {
+                VTSessionSetProperty(rs, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                     VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+                VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CCW90);
+                _rotSession = rs;
+            }
+        }
     }
     return self;
 }
@@ -64,19 +77,13 @@
     OSType fmt = CVPixelBufferGetPixelFormatType(src);
     if (w == 0 || h == 0) return NULL;
 
-    // VTPixelRotationSession is iOS 16+ (the tweak's real target is iOS 16 mediaserverd).
+    // The rotation session was created + configured at init (not here).
     if (@available(iOS 16.0, *)) {
-        if (!_rotSession) {
-            VTPixelRotationSessionRef rs = NULL;
-            if (VTPixelRotationSessionCreate(kCFAllocatorDefault, &rs) != noErr || !rs) return NULL;
-            // Config == engine init (0x82650): (GPU-accel) + Rotation = CCW90. No flip — the
-            // camera-overwrite path always rotates CCW90 for BOTH cameras; the front-camera
-            // selfie mirror is done by the downstream capture pipeline, not here.
-            VTSessionSetProperty(rs, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
-                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
-            VTSessionSetProperty(rs, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CCW90);
-            _rotSession = rs;
-        }
+        if (!_rotSession) return NULL;   // iOS 15 or init failure -> fail open (no rotation)
+        // Re-assert Rotation=CCW90 each call, faithful to create90ImageBuffer: (0x82b48). No flip
+        // — the camera-overwrite path rotates CCW90 for BOTH cameras; the front selfie mirror is
+        // the downstream pipeline's job. (GPU-accel was set once at init, 0x82650.)
+        VTSessionSetProperty(_rotSession, kVTPixelRotationPropertyKey_Rotation, kVTRotation_CCW90);
 
         NSDictionary *ioSurface = @{
             (__bridge id)CFSTR("IOSurfacePreallocPages")     : @0,
