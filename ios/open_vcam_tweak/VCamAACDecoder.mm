@@ -131,7 +131,7 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
     return noErr;
 }
 
-- (BOOL)decodeFrame:(const void *)data length:(size_t)len {
+- (BOOL)decodeFrame:(const void *)data length:(size_t)len ptsMs:(int64_t)ptsMs {
     if (!_conv || !_outBuf || !data || len == 0) return NO;
 
     VCamAACInput input;
@@ -161,7 +161,7 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
             VCamLog(@"aac: decode produced 0 frames #%llu (st=%d)", zeroCalls, (int)st);
         return NO;
     }
-    IVCAMMediaActivePushPCM(_outBuf, outPackets, _rate, _channels);
+    IVCAMMediaActivePushPCM(_outBuf, outPackets, _rate, _channels, ptsMs);
     return YES;
 }
 

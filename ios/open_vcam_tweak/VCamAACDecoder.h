@@ -16,7 +16,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Decode one raw AAC access unit (`data`/`len`) to int16 PCM and push it into the ring. No-op
 /// (returns NO) until configured. `data` need only remain valid for the duration of the call.
-- (BOOL)decodeFrame:(const void *)data length:(size_t)len;
+/// `ptsMs` is this frame's RTMP presentation timestamp (ms), forwarded for dynamic A/V sync.
+- (BOOL)decodeFrame:(const void *)data length:(size_t)len ptsMs:(int64_t)ptsMs;
 
 /// Tear down the converter (e.g. on stream reconfigure or disconnect).
 - (void)invalidate;

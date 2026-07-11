@@ -170,6 +170,14 @@ static uint32_t gAudioSourceRTMP = 1;
 static volatile int32_t gVCamOBSStreaming = 0;
 void IVCAMSetOBSStreaming(int on) { __atomic_store_n(&gVCamOBSStreaming, on ? 1 : 0, __ATOMIC_RELEASE); }
 
+// Dynamic A/V sync: RTMP PTS (ms) of the currently-displayed video frame (published by the H264
+// decoder) and of the newest audio sample written to the ring (published by the producer). The
+// consumer buffers ~(gAudioWritePTSms - gVideoPTSms) so the audio it plays lands on the shown
+// video's PTS. Both from the same OBS stream's timeline, so directly comparable; 0 = unknown.
+static volatile int64_t gVideoPTSms = 0;
+static volatile int64_t gAudioWritePTSms = 0;
+void IVCAMSetVideoPTS(int64_t ptsMs) { __atomic_store_n(&gVideoPTSms, ptsMs, __ATOMIC_RELEASE); }
+
 static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
                                             AudioUnitRenderActionFlags *ioActionFlags,
                                             const AudioTimeStamp *inTimeStamp,
@@ -471,8 +479,14 @@ static uint32_t IVCAMResampleLinear(const int16_t *in, uint32_t inFrames, uint32
 // gAudioSourceRTMP), so the shared scratch + SPSC ring stay single-producer-safe. NOT real-time
 // safe (allocation-free but not for the render thread); call only from an off-RT producer thread.
 void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
-                             uint32_t srcRate, uint32_t srcCh) {
+                             uint32_t srcRate, uint32_t srcCh, int64_t ptsMs) {
     if (!pcm || srcFrames == 0 || !(srcCh == 1 || srcCh == 2)) return;
+
+    // Publish the PTS of the newest sample in this frame (start + duration) for dynamic A/V sync.
+    if (ptsMs > 0 && srcRate > 0)
+        __atomic_store_n(&gAudioWritePTSms, ptsMs + (int64_t)srcFrames * 1000 / (int64_t)srcRate,
+                         __ATOMIC_RELEASE);
+
 
     // Park until a unit has latched its target format (no wrong-rate data into the ring).
     if (!IVCAMAtomicLoad32(&gCtx.formatReady)) {
@@ -603,7 +617,7 @@ static void IVCAMMediaActiveProducerLoop(void) {
 
                 // Adapt to the latched target format and enqueue (parks until formatReady).
                 uint32_t srcFrames = header.payloadLength / (srcCh * 2u);
-                IVCAMMediaActivePushPCM((const int16_t *)gProducerRecv, srcFrames, srcRate, srcCh);
+                IVCAMMediaActivePushPCM((const int16_t *)gProducerRecv, srcFrames, srcRate, srcCh, 0);
             }
 
             close(fd);
@@ -759,7 +773,26 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
     uint64_t t0 = mach_absolute_time();
 
     uint32_t need = inNumberFrames * tgtCh;  // total samples to emit
-    uint32_t water = IVCAMAtomicLoad32(&gCtx.targetWaterSamples);
+
+    // DYNAMIC A/V SYNC target: buffer ~(newest-audio-PTS - displayed-video-PTS) so the audio we
+    // play lands on the shown video's PTS, + a gJitterMs cushion for network jitter. Self-
+    // correcting (no fixed delay): when the video pipeline latency or the network shifts, the PTS
+    // difference shifts with it. Stored to targetWaterSamples so the producer's backlog cap and
+    // the priming/trim below all track the same dynamic target. Falls back to the fixed jitter
+    // water until both PTS clocks are known (0).
+    uint32_t water;
+    int64_t vpts = __atomic_load_n(&gVideoPTSms, __ATOMIC_ACQUIRE);
+    int64_t apts = __atomic_load_n(&gAudioWritePTSms, __ATOMIC_ACQUIRE);
+    if (vpts > 0 && apts > 0) {
+        int64_t targetMs = (apts - vpts) + (int64_t)gJitterMs;
+        if (targetMs < (int64_t)IVCAM_JITTER_MS_MIN) targetMs = (int64_t)IVCAM_JITTER_MS_MIN;
+        if (targetMs > (int64_t)IVCAM_JITTER_MS_MAX) targetMs = (int64_t)IVCAM_JITTER_MS_MAX;
+        water = (uint32_t)((uint64_t)targetMs * gCtx.tgtRate / 1000ull) * tgtCh;
+        IVCAMAtomicStore32(&gCtx.targetWaterSamples, water);
+    } else {
+        water = IVCAMAtomicLoad32(&gCtx.targetWaterSamples);
+    }
+
     uint32_t w = IVCAMAtomicLoad32(&gCtx.writeIdx);
     uint32_t r = gConsumerRead;
     uint32_t avail = w - r;
@@ -946,6 +979,18 @@ static void IVCAMMediaActiveBackgroundTick(void) {
                         IVCAMAtomicLoad64(&gCtx.parkedFrames),
                         IVCAMAtomicLoad64(&gCtx.unsupported),
                         fill, gCtx.primed);
+    // A/V sync telemetry: the PTS gap (newest audio − displayed video) is the dynamic part of the
+    // buffer target; targetWater(ms) is what the consumer is actually holding. If audio still
+    // leads/lags in steady state, tune the base JitterMs pref (live).
+    {
+        int64_t vpts = __atomic_load_n(&gVideoPTSms, __ATOMIC_ACQUIRE);
+        int64_t apts = __atomic_load_n(&gAudioWritePTSms, __ATOMIC_ACQUIRE);
+        uint32_t tw = IVCAMAtomicLoad32(&gCtx.targetWaterSamples);
+        uint32_t twMs = (gCtx.tgtRate && gCtx.tgtChannels)
+            ? (uint32_t)((uint64_t)tw * 1000ull / ((uint64_t)gCtx.tgtRate * gCtx.tgtChannels)) : 0;
+        IVCAMMediaActiveLog(@"MEDIA_ACTIVE_SYNC videoPTS=%lld audioPTS=%lld leadMs=%lld jitterMs=%u targetWaterMs=%u",
+                            vpts, apts, apts - vpts, gJitterMs, twMs);
+    }
     IVCAMMediaActiveLog(@"MEDIA_ACTIVE_RENDER_TIME lastNs=%llu maxNs=%llu periodOverruns=%llu",
                         __atomic_load_n(&gCtx.renderNsLast, __ATOMIC_RELAXED),
                         __atomic_load_n(&gCtx.renderNsMax, __ATOMIC_RELAXED),

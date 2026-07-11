@@ -91,7 +91,6 @@
 //   [1] AACPacketType (0 = AudioSpecificConfig seq header, 1 = raw AAC frame)  [AAC only]
 //   [2..] AudioSpecificConfig (seq header) OR one raw AAC access unit
 - (void)handleAudioTag:(const uint8_t *)data length:(size_t)len timestampMs:(uint32_t)ts {
-    (void)ts;   // the ring/render path is rate-driven + jitter-buffered, not PTS-driven
     if (len < 1) return;
     uint8_t soundFormat = (data[0] >> 4) & 0x0F;
 
@@ -116,7 +115,7 @@
             VCamLog(@"rtmp: aac configure failed");
         }
     } else if (aacPacketType == 1) {           // raw AAC access unit
-        [self.aacDecoder decodeFrame:body length:bodyLen];
+        [self.aacDecoder decodeFrame:body length:bodyLen ptsMs:(int64_t)ts];
     }
 }
 

@@ -1,5 +1,6 @@
 #import "VCamH264Decoder.h"
 #import "VCamFrameStore.h"
+#import "VCamAudioSink.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <time.h>
@@ -120,7 +121,7 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
                              CVImageBufferRef imageBuffer,
                              CMTime presentationTimeStamp,
                              CMTime presentationDuration) {
-    (void)sourceFrameRefCon;
+    int64_t vptsMs = (int64_t)(intptr_t)sourceFrameRefCon;   // RTMP PTS threaded from decodeAccessUnit
     (void)infoFlags;
     (void)presentationTimeStamp;
     (void)presentationDuration;
@@ -178,6 +179,8 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         if (CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, imageBuffer, true, NULL, NULL,
                                                fmt, &timing, &sb) == noErr && sb) {
             [[VCamFrameStore shared] ingestSampleBuffer:sb];
+            // Publish the just-ingested (now displayed) frame's RTMP PTS for dynamic A/V sync.
+            IVCAMSetVideoPTS(vptsMs);
             CFRelease(sb);
         }
         CFRelease(fmt);
@@ -308,8 +311,13 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
 
     VTDecodeInfoFlags infoOut = 0;
     // Synchronous decode: callback fires before this returns — simpler/robust in mediaserverd.
+    // Thread the RTMP presentation PTS (dts+cts, ms) through as the sourceFrameRefCon so the output
+    // callback can publish the DISPLAYED video PTS for dynamic A/V sync. This is passive metadata —
+    // it does NOT feed sample timing to the decoder (still faithful: numSampleTimingEntries=0).
+    int64_t ptsMs = dtsMs + (int64_t)compositionTimeMs;
+    void *ptsRef = (void *)(intptr_t)ptsMs;
     status = VTDecompressionSessionDecodeFrame(
-        _session, sampleBuffer, 0, NULL, &infoOut);
+        _session, sampleBuffer, 0, ptsRef, &infoOut);
     CFRelease(sampleBuffer);
 
     if (status != noErr) {
