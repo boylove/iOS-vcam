@@ -79,7 +79,7 @@
 // 150 ms cushion (was 80): the audio arrives over an SSH reverse tunnel that
 // batches TCP, so it comes in bursts; a bigger jitter buffer absorbs them and
 // cuts the start-up underruns. Raise via the JitterMs pref if the tunnel is worse.
-#define IVCAM_JITTER_MS_DEFAULT 150u
+#define IVCAM_JITTER_MS_DEFAULT 60u
 #define IVCAM_JITTER_MS_MIN 20u
 #define IVCAM_JITTER_MS_MAX 400u
 #define IVCAM_RELATCH_IDLE_US 3000000ull
@@ -726,10 +726,20 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
     uint32_t r = gConsumerRead;
     uint32_t avail = w - r;
 
-    // Jitter buffer priming: hold (fall open to real mic) until the buffer first
-    // reaches the target water level, so replacement starts with a cushion.
+    // Jitter buffer priming: hold until the buffer first reaches the target water level, so
+    // replacement starts with a cushion. While priming, if OBS audio is already arriving (the
+    // producer has fed since latch -> avail>0), MUTE the real mic so no external sound leaks into
+    // the recording before OBS takes over. If avail==0 (nothing streaming) fall open to the real
+    // mic, so a no-stream recording keeps working (fail-open).
     if (!gCtx.primed) {
-        if (water == 0 || avail < water) return status;
+        if (water == 0 || avail < water) {
+            if (avail > 0) {
+                for (uint32_t i = 0; i < ioData->mNumberBuffers; i++)
+                    if (ioData->mBuffers[i].mData)
+                        memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+            }
+            return status;
+        }
         gCtx.primed = 1;
     }
 
