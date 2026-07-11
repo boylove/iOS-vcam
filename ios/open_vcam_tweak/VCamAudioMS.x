@@ -754,7 +754,7 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         // thread; running it on EVERY unlatched render across TikTok's many VoiceProcessing units
         // blew the HAL budget -> mediaserverd crash-loop. Rate-limit to ~one probe / 200ms (global,
         // across all units); muting (never real mic) covers the gap while OBS streams.
-        uint64_t nowUs = IVCAMMediaActiveNowUs();
+        uint64_t nowUs = IVCAMNowUs();
         uint64_t lastTry = __atomic_load_n(&gLastLatchTryUs, __ATOMIC_RELAXED);
         if (nowUs - lastTry > 200000ull) {
             __atomic_store_n(&gLastLatchTryUs, nowUs, __ATOMIC_RELAXED);
