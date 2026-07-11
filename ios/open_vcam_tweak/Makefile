@@ -38,7 +38,7 @@ endif
 ifdef VCAM_DEST_MATRIX_709
 OpenVCam_CFLAGS += -DVCAM_DEST_MATRIX_709=$(VCAM_DEST_MATRIX_709)
 endif
-OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox AudioUnit
+OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."
