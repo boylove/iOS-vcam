@@ -818,15 +818,14 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         gCtx.primed = 1;
     }
 
-    // Keep the buffer CLOSE to the water level so audio latency ≈ the sync target instead of
-    // wandering up toward the producer's backlog cap (heard as a large drifting lag). Trim the
-    // oldest whole frames back toward water once avail exceeds it by a ¼-water margin. Consumer-
-    // owned readIdx (SPSC-safe). Capped at one render's worth per call -> each trim is a small,
-    // near-inaudible skip. Pure arithmetic; no added realtime cost (does not touch the overload).
+    // Keep the buffer CLOSE to the water level so audio latency ≈ the sync target. AGGRESSIVE
+    // one-shot catch-up: drop ALL excess above water in a single step (not capped to one render),
+    // so a backlog that formed before recording started — or after a stall/relatch — is discarded
+    // immediately instead of draining slowly while the producer keeps writing. O(1) (just advances
+    // readIdx, consumer-owned, SPSC-safe); the discarded span is one forward skip, not a lingering
+    // lag. In steady state avail sits near water so excess is tiny.
     if (water > 0 && avail > water + (water >> 2)) {
-        uint32_t excess = avail - water;
-        uint32_t cap = need;  // never trim more than one render's worth per call
-        if (excess > cap) excess = cap;
+        uint32_t excess = avail - water;   // drop the WHOLE backlog down to water, in one shot
         excess -= excess % tgtCh;
         if (excess > 0) {
             r += excess;
@@ -977,7 +976,9 @@ static void IVCAMMediaActiveBackgroundTick(void) {
     uint32_t w = IVCAMAtomicLoad32(&gCtx.writeIdx);
     uint32_t r = IVCAMAtomicLoad32(&gCtx.readIdx);
     uint32_t fill = w - r;
-    IVCAMMediaActiveLog(@"MEDIA_ACTIVE_STATS render=%llu replaced=%llu underruns=%llu trimDrops=%llu overflowDrops=%llu parked=%llu unsupported=%llu fill=%u primed=%u",
+    uint32_t fillMs = (gCtx.tgtRate && gCtx.tgtChannels)
+        ? (uint32_t)((uint64_t)fill * 1000ull / ((uint64_t)gCtx.tgtRate * gCtx.tgtChannels)) : 0;
+    IVCAMMediaActiveLog(@"MEDIA_ACTIVE_STATS render=%llu replaced=%llu underruns=%llu trimDrops=%llu overflowDrops=%llu parked=%llu unsupported=%llu fill=%u fillMs=%u primed=%u",
                         IVCAMAtomicLoad64(&gCtx.renderCalls),
                         IVCAMAtomicLoad64(&gCtx.replaced),
                         IVCAMAtomicLoad64(&gCtx.underruns),
@@ -985,7 +986,7 @@ static void IVCAMMediaActiveBackgroundTick(void) {
                         IVCAMAtomicLoad64(&gCtx.overflowDrops),
                         IVCAMAtomicLoad64(&gCtx.parkedFrames),
                         IVCAMAtomicLoad64(&gCtx.unsupported),
-                        fill, gCtx.primed);
+                        fill, fillMs, gCtx.primed);
     // A/V sync telemetry: the PTS gap (newest audio − displayed video) is the dynamic part of the
     // buffer target; targetWater(ms) is what the consumer is actually holding. If audio still
     // leads/lags in steady state, tune the base JitterMs pref (live).
