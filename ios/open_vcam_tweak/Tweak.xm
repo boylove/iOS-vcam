@@ -115,8 +115,12 @@ static CFStringRef VCamDestMatrix(void) {
 }
 
 // AVCaptureDevicePosition: 0 unspecified, 1 back, 2 front. Updated from the
-// FigCaptureSourceConfiguration -sourcePosition hook; drives front-camera auto-mirror
-// (the original hooks this too, report §3.8).
+// FigCaptureSourceConfiguration -sourcePosition hook. CURRENTLY UNUSED: the camera-overwrite
+// path is position-independent (create90 = CCW90 for both cameras, no flip — the front mirror
+// is the downstream pipeline's job, since 0.6.11). The original DOES consume its position, but
+// in the run-loop rotation path (ivar 0x100 -> 0x83e20, buffers 0xc8/0xd0) which OpenVCam does
+// NOT replicate — so this hook has no consumer here. Pending decision: remove it, or replicate
+// that run-loop path.
 static volatile long gSourcePosition = 0;
 
 // ---------------------------------------------------------------------------
