@@ -708,6 +708,11 @@ static BOOL IVCAMMediaActiveTryLatch(AudioUnit inUnit, UInt32 bus, AudioBufferLi
     return YES;
 }
 
+// Rate-limit gate for the unlatched-state format probe (TryLatch's AudioUnitGetProperty): its
+// last attempt time in monotonic us. Calling AudioUnitGetProperty on EVERY unlatched render across
+// TikTok's many VoiceProcessing units blew the HAL RT budget -> mediaserverd crash-loop.
+static volatile uint64_t gLastLatchTryUs = 0;
+
 // Real-time-safe: zero every buffer (silence the render output). Used to keep the real mic out
 // of a recording when OBS is streaming but we can't (yet) supply OBS audio on this unit.
 static inline void IVCAMMediaActiveMuteRT(AudioBufferList *ioData) {
@@ -745,8 +750,16 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
 
     void *consumer = __atomic_load_n(&gCtx.consumerUnit, __ATOMIC_ACQUIRE);
     if (consumer == NULL) {
-        // Not latched yet: try to latch this unit; mute (not real mic) while OBS is streaming.
-        IVCAMMediaActiveTryLatch(inUnit, inOutputBusNumber, ioData);
+        // Not latched yet. TryLatch does a synchronous AudioUnitGetProperty — NOT cheap on the RT
+        // thread; running it on EVERY unlatched render across TikTok's many VoiceProcessing units
+        // blew the HAL budget -> mediaserverd crash-loop. Rate-limit to ~one probe / 200ms (global,
+        // across all units); muting (never real mic) covers the gap while OBS streams.
+        uint64_t nowUs = IVCAMMediaActiveNowUs();
+        uint64_t lastTry = __atomic_load_n(&gLastLatchTryUs, __ATOMIC_RELAXED);
+        if (nowUs - lastTry > 200000ull) {
+            __atomic_store_n(&gLastLatchTryUs, nowUs, __ATOMIC_RELAXED);
+            IVCAMMediaActiveTryLatch(inUnit, inOutputBusNumber, ioData);
+        }
         if (muteLeak) IVCAMMediaActiveMuteRT(ioData);
         return status;
     }
