@@ -109,10 +109,14 @@ static NSTimeInterval VCamNow(void) {
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) return;
     [_lock lock];
-    // Store the raw sample buffer -> _rawSample (== CMSampleBufferCreateCopy into ivar 0x50).
-    CFRetain(sampleBuffer);
-    if (_rawSample) CFRelease(_rawSample);
-    _rawSample = sampleBuffer;
+    // Store a COPY of the raw sample buffer -> _rawSample, EXACTLY like the original's
+    // setYUVSampleBuffer: (0x82e24) which does CMSampleBufferCreateCopy into ivar 0x50 — an
+    // INDEPENDENT object preserving timing + format description + attachments, not a bare retain.
+    CMSampleBufferRef copy = NULL;
+    if (CMSampleBufferCreateCopy(kCFAllocatorDefault, sampleBuffer, &copy) == noErr && copy) {
+        if (_rawSample) CFRelease(_rawSample);
+        _rawSample = copy;
+    }
     // CCW90 pre-rotated of its image buffer -> _rotated (== create90ImageBuffer: into ivar
     // 0x70). Both stored under the one lock, exactly like setYUVSampleBuffer:.
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
