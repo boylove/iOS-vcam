@@ -378,6 +378,18 @@ static void IVCAMRingWrite(const int16_t *src, uint32_t n) {
     if (n == 0) return;
     uint32_t w = gProducerWrite;
     uint32_t r = IVCAMAtomicLoad32(&gCtx.readIdx);
+    // Latency backstop: if the consumer has fallen far behind (stalled, or a wrong/idle unit
+    // latched so nobody drains), the backlog would play seconds-stale and wreck lip-sync. Discard
+    // the whole backlog and resume writing fresh from the read point, so audio latency is bounded
+    // regardless of the consumer. SPSC-safe: the producer owns writeIdx, and a consumer this far
+    // behind is not draining, so no live read is corrupted (worst case one faded frame).
+    uint32_t backlogCap = gCtx.targetWaterSamples ? (3u * gCtx.targetWaterSamples) : 16384u;
+    if (w - r > backlogCap) {
+        IVCAMAtomicAdd64(&gCtx.overflowDrops, w - r);
+        w = r;
+        gProducerWrite = w;
+        IVCAMAtomicStore32(&gCtx.writeIdx, w);
+    }
     uint32_t used = w - r;
     uint32_t freeSamples = IVCAM_RING_SAMPLES - used;
     if (n > freeSamples) {
