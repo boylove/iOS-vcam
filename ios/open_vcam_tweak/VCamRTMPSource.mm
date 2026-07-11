@@ -74,8 +74,11 @@
         if (naluTags <= 3 || (naluTags % 120) == 0)
             VCamDebugLog(@"rtmp: NALU tag #%llu bodyLen=%zu cts=%d", naluTags, bodyLen, cts);
 #endif
-        NSData *avcc = [NSData dataWithBytes:body length:bodyLen];
-        [self.decoder decodeAccessUnit:avcc compositionTimeMs:cts dtsMs:(int64_t)ts];
+        // Feed the NAL data straight to the decoder with NO intermediate NSData copy — faithful
+        // to the original's zero-copy chain (librtmp reassembles the whole message into a
+        // contiguous m_body, handed as a raw pointer to -decode:size:). `body` points into the
+        // RTMP reader's buffer and is valid for the duration of this synchronous decode.
+        [self.decoder decodeAccessUnit:body length:bodyLen compositionTimeMs:cts dtsMs:(int64_t)ts];
     }
 }
 

@@ -12,10 +12,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// Extracts SPS/PPS and the NAL-unit length size. Returns NO on parse failure.
 - (BOOL)configureWithAVCDecoderConfigurationRecord:(NSData *)record;
 
-/// Decode one access unit. `avccData` is one or more NAL units, each prefixed
+/// Decode one access unit. `data`/`len` is one or more NAL units, each prefixed
 /// by a big-endian length of `naluLengthSize` bytes (as delivered by FLV).
 /// No-op (returns NO) until configured.
-- (BOOL)decodeAccessUnit:(NSData *)avccData
+///
+/// ZERO-COPY, faithful to the original's `-decode:size:` (0x87390), whose input is a
+/// raw `(void *, int)` wrapped no-copy (kCFAllocatorNull) straight from librtmp's reassembled
+/// `m_body` — no intermediate NSData. `data` MUST stay valid until this returns; it does,
+/// because the RTMP reader thread calls this synchronously and the VT decode below is
+/// synchronous (flags=0), so the block buffer is fully consumed before `data` is reused.
+- (BOOL)decodeAccessUnit:(const void *)data
+                  length:(size_t)len
      compositionTimeMs:(int32_t)compositionTimeMs
                  dtsMs:(int64_t)dtsMs;
 

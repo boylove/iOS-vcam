@@ -267,7 +267,8 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
 
 #pragma mark - Decode
 
-- (BOOL)decodeAccessUnit:(NSData *)avccData
+- (BOOL)decodeAccessUnit:(const void *)data
+                  length:(size_t)len
      compositionTimeMs:(int32_t)compositionTimeMs
                  dtsMs:(int64_t)dtsMs {
 #if VCAM_DEBUG
@@ -275,17 +276,19 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     auCalls++;
     if (auCalls <= 3 || (auCalls % 120) == 0)
         VCamDebugLog(@"decoder: decodeAccessUnit #%llu len=%lu session=%p fmt=%p",
-                     auCalls, (unsigned long)avccData.length, _session, _formatDesc);
+                     auCalls, (unsigned long)len, _session, _formatDesc);
 #endif
-    if (!_session || !_formatDesc || avccData.length == 0) return NO;
+    if (!_session || !_formatDesc || !data || len == 0) return NO;
 
-    // Wrap the AVCC data WITHOUT copying, faithful to the original (RE 0x873ec:
-    // CMBlockBufferCreateWithMemoryBlock, blockAllocator = kCFAllocatorNull). Safe because the
-    // decode below is SYNCHRONOUS (flags=0), so avccData outlives the whole decode call.
+    // Wrap the AVCC data WITHOUT copying, faithful to the original's -decode:size: (RE 0x873ec:
+    // CMBlockBufferCreateWithMemoryBlock, blockAllocator = kCFAllocatorNull), straight over the
+    // RTMP payload — NO intermediate NSData. Safe because the RTMP reader calls this synchronously
+    // and the decode below is SYNCHRONOUS (flags=0), so `data` outlives the whole decode call
+    // (the block buffer is fully read before this method returns and `data` is reused).
     CMBlockBufferRef blockBuffer = NULL;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault, (void *)avccData.bytes, avccData.length, kCFAllocatorNull,
-        NULL, 0, avccData.length, 0, &blockBuffer);
+        kCFAllocatorDefault, (void *)data, len, kCFAllocatorNull,
+        NULL, 0, len, 0, &blockBuffer);
     if (status != noErr || !blockBuffer) return NO;
 
     // NO sample timing — faithful to the closed vcamera's decode input (RE 0x87440):
@@ -295,7 +298,7 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     // residual frames, network jitter). The RTMP dtsMs/compositionTimeMs stay in the method
     // signature but are no longer used for decode timing, exactly like the original.
     (void)compositionTimeMs; (void)dtsMs;
-    size_t sampleSize = avccData.length;
+    size_t sampleSize = len;
     CMSampleBufferRef sampleBuffer = NULL;
     status = CMSampleBufferCreateReady(
         kCFAllocatorDefault, blockBuffer, _formatDesc, 1, 0, NULL,
