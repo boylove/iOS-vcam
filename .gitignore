@@ -167,3 +167,26 @@ credentials/
 
 # Auto Claude data directory
 .auto-claude/
+
+# ----------------------------------------------------------------------------
+# Reverse-engineering scratch & external tooling (KEPT ON DISK, just not tracked)
+# ----------------------------------------------------------------------------
+
+# Downloaded external tools (libimobiledevice, theos, etc.) — large & regenerable
+tools/
+
+# RE working set: original binary + disassembly scripts/dumps + analysis scratch
+_orig_vcamera.dylib
+_orig_vcamera.plist
+_re_static/
+_analysis_iosvcam_base/
+_build_out/
+
+# Theos/tweak build outputs
+ios/*/packages/
+ios/*/.theos/
+ios/*/obj/
+
+# Literal "[app]" HLS output dir — the existing objs/nginx/html/[app]/ rule above is a
+# broken glob (brackets are a character class in gitignore), so escape them here
+objs/nginx/html/\[app\]/
