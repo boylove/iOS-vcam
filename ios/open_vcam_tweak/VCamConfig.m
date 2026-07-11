@@ -26,8 +26,6 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
 @interface VCamConfig ()
 @property (atomic, readwrite) BOOL enabled;
 @property (atomic, copy, readwrite) NSString *rtmpURL;
-@property (atomic, readwrite) BOOL mirror;
-@property (atomic, readwrite) NSInteger rotation;
 @property (nonatomic, strong) dispatch_source_t timer;
 @property (nonatomic, copy) NSString *lastSignature;
 @end
@@ -46,8 +44,6 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
     if (self) {
         _enabled = NO;
         _rtmpURL = VCAM_DEFAULT_RTMP;
-        _mirror = NO;
-        _rotation = 0;
         [self reloadNow];
         [self startTimer];
     }
@@ -110,27 +106,19 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
         rtmpURL = [rtmpValue copy];
     }
 
-    id mirrorValue = plist[@"mirror"] ?: plist[@"Mirror"];
-    BOOL mirror = [mirrorValue respondsToSelector:@selector(boolValue)]
-                      ? [mirrorValue boolValue] : NO;
-
-    id rotationValue = plist[@"rotation"] ?: plist[@"Rotation"];
-    NSInteger rotation = [rotationValue respondsToSelector:@selector(integerValue)]
-                             ? [rotationValue integerValue] : 0;
-    if (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270) rotation = 0;
-
     self.enabled = enabled;
     self.rtmpURL = rtmpURL;
-    self.mirror = mirror;
-    self.rotation = rotation;
 
-    // Log only when something changes, so it never spams.
-    NSString *sig = [NSString stringWithFormat:@"%@|%d|%d|%ld|%@",
-                     source ?: @"defaults", enabled, mirror, (long)rotation, rtmpURL];
+    // Log only when something changes, so it never spams. NO mirror/rotation knobs: the
+    // camera-overwrite path rotates a fixed CCW90 (== create90ImageBuffer: 0x82b48) and never
+    // flips (the front selfie mirror is the downstream pipeline's job), exactly like the closed
+    // vcamera — there is nothing for a user rotation/mirror setting to drive on that path.
+    NSString *sig = [NSString stringWithFormat:@"%@|%d|%@",
+                     source ?: @"defaults", enabled, rtmpURL];
     if (![sig isEqualToString:self.lastSignature]) {
         self.lastSignature = sig;
-        VCamLog(@"config source=%@ enabled=%d mirror=%d rotation=%ld url=%@",
-                source ?: @"defaults", enabled, mirror, (long)rotation, rtmpURL);
+        VCamLog(@"config source=%@ enabled=%d url=%@",
+                source ?: @"defaults", enabled, rtmpURL);
     }
 }
 

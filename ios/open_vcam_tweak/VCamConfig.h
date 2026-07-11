@@ -20,12 +20,6 @@ NS_ASSUME_NONNULL_BEGIN
 /// vc.plist `rtmp` key is empty (mirrors vcam-smart-rtmp-fallback).
 @property (atomic, copy, readonly) NSString *rtmpURL;
 
-/// Horizontal mirror the injected frame (front-camera feel). Default NO.
-@property (atomic, readonly) BOOL mirror;
-
-/// Clockwise rotation applied to the injected frame: 0/90/180/270. Default 0.
-@property (atomic, readonly) NSInteger rotation;
-
 /// Force an immediate reload (also happens automatically on a 1.5s timer).
 - (void)reloadNow;
 
