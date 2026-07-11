@@ -57,13 +57,13 @@ typedef struct {
 
     [self invalidate];   // rebuild cleanly on reconfigure
 
-    AudioStreamBasicDescription in = {0};
+    AudioStreamBasicDescription in = {};
     in.mFormatID = kAudioFormatMPEG4AAC;
     in.mSampleRate = rate;
     in.mChannelsPerFrame = channels;
     in.mFramesPerPacket = 1024;   // AAC-LC access unit
 
-    AudioStreamBasicDescription out = {0};
+    AudioStreamBasicDescription out = {};
     out.mFormatID = kAudioFormatLinearPCM;
     out.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
     out.mSampleRate = rate;
@@ -126,7 +126,10 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
 - (BOOL)decodeFrame:(const void *)data length:(size_t)len {
     if (!_conv || !_outBuf || !data || len == 0) return NO;
 
-    VCamAACInput input = { .data = data, .len = (UInt32)len, .consumed = 0 };
+    VCamAACInput input;
+    input.data = data;
+    input.len = (UInt32)len;
+    input.consumed = 0;   // input.pd is filled in by the pull proc before it is read
 
     AudioBufferList abl;
     abl.mNumberBuffers = 1;
