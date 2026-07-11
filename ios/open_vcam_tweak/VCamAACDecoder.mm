@@ -61,6 +61,7 @@ typedef struct {
 
     AudioStreamBasicDescription in = {};
     in.mFormatID = kAudioFormatMPEG4AAC;
+    in.mFormatFlags = kMPEG4Object_AAC_LC;   // tell the decoder it's LC (no cookie is accepted)
     in.mSampleRate = rate;
     in.mChannelsPerFrame = channels;
     in.mFramesPerPacket = 1024;   // AAC-LC access unit
@@ -144,7 +145,11 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
     abl.mBuffers[0].mDataByteSize = kVCamAACMaxOutFrames * _channels * (UInt32)sizeof(int16_t);
     abl.mBuffers[0].mData = _outBuf;
 
-    UInt32 outPackets = kVCamAACMaxOutFrames;   // LPCM: 1 frame per packet
+    // Request EXACTLY one AAC-LC access unit's worth of output (1024 frames). Asking for more
+    // makes the converter pull a SECOND input packet, hit the input proc's 0-return, treat it as
+    // end-of-stream, and stop producing after the first packets (the silent 0-frame stall). One
+    // packet in, one packet's frames out — the converter is satisfied and never sees EOS.
+    UInt32 outPackets = 1024;
     OSStatus st = AudioConverterFillComplexBuffer(_conv, VCamAACInputProc, &input,
                                                   &outPackets, &abl, NULL);
     // The input proc supplies a single packet then returns 0, so a benign "ran out of input"
