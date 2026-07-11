@@ -12,7 +12,7 @@ NS_ASSUME_NONNULL_BEGIN
 ///   pre-rotates a CCW90 copy (faithful to `setYUVSampleBuffer:` 0x82ddc ->
 ///   `create90ImageBuffer:` 0x829e0).
 /// - The capture-hook thread wraps its pick + VTPixelTransfer in
-///   `-beginEmitAccessWithMaxAge:` / `-endEmitAccess`, so the transfer runs in the SAME
+///   `-beginEmitAccess` / `-endEmitAccess`, so the transfer runs in the SAME
 ///   critical section as the ingest rotation (faithful to `modifyImageBuffer:` 0x84458,
 ///   which also holds ivar 0x18). That single shared lock is what serialises the rotation
 ///   and the transfer so they never overlap on the GPU — splitting it into two locks is
@@ -28,11 +28,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// like the original's Helper -imageBufferToSampleBuffer:timeStamp: -> -outputFrame: chain.
 - (void)ingestSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 
-/// Capture-thread emit: acquire the engine lock and confirm a fresh frame exists (younger
-/// than `maxAgeSeconds`). Returns NO with the lock NOT held when none. On YES the caller
-/// reads `-rawFrameLocked` / `-rotatedFrameLocked`, does its single transfer, then MUST call
-/// `-endEmitAccess`. The buffers are valid only between begin/end.
-- (BOOL)beginEmitAccessWithMaxAge:(NSTimeInterval)maxAgeSeconds;
+/// Capture-thread emit: acquire the engine lock and confirm a frame exists. Returns NO with
+/// the lock NOT held when there is none. On YES the caller reads `-rawFrameLocked` /
+/// `-rotatedFrameLocked`, does its single transfer, then MUST call `-endEmitAccess`. The
+/// buffers are valid only between begin/end. NO staleness/age check — faithful to
+/// modifyImageBuffer: (0x84458) which gates ONLY on _bLive + ivar 0x50 != NULL (a stalled
+/// stream keeps overwriting with the last OBS frame; a disconnect clears it via -clear).
+- (BOOL)beginEmitAccess;
 - (nullable CVPixelBufferRef)rawFrameLocked;
 - (nullable CVPixelBufferRef)rotatedFrameLocked;
 - (void)endEmitAccess;

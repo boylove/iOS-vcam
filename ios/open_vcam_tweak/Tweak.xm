@@ -50,7 +50,6 @@
 // ---------------------------------------------------------------------------
 
 #define VCAM_LOG_NAME @"OpenVCam.log"
-static const NSTimeInterval kVCamFrameMaxAge = 0.5;   // watchdog: 500ms
 
 // VCAM_DEST_COLOR (default 1 = ON, matching the closed vcamera). Sets the transfer
 // session's DESTINATION colour (ITU-R 709 primaries/transfer, per-path YCbCr matrix),
@@ -307,7 +306,7 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // setYUVSampleBuffer: and modifyImageBuffer:). NO rotation and NO flip here: the ingest
     // already produced the CCW90 buffer, and the front-camera selfie mirror is the downstream
     // capture pipeline's job (as it is for the real front camera).
-    if (![store beginEmitAccessWithMaxAge:kVCamFrameMaxAge]) { gRNoFresh++; return NO; }
+    if (![store beginEmitAccess]) { gRNoFresh++; return NO; }
     CVPixelBufferRef raw = [store rawFrameLocked];
     CVPixelBufferRef rot = [store rotatedFrameLocked];
     // Pick raw (same orientation as dst) vs the CCW90 pre-rotated (differing) — exactly the

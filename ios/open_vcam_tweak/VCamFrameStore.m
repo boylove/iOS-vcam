@@ -13,7 +13,6 @@
     CMSampleBufferRef _rawSample;            // raw decoded frame as CMSampleBuffer (== ivar 0x50)
     CVPixelBufferRef _rotated;               // CCW90 pre-rotated copy   (== engine ivar 0x70)
     VTPixelRotationSessionRef _rotSession;   // CCW90 rotation session   (== engine ivar 0x98)
-    NSTimeInterval _updatedAt;
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
 }
 
@@ -30,7 +29,6 @@
         _rawSample = NULL;
         _rotated = NULL;
         _rotSession = NULL;
-        _updatedAt = 0;
         // NSRecursiveLock, matching the closed vcamera's engine _lock (0x823f8) — the ingest
         // rotate and the emit transfer share it, and it can re-enter without self-deadlock.
         _lock = [[NSRecursiveLock alloc] init];
@@ -49,11 +47,6 @@
         }
         CFRelease(_rotSession);
     }
-}
-
-static NSTimeInterval VCamNow(void) {
-    // Monotonic seconds; avoids wall-clock jumps.
-    return (NSTimeInterval)clock_gettime_nsec_np(CLOCK_MONOTONIC) / (NSTimeInterval)NSEC_PER_SEC;
 }
 
 // Faithful port of the closed vcamera's `create90ImageBuffer:` (0x829e0): CCW90-rotate
@@ -121,13 +114,12 @@ static NSTimeInterval VCamNow(void) {
     CMSampleBufferCreateCopy(kCFAllocatorDefault, sampleBuffer, &_rawSample);   // _rawSample = NULL on failure
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
     _rotated = [self create90Locked:(CVPixelBufferRef)imageBuffer];
-    _updatedAt = VCamNow();
     [_lock unlock];
 }
 
-- (BOOL)beginEmitAccessWithMaxAge:(NSTimeInterval)maxAgeSeconds {
+- (BOOL)beginEmitAccess {
     [_lock lock];
-    if (_rawSample && (VCamNow() - _updatedAt) <= maxAgeSeconds) return YES;   // lock stays held
+    if (_rawSample) return YES;   // lock stays held; NO age check (== modifyImageBuffer: 0x84498)
     [_lock unlock];
     return NO;
 }
@@ -142,7 +134,6 @@ static NSTimeInterval VCamNow(void) {
     [_lock lock];
     if (_rawSample) { CFRelease(_rawSample); _rawSample = NULL; }
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
-    _updatedAt = 0;
     [_lock unlock];
 }
 
