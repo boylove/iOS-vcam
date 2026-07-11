@@ -303,10 +303,24 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     return YES;
 }
 
+// VCAM_VIDEO_DEDUP (default 0). The camera graph re-emits the SAME frame through many
+// BWNodeOutput instances (~5-10x/frame). DEVICE-PROVEN (2026-07-12): overwriting every one
+// transfers ~5x/frame into the channel-0 ISP RENDERED-pool buffers, exhausting the pool (H13ISP
+// 'Unable to allocate a replacement buffer' x220) and HALVING capture fps (30->15); the closed
+// original transfers ONCE/frame (0 ISP errors at 30fps). With dedup ON we skip a frame we already
+// overwrote, keyed on the system TransitionID (kCMSampleBufferAttachmentKey_TransitionID,
+// ShouldPropagate) — the same key the original uses (RE 0.5.4). Historical caveat: this was blamed
+// for photo↔video mode-switch sharp/blur cycling, but that is a MODE SWITCH artifact, not a
+// during-recording one; photo node hooks are off by default.
+#ifndef VCAM_VIDEO_DEDUP
+#define VCAM_VIDEO_DEDUP 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Hook plumbing for private mediaserverd classes (objc_getClass + MSHookMessageEx)
 // ---------------------------------------------------------------------------
 static NSMutableDictionary<NSValue *, NSValue *> *gEmitOrigs;    // Class -> IMP
+static uint64_t gRDup;                                           // deduped (already-OBS) emits
 
 static IMP VCamFindOrig(NSMutableDictionary<NSValue *, NSValue *> *map, id obj) {
     Class c = object_getClass(obj);
@@ -330,12 +344,25 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
     BOOL did = NO;
     if (ib) {
-        // Overwrite every landscape buffer, no dedup — instruction-level RE of the
-        // original's video -[<core> modifyImageBuffer:] @0x84458 shows it does exactly
-        // ONE VTPixelTransferSessionTransferImage per call, an unconditional in-place
-        // overwrite every emit (the landscape gate, not a dedup, is what keeps the
-        // overwrite rate safe — see VCAM_LANDSCAPE_GATE).
+#if VCAM_VIDEO_DEDUP
+        // Overwrite each frame EXACTLY ONCE: the graph re-emits the same buffer ~5-10x/frame and
+        // transferring into all of them exhausts the ISP RENDERED pool -> 30->15fps. If we already
+        // stamped this buffer, it's a re-emit -> pass through; else overwrite + stamp so the
+        // re-emits (which carry the ShouldPropagate attachment) are skipped. Keyed on the system
+        // TransitionID like the original.
+        if (CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) != NULL) {
+            gRDup++;
+            did = YES;   // already overwritten with OBS -> pass through
+        } else {
+            did = VCamOverwriteInPlace(ib);
+            if (did) CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID,
+                                     (__bridge CFTypeRef)@(1), kCMAttachmentMode_ShouldPropagate);
+        }
+#else
+        // No dedup (the landscape gate alone bounds the rate). DEVICE-DISPROVEN on the
+        // memory-tight device — see VCAM_VIDEO_DEDUP; build with =1 to overwrite once/frame.
         did = VCamOverwriteInPlace(ib);
+#endif
     }
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);   // original sb, now overwritten
     gEmitReturns++;                            // heartbeat: orig returned (emit not blocked)
@@ -351,8 +378,8 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
     }
     if ((calls % 600) == 0)
-        VCamLog(@"health: emits=%llu replaced=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu]",
-                calls, repl, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);
+        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu]",
+                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);
 }
 
 

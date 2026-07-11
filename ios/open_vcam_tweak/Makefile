@@ -42,6 +42,10 @@ endif
 ifdef VCAM_AUDIO_DISABLE
 OpenVCam_CFLAGS += -DVCAM_AUDIO_DISABLE=$(VCAM_AUDIO_DISABLE)
 endif
+# VCAM_VIDEO_DEDUP (default 0) — overwrite each frame once (TransitionID); fixes ISP-pool fps drop.
+ifdef VCAM_VIDEO_DEDUP
+OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
+endif
 OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
 
 after-install::
