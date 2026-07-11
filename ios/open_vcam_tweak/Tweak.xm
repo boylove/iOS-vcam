@@ -313,7 +313,7 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 // for photo↔video mode-switch sharp/blur cycling, but that is a MODE SWITCH artifact, not a
 // during-recording one; photo node hooks are off by default.
 #ifndef VCAM_VIDEO_DEDUP
-#define VCAM_VIDEO_DEDUP 0
+#define VCAM_VIDEO_DEDUP 1   // DEVICE-PROVEN default: without it fps halves (30->15, ISP pool exhausted)
 #endif
 
 // ---------------------------------------------------------------------------
