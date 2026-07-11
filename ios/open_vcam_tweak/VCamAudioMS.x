@@ -79,7 +79,7 @@
 // 150 ms cushion (was 80): the audio arrives over an SSH reverse tunnel that
 // batches TCP, so it comes in bursts; a bigger jitter buffer absorbs them and
 // cuts the start-up underruns. Raise via the JitterMs pref if the tunnel is worse.
-#define IVCAM_JITTER_MS_DEFAULT 60u
+#define IVCAM_JITTER_MS_DEFAULT 150u
 #define IVCAM_JITTER_MS_MIN 20u
 #define IVCAM_JITTER_MS_MAX 400u
 #define IVCAM_RELATCH_IDLE_US 3000000ull
