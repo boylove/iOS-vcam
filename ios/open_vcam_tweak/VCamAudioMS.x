@@ -83,6 +83,10 @@
 #define IVCAM_JITTER_MS_MIN 20u
 #define IVCAM_JITTER_MS_MAX 400u
 #define IVCAM_RELATCH_IDLE_US 3000000ull
+// Fast latch STEAL: when a different mic unit is actively rendering while the latched unit has not
+// replaced for this long, release the latch immediately so the active unit (e.g. TikTok's just-
+// opened recorder) takes over in ~this time instead of waiting for the 3s background idle-relatch.
+#define IVCAM_STEAL_IDLE_US 250000ull
 
 #pragma pack(push, 1)
 typedef struct {
@@ -764,6 +768,19 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
         return status;
     }
     if (consumer != (void *)inUnit) {               // a different mic unit -> mute, never real mic
+        // Fast steal on app switch: if THIS unit is actively rendering but the latched unit has
+        // gone idle (stopped replacing), release the latch now so this unit can take over on its
+        // next render (~STEAL + one rate-limited probe), instead of muting for the whole clip while
+        // the 3s background idle-relatch catches up. This is what makes a freshly-opened TikTok
+        // recorder get OBS audio quickly. CAS so only one thread clears a given stale latch.
+        uint64_t lastUs = IVCAMAtomicLoad64(&gCtx.lastRenderUs);
+        uint64_t nowUs = IVCAMNowUs();
+        if (lastUs != 0 && nowUs > lastUs && (nowUs - lastUs) > IVCAM_STEAL_IDLE_US) {
+            if (__atomic_compare_exchange_n(&gCtx.consumerUnit, &consumer, NULL, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                IVCAMAtomicStore32(&gCtx.formatReady, 0);
+            }
+        }
         if (muteLeak) IVCAMMediaActiveMuteRT(ioData);
         return status;
     }
