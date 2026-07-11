@@ -728,7 +728,11 @@ static OSStatus IVCAMMediaActiveAudioUnitRender(AudioUnit inUnit,
 
     IVCAMAtomicAdd64(&gCtx.renderCalls, 1);
 
-    if (inOutputBusNumber > 1) return status;
+    // ONLY the mic-INPUT element (bus 1 on RemoteIO) is ever latched/replaced/muted. Output
+    // elements (bus 0 = speaker) are left completely untouched: latching one would inject OBS
+    // audio into playback AND (via the mic-leak guard) mute every real mic-input render -> a
+    // silent recording. Restricting to bus 1 keeps the latch on the actual capture mic.
+    if (inOutputBusNumber != 1) return status;
     if (!IVCAMAtomicLoad32(&gCtx.enabled)) return status;
 
     // A mic-INPUT element (bus 1) must never leak the real mic into a recording while OBS is
