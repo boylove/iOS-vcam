@@ -109,16 +109,16 @@ static NSTimeInterval VCamNow(void) {
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) return;
     [_lock lock];
-    // Store a COPY of the raw sample buffer -> _rawSample, EXACTLY like the original's
-    // setYUVSampleBuffer: (0x82e24) which does CMSampleBufferCreateCopy into ivar 0x50 — an
-    // INDEPENDENT object preserving timing + format description + attachments, not a bare retain.
-    CMSampleBufferRef copy = NULL;
-    if (CMSampleBufferCreateCopy(kCFAllocatorDefault, sampleBuffer, &copy) == noErr && copy) {
-        if (_rawSample) CFRelease(_rawSample);
-        _rawSample = copy;
-    }
-    // CCW90 pre-rotated of its image buffer -> _rotated (== create90ImageBuffer: into ivar
-    // 0x70). Both stored under the one lock, exactly like setYUVSampleBuffer:.
+    // Faithful to setYUVSampleBuffer: (0x82ddc) IN THE ORIGINAL'S EXACT ORDER: release the old
+    // raw and set it NULL FIRST (0x82e0c str xzr), THEN CMSampleBufferCreateCopy into _rawSample
+    // (which is left NULL on the rare failure), THEN release old rotated -> NULL, THEN create90
+    // into _rotated. So _rawSample and _rotated ALWAYS come from the SAME input frame — both new,
+    // or both cleared — never the old raw paired with a new rotated. (A CMSampleBufferCreateCopy
+    // preserves timing + format description + attachments as an independent object, not a retain;
+    // and if the copy fails, _rawSample==NULL makes the emit skip, exactly like modifyImageBuffer:
+    // 0x84498 which bails when ivar 0x50 is NULL.)
+    if (_rawSample) { CFRelease(_rawSample); _rawSample = NULL; }
+    CMSampleBufferCreateCopy(kCFAllocatorDefault, sampleBuffer, &_rawSample);   // _rawSample = NULL on failure
     if (_rotated) { CVPixelBufferRelease(_rotated); _rotated = NULL; }
     _rotated = [self create90Locked:(CVPixelBufferRef)imageBuffer];
     _updatedAt = VCamNow();
