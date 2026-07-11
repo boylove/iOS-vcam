@@ -6,6 +6,12 @@
 
 #import "VCamLog.h"
 
+// Private: the synthetic monotonic output-timestamp counter lives on the INSTANCE (== the
+// closed vcamera's Helper ivar 0x30), so it resets per decoder instance, not process-wide.
+@interface VCamH264Decoder ()
+- (double)nextOutputTimestamp;
+@end
+
 // Monotonic seconds, for backing off decoder-session rebuild attempts.
 static double VCamMonoSeconds(void) {
     struct timespec ts;
@@ -19,7 +25,8 @@ static double VCamMonoSeconds(void) {
     int _naluLengthSize;
     NSData *_sps;
     NSData *_pps;
-    double _lastBuildFail;   // VCamMonoSeconds() of the last failed buildSession, or 0
+    double _lastBuildFail;     // VCamMonoSeconds() of the last failed buildSession, or 0
+    double _outputTimestamp;   // synthetic output PTS counter, +20.0/frame (== Helper ivar 0x30)
 }
 
 - (instancetype)init {
@@ -28,8 +35,17 @@ static double VCamMonoSeconds(void) {
         _formatDesc = NULL;
         _session = NULL;
         _naluLengthSize = 4;
+        _outputTimestamp = 0.0;   // reset per instance, like the original's Helper ivar 0x30
     }
     return self;
+}
+
+// Returns the current synthetic output timestamp, then advances it +20.0 — faithful to the
+// original Helper -outputFrame: (0x77d74: use ivar 0x30, then ivar 0x30 += 20.0).
+- (double)nextOutputTimestamp {
+    double t = _outputTimestamp;
+    _outputTimestamp += 20.0;
+    return t;
 }
 
 - (void)dealloc {
@@ -124,7 +140,6 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
                              CVImageBufferRef imageBuffer,
                              CMTime presentationTimeStamp,
                              CMTime presentationDuration) {
-    (void)decompressionOutputRefCon;
     (void)sourceFrameRefCon;
     (void)infoFlags;
     (void)presentationTimeStamp;
@@ -170,13 +185,14 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
     // +20.0 per frame, PTS = CMTimeMake((int64)(counter*600), 600) (timescale 600, flags valid),
     // duration/DTS invalid. It also CVPixelBufferLockBaseAddress's the buffer across the wrap —
     // which forces the GPU-decoded pixels to land (a sync point) — so we replicate that too.
-    static double vcamOutTs = 0.0;   // decode-thread only; monotonic like the original's ivar 0x30
+    VCamH264Decoder *decoder = (__bridge VCamH264Decoder *)decompressionOutputRefCon;
+    double outTs = decoder ? [decoder nextOutputTimestamp] : 0.0;   // per-instance counter (== ivar 0x30)
     CVPixelBufferLockBaseAddress((CVPixelBufferRef)imageBuffer, 0);
     CMVideoFormatDescriptionRef fmt = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(NULL, imageBuffer, &fmt) == noErr && fmt) {
         CMSampleTimingInfo timing;
         timing.duration = kCMTimeInvalid;
-        timing.presentationTimeStamp = CMTimeMake((int64_t)(vcamOutTs * 600.0), 600);
+        timing.presentationTimeStamp = CMTimeMake((int64_t)(outTs * 600.0), 600);
         timing.decodeTimeStamp = kCMTimeInvalid;
         CMSampleBufferRef sb = NULL;
         if (CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, imageBuffer, true, NULL, NULL,
@@ -187,7 +203,6 @@ static void VCamDecodeOutput(void *decompressionOutputRefCon,
         CFRelease(fmt);
     }
     CVPixelBufferUnlockBaseAddress((CVPixelBufferRef)imageBuffer, 0);
-    vcamOutTs += 20.0;
 }
 
 - (BOOL)buildSession {
