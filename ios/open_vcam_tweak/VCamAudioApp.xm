@@ -38,6 +38,11 @@
 #define IVCAM_APP_TARGET_MEDIASERVERD @"mediaserverd"
 #define IVCAM_APP_TARGET_CAMERA       @"com.apple.camera"
 #define IVCAM_APP_CANON_RATE 48000    // iOS capture units are 48 kHz; resample OBS to this
+// FIFO high-water: keep only the freshest ~this many ms of audio. On RTMP connect SRS bursts its
+// GOP cache (up to ~1 s of buffered audio); without a tight cap that whole burst sits in the FIFO
+// and the audio plays that far behind the (low-latency) video ("画面比声音早"). Trimming to a small
+// target keeps the mic audio close to real time so it lines up with the video overwrite. Tunable.
+#define IVCAM_APP_BUFFER_MS 150u
 
 static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
                                             AudioUnitRenderActionFlags *ioActionFlags,
@@ -112,7 +117,7 @@ static OSStatus (*gOriginalAudioUnitRender)(AudioUnit inUnit,
     [self.pcmLock lock];
     if (self.channels != (int)ch) { self.channels = (int)ch; self.pcm.length = 0; }  // format change
     [self.pcm appendData:out];
-    NSUInteger maxBytes = (NSUInteger)IVCAM_APP_CANON_RATE * ch * sizeof(int16_t);   // ~1 s
+    NSUInteger maxBytes = (NSUInteger)IVCAM_APP_CANON_RATE * IVCAM_APP_BUFFER_MS / 1000u * ch * sizeof(int16_t);
     if (self.pcm.length > maxBytes) {
         [self.pcm replaceBytesInRange:NSMakeRange(0, self.pcm.length - maxBytes) withBytes:NULL length:0];
     }
