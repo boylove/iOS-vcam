@@ -16,7 +16,7 @@ TWEAK_NAME := OpenVCam
 # ring the AudioUnitRender hook consumes). One tweak, one stream, both A/V. Audio is fail-open and
 # runtime-gated (default on; disable flag / Enabled=false pref), so it can never wedge the video
 # path. For a video-only build, drop VCamAudioMS.x + VCamAACDecoder.mm from FILES below.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x vendor/rtmp/vcam_rtmp.c
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS
