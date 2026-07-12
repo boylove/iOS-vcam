@@ -76,6 +76,16 @@
 // fall open to the real mic.
 #define IVCAM_RECENT_AUDIO_US 500000ull
 
+// Format-probe throttle. AudioUnitGetProperty is NOT cheap on the render thread;
+// calling it on EVERY bus-1 render across mediaserverd's many mic units blows the
+// HAL RT budget (ClientHALIODurationExceededBudget -> mediaserverd crash-loop —
+// the 0.6.36 regression). So probe the render unit's format at most once per this
+// interval, cache it (packed, lock-free), and reuse the cache on every render.
+// This is the ONE piece the safe tweak didn't need (it runs in-process, not
+// mediaserverd); consumption stays broadcast — the cache is format only, never a
+// consumer identity, so any bus-1 unit still fills from it.
+#define IVCAM_FMT_PROBE_US 200000ull
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
@@ -88,6 +98,17 @@ static os_unfair_lock gAudioLock = OS_UNFAIR_LOCK_INIT;
 // under gAudioLock by the consumer.
 static uint32_t  gFifoRate = 0;
 static uint32_t  gFifoChannels = 0;
+
+// Cached render-unit format, packed into one word so it reads/writes atomically
+// (no torn read, no valid flag): bits 0-17 rate, 18-19 channels, 20 isFloat,
+// 21 nonInterleaved; 0 = not yet probed. Refreshed by a rate-limited probe on the
+// render thread (gLastProbeUs), read lock-free on every render.
+static volatile uint32_t gFmtPacked = 0;
+static volatile uint64_t gLastProbeUs = 0;
+
+static inline uint32_t IVCAMPackFmt(uint32_t rate, uint32_t ch, uint32_t isFloat, uint32_t ni) {
+    return (rate & 0x3FFFFu) | ((ch & 0x3u) << 18) | ((isFloat & 1u) << 20) | ((ni & 1u) << 21);
+}
 
 static volatile int32_t  gEnabled = 1;           // runtime gate (prefs / disable flag)
 static volatile int32_t  gOBSStreaming = 0;      // set by RTMP connect/disconnect
@@ -274,36 +295,61 @@ static inline void IVCAMMuteRT(AudioBufferList *ioData) {
 
 // Fill ioData with OBS audio popped from the FIFO. Returns YES if replaced, NO on
 // any unsupported format / rate mismatch / underrun (caller then mutes or falls
-// open). RT-safe: one os_unfair_lock-guarded ring memcpy into a stack scratch,
-// then pure arithmetic. No ObjC, no alloc, no CoreAudio property calls.
+// open). RT-safe: no ObjC, no alloc; one os_unfair_lock-guarded ring memcpy into a
+// stack scratch then pure arithmetic. The only CoreAudio property call is the
+// format probe, rate-limited to ~IVCAM_FMT_PROBE_US (never per render).
 static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
                               UInt32 inNumberFrames, AudioBufferList *ioData) {
     if (inNumberFrames == 0 || inNumberFrames > IVCAM_MAX_RENDER_FRAMES) return NO;
 
-    AudioStreamBasicDescription asbd;
-    UInt32 size = sizeof(asbd);
-    memset(&asbd, 0, sizeof(asbd));
-    OSStatus fs = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
-                                       kAudioUnitScope_Output, bus, &asbd, &size);
-    if (fs != noErr) {
-        size = sizeof(asbd);
-        fs = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
-                                  kAudioUnitScope_Input, bus, &asbd, &size);
+    // Render-unit format from the rate-limited cache, NOT a per-render
+    // AudioUnitGetProperty (that overloads the HAL budget in mediaserverd). Probe
+    // at most once per IVCAM_FMT_PROBE_US, publish the packed format, reuse it.
+    uint64_t nowUs = IVCAMNowUs();
+    uint32_t packed = __atomic_load_n(&gFmtPacked, __ATOMIC_ACQUIRE);
+    uint64_t lastProbe = __atomic_load_n(&gLastProbeUs, __ATOMIC_RELAXED);
+    if (packed == 0 || nowUs - lastProbe > IVCAM_FMT_PROBE_US) {
+        // One prober at a time (CAS the timestamp); losers reuse the current cache.
+        if (__atomic_compare_exchange_n(&gLastProbeUs, &lastProbe, nowUs, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            AudioStreamBasicDescription asbd;
+            UInt32 size = sizeof(asbd);
+            memset(&asbd, 0, sizeof(asbd));
+            OSStatus fs = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                                               kAudioUnitScope_Output, bus, &asbd, &size);
+            if (fs != noErr) {
+                size = sizeof(asbd);
+                fs = AudioUnitGetProperty(inUnit, kAudioUnitProperty_StreamFormat,
+                                          kAudioUnitScope_Input, bus, &asbd, &size);
+            }
+            if (fs == noErr) {
+                BOOL pFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+                BOOL pInt = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
+                BOOL pNI = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+                uint32_t pCh = asbd.mChannelsPerFrame;
+                if (pCh == 0 && pNI) pCh = ioData->mNumberBuffers;
+                if (asbd.mFormatID == kAudioFormatLinearPCM && (pCh == 1 || pCh == 2) &&
+                    asbd.mSampleRate > 0.0 && asbd.mSampleRate <= 192000.0 &&
+                    ((pFloat && asbd.mBitsPerChannel == 32) || (pInt && asbd.mBitsPerChannel == 16))) {
+                    packed = IVCAMPackFmt((uint32_t)asbd.mSampleRate, pCh, pFloat ? 1 : 0, pNI ? 1 : 0);
+                    __atomic_store_n(&gFmtPacked, packed, __ATOMIC_RELEASE);
+                } else {
+                    __atomic_add_fetch(&gUnsupported, 1, __ATOMIC_RELAXED);
+                }
+            }
+        }
     }
-    if (fs != noErr) { __atomic_add_fetch(&gUnsupported, 1, __ATOMIC_RELAXED); return NO; }
+    if (packed == 0) return NO;   // format not known yet -> caller mutes / falls open
 
-    BOOL isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-    BOOL isSignedInt = (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0;
-    BOOL nonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-    UInt32 targetCh = asbd.mChannelsPerFrame;
-    if (targetCh == 0 && nonInterleaved) targetCh = ioData->mNumberBuffers;
-    if (asbd.mFormatID != kAudioFormatLinearPCM || !(targetCh == 1 || targetCh == 2) ||
-        !((isFloat && asbd.mBitsPerChannel == 32) || (isSignedInt && asbd.mBitsPerChannel == 16))) {
-        __atomic_add_fetch(&gUnsupported, 1, __ATOMIC_RELAXED);
-        return NO;
-    }
+    uint32_t fmtRate = packed & 0x3FFFFu;
+    UInt32 targetCh = (packed >> 18) & 0x3u;
+    BOOL isFloat = ((packed >> 20) & 1u) != 0;
+    BOOL nonInterleaved = ((packed >> 21) & 1u) != 0;
+    if (!(targetCh == 1 || targetCh == 2)) return NO;
 
-    // Validate the buffer layout BEFORE consuming so a mismatch doesn't lose data.
+    // Cross-check the actual buffer layout against the cached format (cheap, no HAL);
+    // fall open if a unit's layout contradicts the cache (e.g. just after an app or
+    // format switch, before the next probe refreshes it). Also guards consuming.
     if (nonInterleaved) {
         if (ioData->mNumberBuffers < targetCh) return NO;
         for (UInt32 ch = 0; ch < targetCh; ch++)
@@ -317,7 +363,7 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
     uint32_t srcCh;
     os_unfair_lock_lock(&gAudioLock);
     srcCh = gFifoChannels;
-    if (gFifoRate == 0 || !(srcCh == 1 || srcCh == 2) || (double)gFifoRate != asbd.mSampleRate) {
+    if (gFifoRate == 0 || !(srcCh == 1 || srcCh == 2) || gFifoRate != fmtRate) {
         os_unfair_lock_unlock(&gAudioLock);
         return NO;                              // no stream yet / rate mismatch
     }
@@ -431,8 +477,9 @@ static void IVCAMAudioBackgroundTick(void) {
 
     int64_t vpts = __atomic_load_n(&gVideoPTSms, __ATOMIC_ACQUIRE);
     int64_t apts = __atomic_load_n(&gAudioWritePTSms, __ATOMIC_ACQUIRE);
+    uint32_t packed = __atomic_load_n(&gFmtPacked, __ATOMIC_ACQUIRE);
     IVCAMAudioLog(@"AUDIO_STATS render=%llu replaced=%llu underruns=%llu muted=%llu overflow=%llu unsupported=%llu "
-                   "fifoRate=%u fifoCh=%u fill=%u fillMs=%u obs=%d leadMs=%lld",
+                   "fifoRate=%u fifoCh=%u fill=%u fillMs=%u obs=%d leadMs=%lld unitRate=%u unitCh=%u unitFloat=%u unitNI=%u",
                   __atomic_load_n(&gRenderCalls, __ATOMIC_RELAXED),
                   __atomic_load_n(&gReplaced, __ATOMIC_RELAXED),
                   __atomic_load_n(&gUnderruns, __ATOMIC_RELAXED),
@@ -440,7 +487,8 @@ static void IVCAMAudioBackgroundTick(void) {
                   __atomic_load_n(&gOverflowDrops, __ATOMIC_RELAXED),
                   __atomic_load_n(&gUnsupported, __ATOMIC_RELAXED),
                   rate, ch, fill, fillMs, __atomic_load_n(&gOBSStreaming, __ATOMIC_ACQUIRE),
-                  (apts > 0 && vpts > 0) ? (apts - vpts) : 0);
+                  (apts > 0 && vpts > 0) ? (apts - vpts) : 0,
+                  packed & 0x3FFFFu, (packed >> 18) & 0x3u, (packed >> 20) & 1u, (packed >> 21) & 1u);
 }
 
 static void IVCAMAudioStartBackground(void) {
