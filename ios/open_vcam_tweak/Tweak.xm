@@ -381,9 +381,13 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         // Dedup by TransitionID like video: the graph re-emits each buffer ~3x, so overwrite ONCE
         // and let the re-emits carry the OBS audio. Only packed signed-int16 interleaved mono/stereo
         // (the capture graph's format, matching the OBS AAC); anything else falls open to the mic.
+        // Dedup with a PRIVATE key, NOT the system TransitionID: stamping TransitionID on the AUDIO
+        // buffer makes the movie muxer treat it as a transition/discontinuity and throttle the video
+        // to 24 fps (video uses TransitionID fine, but on audio it drops fps). A private key is
+        // ignored by the muxer, so it dedups without the fps hit. (0.6.46)
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
         if (fd && CMFormatDescriptionGetMediaType(fd) == kCMMediaType_Audio &&
-            CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) == NULL) {
+            CMGetAttachment(sb, CFSTR("VCamAudioDedup"), NULL) == NULL) {
             const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
             if (a && a->mFormatID == kAudioFormatLinearPCM && a->mBitsPerChannel == 16 &&
                 (a->mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
@@ -402,8 +406,8 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
                     } else if (IVCAMAudioOBSStreaming()) {
                         memset(ptr, 0, need);   // OBS live but no PCM yet -> mute (no real-mic leak)
                     }
-                    CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID,
-                                    (__bridge CFTypeRef)@(1), kCMAttachmentMode_ShouldPropagate);
+                    CMSetAttachment(sb, CFSTR("VCamAudioDedup"), kCFBooleanTrue,
+                                    kCMAttachmentMode_ShouldPropagate);
                 }
             }
         }
