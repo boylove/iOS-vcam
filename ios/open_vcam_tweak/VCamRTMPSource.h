@@ -12,6 +12,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)shared;
 
+/// Audio-only mode: skip H264 video decode and the frame store entirely, only demux + decode the
+/// AAC audio track. Set BEFORE ensureStarted. Used in an app process (TikTok) where OpenVCam only
+/// replaces the microphone (video is overwritten by the mediaserverd instance). Default NO.
+@property (nonatomic, assign) BOOL audioOnly;
+
 /// Ensure the pull thread is running (no-op if already started).
 - (void)ensureStarted;
 

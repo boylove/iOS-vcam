@@ -4,6 +4,10 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 
+// Routable PCM sink (see VCamAudioSink.h). Defaults to the mediaserverd ring push; an app process
+// (VCamAudioApp) overrides it to route decoded OBS PCM into its own in-process FIFO instead.
+VCamPCMSink gVCamPCMSink = IVCAMMediaActivePushPCM;
+
 // AAC-LC decodes 1024 PCM frames per access unit; HE-AAC/SBR up to 2048. Size the output
 // scratch generously so one FillComplexBuffer call always fits.
 static const UInt32 kVCamAACMaxOutFrames = 4096;
@@ -134,12 +138,6 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
 - (BOOL)decodeFrame:(const void *)data length:(size_t)len ptsMs:(int64_t)ptsMs {
     if (!_conv || !_outBuf || !data || len == 0) return NO;
 
-    // Idle gate: skip decoding entirely when no mic is actively capturing (camera preview, between
-    // recordings). Decoding + pushing OBS audio continuously with no consumer floods the FIFO and
-    // loads mediaserverd for nothing (the 0.6.39 HAL-overload contributor). The AAC decoder stays
-    // configured (sequence header still processed), so it resumes instantly on the next mic render.
-    if (!IVCAMAudioWantsDecode()) return NO;
-
     VCamAACInput input;
     input.data = data;
     input.len = (UInt32)len;
@@ -167,7 +165,7 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
             VCamLog(@"aac: decode produced 0 frames #%llu (st=%d)", zeroCalls, (int)st);
         return NO;
     }
-    IVCAMMediaActivePushPCM(_outBuf, outPackets, _rate, _channels, ptsMs);
+    gVCamPCMSink(_outBuf, outPackets, _rate, _channels, ptsMs);
     return YES;
 }
 

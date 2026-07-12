@@ -125,6 +125,7 @@ static void VCamRTMPMediaCallback(void *ctx, uint8_t msg_type,
     VCamRTMPSource *self = (__bridge VCamRTMPSource *)ctx;
     @autoreleasepool {
         if (msg_type == 9) {                   // video (AVC/H264)
+            if (self.audioOnly) return;        // app process: mic-only, skip video decode
             [self handleVideoTag:data length:len timestampMs:timestamp_ms];
         } else if (msg_type == 8) {            // audio (AAC) -> mic replacement
             [self handleAudioTag:data length:len timestampMs:timestamp_ms];
@@ -151,8 +152,10 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
             @autoreleasepool {
                 VCamConfig *cfg = [VCamConfig shared];
                 if (!cfg.enabled) {
-                    [[VCamFrameStore shared] setLive:NO];
-                    [[VCamFrameStore shared] clear];
+                    if (!self.audioOnly) {
+                        [[VCamFrameStore shared] setLive:NO];
+                        [[VCamFrameStore shared] clear];
+                    }
                     IVCAMSetOBSStreaming(0);   // audio hook: fall open to the real mic
                     sleep(1);
                     continue;
@@ -170,7 +173,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 VCamLog(@"rtmp: connecting %@", url);
                 // Live for the duration of the connection (== the original's setLive:YES from the
                 // RTMP accept callback). The emit overwrites only while live && a frame exists.
-                [[VCamFrameStore shared] setLive:YES];
+                if (!self.audioOnly) [[VCamFrameStore shared] setLive:YES];
                 vcam_rtmp_run(client, VCamRTMPMediaCallback,
                               (__bridge void *)self, &self->_stopFlag);
                 vcam_rtmp_destroy(client);
@@ -180,7 +183,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 // disconnect only does setLive:NO. The gate (not a frame drop) falls open to the
                 // real camera; a reconnect resumes from the kept frame. The decoder is kept too —
                 // it rebuilds on the reconnect's sequence header (configure always rebuilds).
-                [[VCamFrameStore shared] setLive:NO];
+                if (!self.audioOnly) [[VCamFrameStore shared] setLive:NO];
                 IVCAMSetOBSStreaming(0);   // OBS gone: audio hook falls open to the real mic
 
                 if (!self.stopFlag) {

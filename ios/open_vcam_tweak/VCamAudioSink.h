@@ -2,38 +2,39 @@
 #include <stdint.h>
 
 // Bridge from the RTMP audio decoder (VCamRTMPSource, producer thread) to the mediaserverd
-// microphone-replacement FIFO in VCamAudioMS.x. Defined there; declared here so the ObjC++
-// RTMP source can push decoded OBS audio into the same shared FIFO the AudioUnitRender hook
-// (broadcast model) consumes. See VCamAudioMS.x for the full real-time-safety model.
+// microphone-replacement ring in VCamAudioMS.x. Defined there; declared here so the ObjC++
+// RTMP source can push decoded OBS audio into the same lock-free ring the AudioUnitRender hook
+// consumes. See VCamAudioMS.x for the full real-time-safety model.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Push `srcFrames` of interleaved int16 PCM at (srcRate, srcCh) into the FIFO. Off-RT only
-// (call from the single RTMP reader thread). Stores at the source format; the consumer requires
-// the render unit's rate to equal srcRate (no RT resampling) and channel-maps mono<->stereo at
-// pop. srcCh must be 1 or 2. `ptsMs` is this frame's RTMP presentation timestamp (ms), used for
-// A/V telemetry only (video is real-time after the fps fix, so audio just plays through). Pass 0.
+// Push `srcFrames` of interleaved int16 PCM at (srcRate, srcCh) into the ring. Off-RT only
+// (call from the single RTMP reader thread). No-op until a consumer AudioUnit has latched its
+// target format; adapts (channel-map + resample) to that format internally. srcCh must be 1 or 2.
+// `ptsMs` is this audio frame's RTMP presentation timestamp (ms); it drives dynamic A/V sync
+// (the newest written sample's PTS vs the displayed video PTS). Pass 0 if unknown.
 void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
                              uint32_t srcRate, uint32_t srcCh, int64_t ptsMs);
 
 // Publish the currently-displayed video frame's RTMP PTS (ms), from the H264 decoder's output
-// callback. Telemetry only in the broadcast model (logged as the A/V lead); it no longer drives
-// a buffer target. Kept so the H264 decoder's call site and the shared-sink ABI are unchanged.
+// callback. The audio consumer buffers exactly (newest-audio-PTS - this) so the audio it plays
+// lands on the shown video's PTS — dynamic, self-correcting A/V sync (no fixed delay).
 void IVCAMSetVideoPTS(int64_t ptsMs);
 
-// Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). While set, a mic-input render
-// that underruns MUTES rather than leaking the real mic — but only if OBS audio was produced
-// recently (a live stream's momentary gap); a video-only stream or the pre-first-frame startup
-// falls open to the real mic. When clear, mic inputs always fall open to the real mic.
+// Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). While set, mic-input renders
+// are muted rather than leaking the real mic when OBS audio can't yet be supplied; when clear,
+// mic inputs fall open to the real mic. Lets the audio hook silence the startup window.
 void IVCAMSetOBSStreaming(int on);
 
-// Idle gate: returns 1 only while a mic-input (bus 1) render has occurred recently (an app is
-// actively capturing the mic). The AAC decoder calls this to SKIP decoding OBS audio when no mic
-// is capturing (camera preview, between recordings) — so mediaserverd does no audio work, and the
-// FIFO never floods, while idle. Returns 0 when audio is disabled or no mic render is recent.
-int IVCAMAudioWantsDecode(void);
+// Routable PCM sink. VCamAACDecoder pushes decoded OBS PCM through this pointer instead of calling
+// IVCAMMediaActivePushPCM directly, so the SAME decoder feeds either the mediaserverd ring
+// (default) or, in an app process (TikTok), the in-process FIFO in VCamAudioApp. Globals are
+// per-process, so mediaserverd keeps the ring while TikTok routes to its own FIFO; set it before
+// starting the RTMP source. Defaults to IVCAMMediaActivePushPCM.
+typedef void (*VCamPCMSink)(const int16_t *pcm, uint32_t srcFrames, uint32_t srcRate, uint32_t srcCh, int64_t ptsMs);
+extern VCamPCMSink gVCamPCMSink;
 
 #ifdef __cplusplus
 }
