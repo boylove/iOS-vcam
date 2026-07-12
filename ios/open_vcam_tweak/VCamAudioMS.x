@@ -317,12 +317,19 @@ void IVCAMSetOBSStreaming(int on) { __atomic_store_n(&gOBSStreaming, on ? 1 : 0,
 // Render hook (render thread; real-time, LOCK-FREE)
 // ---------------------------------------------------------------------------
 
-// Map one source frame's channel `c` (0..targetCh-1) to an int16 sample.
-static inline int16_t IVCAMMapSample(const int16_t *src, uint32_t i, uint32_t c,
-                                     uint32_t srcCh, uint32_t targetCh) {
-    if (srcCh == targetCh) return src[i * srcCh + c];
-    if (srcCh == 1) return src[i];                                   // mono -> stereo (dup)
-    return (int16_t)(((int32_t)src[i * 2] + (int32_t)src[i * 2 + 1]) / 2);  // stereo -> mono
+// Read source frame `frame` (relative to claimed read index `r`), output channel
+// `c`, directly from the ring with channel mapping. No scratch buffer — reading
+// straight from gRing keeps the render function's stack tiny (a 32 KiB stack
+// scratch here overflowed the capture-graph source-node-start render thread ->
+// "capture graph source nodes start" timeout -> mediaserverd reset, the 0.6.39/40
+// regression). Frames never straddle the ring wrap (RING is a multiple of srcCh),
+// so a frame's srcCh samples are contiguous; the per-frame index is masked.
+static inline int16_t IVCAMRingMapSample(uint32_t r, uint32_t frame, uint32_t c,
+                                         uint32_t srcCh, uint32_t targetCh) {
+    uint32_t base = (r + frame * srcCh) & IVCAM_RING_MASK;
+    if (srcCh == targetCh) return gRing[(base + c) & IVCAM_RING_MASK];
+    if (srcCh == 1) return gRing[base];                                 // mono -> stereo (dup)
+    return (int16_t)(((int32_t)gRing[base] + (int32_t)gRing[(base + 1) & IVCAM_RING_MASK]) / 2);  // stereo -> mono
 }
 
 static inline void IVCAMMuteRT(AudioBufferList *ioData) {
@@ -420,16 +427,10 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
         return NO;
     }
 
-    // Copy the claimed span into a per-render stack scratch (safe against a producer
-    // wrap: it would need to write the whole ring in the µs before this memcpy).
-    int16_t src[IVCAM_MAX_RENDER_FRAMES * 2];
-    uint32_t pos = r & IVCAM_RING_MASK;
-    uint32_t first = IVCAM_RING_SAMPLES - pos;
-    if (first > needSrc) first = needSrc;
-    memcpy(src, &gRing[pos], (size_t)first * sizeof(int16_t));
-    if (needSrc > first) memcpy(src + first, &gRing[0], (size_t)(needSrc - first) * sizeof(int16_t));
-
-    // Write scratch -> ioData with channel mapping (int16/float, interleaved/non).
+    // Fill ioData by reading the claimed span DIRECTLY from the ring (no scratch
+    // buffer — a big stack array here overflowed the source-node-start render
+    // thread). Safe against a producer wrap: it would need to write the whole ring
+    // in the µs before these reads. Channel-map inline (int16/float, interleaved/non).
     if (isFloat) {
         if (nonInterleaved) {
             for (UInt32 ch = 0; ch < targetCh; ch++) {
@@ -437,7 +438,7 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
                 UInt32 wf = ioData->mBuffers[ch].mDataByteSize / (UInt32)sizeof(float);
                 if (wf > inNumberFrames) wf = inNumberFrames;
                 for (UInt32 i = 0; i < wf; i++)
-                    out[i] = (float)IVCAMMapSample(src, i, ch, srcCh, targetCh) / 32768.0f;
+                    out[i] = (float)IVCAMRingMapSample(r, i, ch, srcCh, targetCh) / 32768.0f;
                 ioData->mBuffers[ch].mDataByteSize = wf * (UInt32)sizeof(float);
             }
         } else {
@@ -446,7 +447,7 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
             if (wf > inNumberFrames) wf = inNumberFrames;
             for (UInt32 i = 0; i < wf; i++)
                 for (UInt32 c = 0; c < targetCh; c++)
-                    out[i * targetCh + c] = (float)IVCAMMapSample(src, i, c, srcCh, targetCh) / 32768.0f;
+                    out[i * targetCh + c] = (float)IVCAMRingMapSample(r, i, c, srcCh, targetCh) / 32768.0f;
             ioData->mBuffers[0].mDataByteSize = wf * targetCh * (UInt32)sizeof(float);
         }
     } else {
@@ -456,7 +457,7 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
                 UInt32 wf = ioData->mBuffers[ch].mDataByteSize / (UInt32)sizeof(int16_t);
                 if (wf > inNumberFrames) wf = inNumberFrames;
                 for (UInt32 i = 0; i < wf; i++)
-                    out[i] = IVCAMMapSample(src, i, ch, srcCh, targetCh);
+                    out[i] = IVCAMRingMapSample(r, i, ch, srcCh, targetCh);
                 ioData->mBuffers[ch].mDataByteSize = wf * (UInt32)sizeof(int16_t);
             }
         } else {
@@ -465,7 +466,7 @@ static BOOL IVCAMFillFromFifo(AudioUnit inUnit, UInt32 bus,
             if (wf > inNumberFrames) wf = inNumberFrames;
             for (UInt32 i = 0; i < wf; i++)
                 for (UInt32 c = 0; c < targetCh; c++)
-                    out[i * targetCh + c] = IVCAMMapSample(src, i, c, srcCh, targetCh);
+                    out[i * targetCh + c] = IVCAMRingMapSample(r, i, c, srcCh, targetCh);
             ioData->mBuffers[0].mDataByteSize = wf * targetCh * (UInt32)sizeof(int16_t);
         }
     }
