@@ -23,10 +23,20 @@ void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
 // lands on the shown video's PTS — dynamic, self-correcting A/V sync (no fixed delay).
 void IVCAMSetVideoPTS(int64_t ptsMs);
 
-// Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). While set, mic-input renders
-// are muted rather than leaking the real mic when OBS audio can't yet be supplied; when clear,
-// mic inputs fall open to the real mic. Lets the audio hook silence the startup window.
+// Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). Read by IVCAMAudioOBSStreaming.
 void IVCAMSetOBSStreaming(int on);
+int  IVCAMAudioOBSStreaming(void);
+
+// Pop `frames` of OBS PCM matching (rate, ch) into dst (int16 interleaved), overwriting it IN PLACE.
+// Called from the mediaserverd BW emit hook (Tweak.xm) to replace the capture graph's mic audio with
+// OBS audio — the audio analogue of the in-place video overwrite, OFF the hot AudioUnitRender IO path
+// (which drops fps + crashes repeat-record). Returns 1 if fully filled; 0 on format mismatch /
+// underrun (caller then keeps the real mic, or mutes while OBS streams). Off-RT-safe enough for the
+// emit thread (one os_unfair_lock-guarded memcpy + memmove); NOT a real-time render context.
+int IVCAMAudioPopForEmit(int16_t *dst, uint32_t frames, uint32_t rate, uint32_t ch);
+
+// Telemetry snapshot for the health log (all out-params optional).
+void IVCAMAudioStats(uint64_t *pushed, uint64_t *hit, uint64_t *miss, uint32_t *rate, uint32_t *ch, uint32_t *fillMs);
 
 // Routable PCM sink. VCamAACDecoder pushes decoded OBS PCM through this pointer instead of calling
 // IVCAMMediaActivePushPCM directly, so the SAME decoder feeds either the mediaserverd ring

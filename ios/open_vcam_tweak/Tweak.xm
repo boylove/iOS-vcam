@@ -2,9 +2,11 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <stdarg.h>
+#import <string.h>
 
 #import "VCamConfig.h"
 #import "VCamFrameStore.h"
@@ -115,6 +117,15 @@
 // no locks touched — safe to leave on in release builds.
 static volatile uint64_t gEmitEntries  = 0;   // VCamEmit entered
 static volatile uint64_t gEmitReturns  = 0;   // VCamEmit's orig() returned
+static volatile uint64_t gAudioRepl    = 0;   // audio buffers overwritten with OBS PCM at emit
+
+// A/B kill-switch: /var/mobile/Media/vcam_noaudio disables the emit-based mic replacement (video
+// overwrite stays). Checked once, cached (Media is a path mediaserverd's sandbox can stat).
+static BOOL VCamAudioOff(void) {
+    static int off = -1;
+    if (off < 0) off = [[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Media/vcam_noaudio"] ? 1 : 0;
+    return off != 0;
+}
 
 static void VCamStartHeartbeat(void) {
     static dispatch_once_t once;
@@ -363,19 +374,37 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         // memory-tight device — see VCAM_VIDEO_DEDUP; build with =1 to overwrite once/frame.
         did = VCamOverwriteInPlace(ib);
 #endif
-    } else if (sb) {
-        // PROBE (0.6.44): does an AUDIO sample buffer pass through this SAME emit hook? If yes we can
-        // replace the mic audio HERE — off the hot AudioUnitRender IO path that drops fps 29.98->24
-        // and crashes repeat-record. Log the audio format, rate-limited. (No replacement yet.)
+    } else if (sb && !VCamAudioOff()) {
+        // AUDIO overwrite (0.6.45): replace the capture graph's mic PCM with OBS audio IN PLACE —
+        // exactly like the video image buffer above, via the SAME emit hook, OFF the hot
+        // AudioUnitRender IO path (which dropped fps 29.98->24 and SIGTRAP-crashed repeat-record).
+        // Dedup by TransitionID like video: the graph re-emits each buffer ~3x, so overwrite ONCE
+        // and let the re-emits carry the OBS audio. Only packed signed-int16 interleaved mono/stereo
+        // (the capture graph's format, matching the OBS AAC); anything else falls open to the mic.
         CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
-        if (fd && CMFormatDescriptionGetMediaType(fd) == kCMMediaType_Audio) {
-            static uint64_t aud = 0;
-            if ((aud++ % 100) == 0) {
-                const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
-                VCamLog(@"AUDIO_EMIT #%llu cls=%s rate=%.0f ch=%u bits=%u flags=0x%x nsamp=%ld", aud,
-                        object_getClassName(self), a ? a->mSampleRate : 0.0, a ? a->mChannelsPerFrame : 0,
-                        a ? a->mBitsPerChannel : 0, a ? (unsigned)a->mFormatFlags : 0,
-                        (long)CMSampleBufferGetNumSamples(sb));
+        if (fd && CMFormatDescriptionGetMediaType(fd) == kCMMediaType_Audio &&
+            CMGetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID, NULL) == NULL) {
+            const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+            if (a && a->mFormatID == kAudioFormatLinearPCM && a->mBitsPerChannel == 16 &&
+                (a->mFormatFlags & kAudioFormatFlagIsSignedInteger) &&
+                !(a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) &&
+                (a->mChannelsPerFrame == 1 || a->mChannelsPerFrame == 2)) {
+                CMItemCount nsamp = CMSampleBufferGetNumSamples(sb);
+                size_t need = (size_t)nsamp * a->mChannelsPerFrame * 2u;
+                CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+                size_t lenAt = 0, total = 0; char *ptr = NULL;
+                if (nsamp > 0 && nsamp < 65536 && bb &&
+                    CMBlockBufferGetDataPointer(bb, 0, &lenAt, &total, &ptr) == kCMBlockBufferNoErr &&
+                    ptr && lenAt >= need) {
+                    if (IVCAMAudioPopForEmit((int16_t *)ptr, (uint32_t)nsamp,
+                                             (uint32_t)a->mSampleRate, a->mChannelsPerFrame)) {
+                        gAudioRepl++;
+                    } else if (IVCAMAudioOBSStreaming()) {
+                        memset(ptr, 0, need);   // OBS live but no PCM yet -> mute (no real-mic leak)
+                    }
+                    CMSetAttachment(sb, kCMSampleBufferAttachmentKey_TransitionID,
+                                    (__bridge CFTypeRef)@(1), kCMAttachmentMode_ShouldPropagate);
+                }
             }
         }
     }
@@ -392,9 +421,14 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         repl++;
         if (repl == 1) VCamLog(@"health: first frame replaced (OBS is live)");
     }
-    if ((calls % 600) == 0)
-        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu]",
-                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait);
+    if ((calls % 600) == 0) {
+        uint64_t aPush = 0, aHit = 0, aMiss = 0; uint32_t aRate = 0, aCh = 0, aFillMs = 0;
+        IVCAMAudioStats(&aPush, &aHit, &aMiss, &aRate, &aCh, &aFillMs);
+        VCamLog(@"health: emits=%llu replaced=%llu dup=%llu why[noFresh=%llu noXfer=%llu xferFail=%llu portrait=%llu] "
+                 "audio[repl=%llu push=%llu hit=%llu miss=%llu rate=%u ch=%u fillMs=%u]",
+                calls, repl, gRDup, gRNoFresh, gRNoXfer, gRXferFail, gRPortrait,
+                gAudioRepl, aPush, aHit, aMiss, aRate, aCh, aFillMs);
+    }
 }
 
 
