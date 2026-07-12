@@ -363,6 +363,21 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         // memory-tight device — see VCAM_VIDEO_DEDUP; build with =1 to overwrite once/frame.
         did = VCamOverwriteInPlace(ib);
 #endif
+    } else if (sb) {
+        // PROBE (0.6.44): does an AUDIO sample buffer pass through this SAME emit hook? If yes we can
+        // replace the mic audio HERE — off the hot AudioUnitRender IO path that drops fps 29.98->24
+        // and crashes repeat-record. Log the audio format, rate-limited. (No replacement yet.)
+        CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
+        if (fd && CMFormatDescriptionGetMediaType(fd) == kCMMediaType_Audio) {
+            static uint64_t aud = 0;
+            if ((aud++ % 100) == 0) {
+                const AudioStreamBasicDescription *a = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
+                VCamLog(@"AUDIO_EMIT #%llu cls=%s rate=%.0f ch=%u bits=%u flags=0x%x nsamp=%ld", aud,
+                        object_getClassName(self), a ? a->mSampleRate : 0.0, a ? a->mChannelsPerFrame : 0,
+                        a ? a->mBitsPerChannel : 0, a ? (unsigned)a->mFormatFlags : 0,
+                        (long)CMSampleBufferGetNumSamples(sb));
+            }
+        }
     }
     ((void (*)(id, SEL, CMSampleBufferRef))orig)(self, _cmd, sb);   // original sb, now overwritten
     gEmitReturns++;                            // heartbeat: orig returned (emit not blocked)
