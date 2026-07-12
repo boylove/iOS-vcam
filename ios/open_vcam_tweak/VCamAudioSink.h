@@ -29,6 +29,12 @@ void IVCAMSetVideoPTS(int64_t ptsMs);
 // falls open to the real mic. When clear, mic inputs always fall open to the real mic.
 void IVCAMSetOBSStreaming(int on);
 
+// Idle gate: returns 1 only while a mic-input (bus 1) render has occurred recently (an app is
+// actively capturing the mic). The AAC decoder calls this to SKIP decoding OBS audio when no mic
+// is capturing (camera preview, between recordings) — so mediaserverd does no audio work, and the
+// FIFO never floods, while idle. Returns 0 when audio is disabled or no mic render is recent.
+int IVCAMAudioWantsDecode(void);
+
 #ifdef __cplusplus
 }
 #endif

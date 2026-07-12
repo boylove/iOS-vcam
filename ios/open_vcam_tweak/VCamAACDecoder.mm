@@ -134,6 +134,12 @@ static OSStatus VCamAACInputProc(AudioConverterRef conv, UInt32 *ioNumberDataPac
 - (BOOL)decodeFrame:(const void *)data length:(size_t)len ptsMs:(int64_t)ptsMs {
     if (!_conv || !_outBuf || !data || len == 0) return NO;
 
+    // Idle gate: skip decoding entirely when no mic is actively capturing (camera preview, between
+    // recordings). Decoding + pushing OBS audio continuously with no consumer floods the FIFO and
+    // loads mediaserverd for nothing (the 0.6.39 HAL-overload contributor). The AAC decoder stays
+    // configured (sequence header still processed), so it resumes instantly on the next mic render.
+    if (!IVCAMAudioWantsDecode()) return NO;
+
     VCamAACInput input;
     input.data = data;
     input.len = (UInt32)len;
