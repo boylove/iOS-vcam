@@ -12,7 +12,9 @@
 @property (nonatomic, strong) VCamH264Decoder *decoder;
 @property (nonatomic, strong) VCamAACDecoder *aacDecoder;
 @property (nonatomic, assign) BOOL started;
-@property (nonatomic, assign) volatile int stopFlag;
+@property (nonatomic, assign) volatile int stopFlag;    // hard stop -> thread exits
+@property (nonatomic, assign) volatile int breakFlag;   // break THIS connection (stop OR url change)
+@property (atomic, copy) NSString *connectedURL;        // the URL the live connection used
 @end
 
 @implementation VCamRTMPSource
@@ -130,6 +132,15 @@ static void VCamRTMPMediaCallback(void *ctx, uint8_t msg_type,
         } else if (msg_type == 8) {            // audio (AAC) -> mic replacement
             [self handleAudioTag:data length:len timestampMs:timestamp_ms];
         }
+        // Hot URL switch: if the panel changed rtmpURL while this stream is live, break the
+        // connection so the outer loop reconnects to the NEW url. The stop flag is polled at
+        // every read boundary, so for a flowing stream this reconnects within a frame or two.
+        if (self.stopFlag) {
+            self.breakFlag = 1;
+        } else {
+            NSString *connected = self.connectedURL, *current = [VCamConfig shared].rtmpURL;
+            if (connected && current && ![connected isEqualToString:current]) self.breakFlag = 1;
+        }
     }
 }
 
@@ -171,11 +182,15 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 }
 
                 VCamLog(@"rtmp: connecting %@", url);
+                // Break this connection on a hard stop OR a live URL change (see the media
+                // callback). Arm the per-connection break flag and record the URL we're using.
+                self.connectedURL = url;
+                self.breakFlag = 0;
                 // Live for the duration of the connection (== the original's setLive:YES from the
                 // RTMP accept callback). The emit overwrites only while live && a frame exists.
                 if (!self.audioOnly) [[VCamFrameStore shared] setLive:YES];
                 vcam_rtmp_run(client, VCamRTMPMediaCallback,
-                              (__bridge void *)self, &self->_stopFlag);
+                              (__bridge void *)self, &self->_breakFlag);
                 vcam_rtmp_destroy(client);
 
                 // Disconnected: drop the live gate but KEEP the last OBS frame — faithful to the
@@ -187,8 +202,14 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
                 IVCAMSetOBSStreaming(0);   // OBS gone: audio hook falls open to the real mic
 
                 if (!self.stopFlag) {
-                    VCamLog(@"rtmp: disconnected; retrying");
-                    sleep(1);
+                    // Distinguish a real disconnect (back off 1s) from a hot URL change
+                    // (reconnect immediately to the new stream).
+                    if (![self.connectedURL isEqualToString:[VCamConfig shared].rtmpURL]) {
+                        VCamLog(@"rtmp: url changed -> reconnecting to %@", [VCamConfig shared].rtmpURL);
+                    } else {
+                        VCamLog(@"rtmp: disconnected; retrying");
+                        sleep(1);
+                    }
                 }
             }
         }
@@ -201,6 +222,7 @@ static void VCamRTMPLogCallback(void *ctx, const char *message) {
 
 - (void)stop {
     self.stopFlag = 1;
+    self.breakFlag = 1;   // also break the in-flight connection (the run polls breakFlag)
     [[VCamFrameStore shared] setLive:NO];
     [[VCamFrameStore shared] clear];   // full teardown: dropping the frame here is fine
 }

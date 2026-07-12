@@ -32,6 +32,7 @@
 
 #import "VCamRTMPSource.h"
 #import "VCamConfig.h"
+#import "VCamControlChannel.h"
 #import "VCamAudioSink.h"
 #import "VCamLog.h"
 
@@ -251,6 +252,10 @@ static OSStatus VCamAppAudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFl
             // dylib (TikTok, ...) gets the in-process broadcast mic replacement.
             if ([proc isEqualToString:IVCAM_APP_TARGET_MEDIASERVERD]) return;
             if ([bundle isEqualToString:IVCAM_APP_TARGET_CAMERA]) return;
+            // SpringBoard loads this dylib only for the floating panel (VCamFloatingPanel);
+            // it is not a capture app, so never install the mic hook there.
+            if ([proc isEqualToString:@"SpringBoard"] ||
+                [bundle isEqualToString:@"com.apple.springboard"]) return;
 
             VCamConfig *cfg = [VCamConfig shared];
             if (!cfg.enabled) { VCamLog(@"app-audio: disabled by config in %@", proc); return; }
@@ -266,6 +271,17 @@ static OSStatus VCamAppAudioUnitRender(AudioUnit inUnit, AudioUnitRenderActionFl
             MSHookFunction((void *)AudioUnitRender, (void *)VCamAppAudioUnitRender,
                            (void **)&gOriginalAudioUnitRender);
             VCamLog(@"app-audio: AudioUnitRender hook installed (broadcast, RTMP audio-only source)");
+
+            // Hot on/off from the floating panel's "替换音频" switch. TikTok's sandbox can't
+            // read the config file, so the toggle can only arrive over the Darwin-notify bus:
+            // flip client.enabled here (when NO, fillAudioBufferList bails -> the real mic).
+            dispatch_block_t applyAudioToggle = ^{
+                BOOL on = YES, e = YES, v = YES, a = YES;   // default ON until the panel publishes
+                if (VCamControlReadState(&e, &v, &a)) on = (e && a);
+                [VCamAppAudioClient shared].enabled = on;
+            };
+            applyAudioToggle();
+            VCamControlObserve(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), applyAudioToggle);
         } @catch (NSException *e) {
             VCamLog(@"app-audio: ctor exception %@ — inactive (fail-open)", e);
         }

@@ -20,7 +20,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// vc.plist `rtmp` key is empty (mirrors vcam-smart-rtmp-fallback).
 @property (atomic, copy, readonly) NSString *rtmpURL;
 
-/// Force an immediate reload (also happens automatically on a 1.5s timer).
+/// Replace the camera video with the OBS frame. Default YES. Gated by the
+/// floating panel's "替换视频" switch (vc.plist `replaceVideo`, or the live
+/// Darwin-notify state when the panel has published this boot).
+@property (atomic, readonly) BOOL replaceVideo;
+
+/// Replace the microphone with the OBS audio. Default YES. Gated by the
+/// floating panel's "替换音频" switch (vc.plist `replaceAudio` / notify state).
+@property (atomic, readonly) BOOL replaceAudio;
+
+/// Force an immediate reload (also happens automatically on a 1.5s timer and on
+/// every control-channel publish).
 - (void)reloadNow;
 
 @end

@@ -248,7 +248,7 @@ static uint64_t gRPortrait;   // landscape-gate skips (health diagnostic)
 static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     if (!cameraBuf) return NO;
     VCamConfig *cfg = [VCamConfig shared];
-    if (!cfg.enabled) return NO;
+    if (!cfg.enabled || !cfg.replaceVideo) return NO;   // "替换视频" off -> pass the real camera
 
 #if VCAM_LANDSCAPE_GATE
     // Overwrite only LANDSCAPE buffers, like the closed vcamera (see VCAM_LANDSCAPE_GATE).
@@ -374,8 +374,9 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
         // memory-tight device — see VCAM_VIDEO_DEDUP; build with =1 to overwrite once/frame.
         did = VCamOverwriteInPlace(ib);
 #endif
-    } else if (sb && !VCamAudioOff()) {
+    } else if (sb && [VCamConfig shared].replaceAudio && !VCamAudioOff()) {
         // AUDIO overwrite (0.6.45): replace the capture graph's mic PCM with OBS audio IN PLACE —
+        // gated by the floating panel's "替换音频" switch (cfg.replaceAudio) and the vcam_noaudio file.
         // exactly like the video image buffer above, via the SAME emit hook, OFF the hot
         // AudioUnitRender IO path (which dropped fps 29.98->24 and SIGTRAP-crashed repeat-record).
         // Dedup by TransitionID like video: the graph re-emits each buffer ~3x, so overwrite ONCE

@@ -16,7 +16,12 @@ TWEAK_NAME := OpenVCam
 # ring the AudioUnitRender hook consumes). One tweak, one stream, both A/V. Audio is fail-open and
 # runtime-gated (default on; disable flag / Enabled=false pref), so it can never wedge the video
 # path. For a video-only build, drop VCamAudioMS.x + VCamAACDecoder.mm from FILES below.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm vendor/rtmp/vcam_rtmp.c
+# VCamFloatingPanel.xm + VCamControlChannel.m add the SpringBoard floating control panel:
+# a draggable button (over apps) with an RTMP-URL field and 替换视频/替换音频 switches. Save
+# writes /var/mobile/Media/vc.plist (mediaserverd reads it) AND publishes the toggles on a
+# Darwin-notify bus (VCamControlChannel) that also reaches TikTok's in-process mic path — the
+# one channel that crosses its sandbox. The panel is gated to SpringBoard and fail-open.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm VCamFloatingPanel.xm VCamControlChannel.m vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS
@@ -46,7 +51,7 @@ endif
 ifdef VCAM_VIDEO_DEDUP
 OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
 endif
-OpenVCam_FRAMEWORKS := Foundation AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
+OpenVCam_FRAMEWORKS := Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."
