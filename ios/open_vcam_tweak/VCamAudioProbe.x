@@ -32,6 +32,7 @@
 #import <math.h>
 #import <string.h>
 #import <os/lock.h>
+#import <mach/mach_time.h>
 
 #import "VCamLog.h"
 #import "VCamAudioSink.h"   // gVCamPCMSink, VCamPCMSink, IVCAMMediaActivePushPCM
@@ -50,62 +51,64 @@ static _Atomic uint64_t gToneInjected = 0;
 static _Atomic int gMicInject = 0;
 static _Atomic uint64_t gObsInjected = 0;
 
-// --- OBS mic FIFO: mono int16 @ 48 kHz, resampled on push from the shared AAC decoder. The AUProcess
-// hook pops one period per audio-clock tick and converts to float in place. A small jitter buffer
-// (prime before popping; re-prime on underrun) keeps it from stuttering on SRS's bursty delivery. ---
-#define VCAM_MIC_CAP   9600u   // ~200 ms @ 48 kHz mono
-#define VCAM_MIC_PRIME 2400u   // ~50 ms buffered before we start popping
-static int16_t  gMicFifo[VCAM_MIC_CAP];
-static uint32_t gMicFifoLen = 0;
-static int      gMicPrimed = 0;
-static os_unfair_lock gMicLock = OS_UNFAIR_LOCK_INIT;
+// --- OBS mic source: a lock-free ring (48 kHz mono int16) written by the shared AAC decoder, read by
+// the AUProcess hook through a drift-corrected cursor that advances at REAL TIME (mach clock), not per
+// call. This is the fix for the 0.6.54 crackle: the old per-period POP drained the FIFO once per UNIT,
+// but the VPIO effect units are independent streams (different periods/sizes: 1024/256/84), so it
+// over-drained -> chronic underrun (fifo -> ~68). Reading a time-anchored window (never consuming)
+// keeps playback continuous regardless of how many units read it, and a ~LAT-ms jitter buffer behind
+// the write head absorbs SRS's bursts. The cursor advances by real elapsed time across ALL calls, so
+// total consumption is exactly 48 kHz no matter the unit count. ---
+#define VCAM_RING 96000u   // 2 s @ 48 kHz mono
+#define VCAM_LAT   4800u   // ~100 ms target latency behind the write head (jitter/drift headroom)
+static int16_t          gRing[VCAM_RING];
+static _Atomic uint64_t gWritePos = 0;              // producer: total samples written
+static uint64_t         gReadPos  = 0;              // consumer cursor (guarded by gReadLock)
+static uint64_t         gLastHost = 0;
+static double           gHostToSamp = 0.0;          // mach ticks -> 48 kHz samples
+static int              gReadSynced = 0;
+static os_unfair_lock   gReadLock = OS_UNFAIR_LOCK_INIT;
 
-// Producer (AAC decode thread, off the RT audio thread): resample srcRate->48k, downmix ->mono, append.
+static void VCamMicInitClock(void) {
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    gHostToSamp = ((double)tb.numer / (double)tb.denom) * 48000.0 / 1.0e9;   // ticks -> ns -> samples
+}
+
+// Producer (single AAC-decode thread, off the RT path): resample srcRate->48k, downmix ->mono, write ring.
 static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
     if (!pcm || frames < 2 || !(ch == 1 || ch == 2) || rate == 0) return;
     int16_t tmp[8192];
     double step = (double)rate / 48000.0, pos = 0.0;
     uint32_t no = 0;
     while (no < 8192 && pos < (double)(frames - 1)) {
-        long i = (long)pos; double fr = pos - (double)i;
-        int a, b;
+        long i = (long)pos; double fr = pos - (double)i; int a, b;
         if (ch == 1) { a = pcm[i]; b = pcm[i + 1]; }
         else { a = ((int)pcm[i*2] + pcm[i*2+1]) / 2; b = ((int)pcm[(i+1)*2] + pcm[(i+1)*2+1]) / 2; }
         tmp[no++] = (int16_t)lround((double)a + ((double)b - (double)a) * fr);
         pos += step;
     }
-    if (no == 0 || no > VCAM_MIC_CAP) return;
-    os_unfair_lock_lock(&gMicLock);
-    if (gMicFifoLen + no > VCAM_MIC_CAP) {                 // overflow: drop oldest
-        uint32_t drop = gMicFifoLen + no - VCAM_MIC_CAP;
-        if (drop > gMicFifoLen) drop = gMicFifoLen;
-        memmove(gMicFifo, gMicFifo + drop, (gMicFifoLen - drop) * sizeof(int16_t));
-        gMicFifoLen -= drop;
-    }
-    memcpy(gMicFifo + gMicFifoLen, tmp, no * sizeof(int16_t));
-    gMicFifoLen += no;
-    if (!gMicPrimed && gMicFifoLen >= VCAM_MIC_PRIME) gMicPrimed = 1;
-    os_unfair_lock_unlock(&gMicLock);
+    uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_relaxed);
+    for (uint32_t i = 0; i < no; i++) gRing[(wp + i) % VCAM_RING] = tmp[i];
+    atomic_store_explicit(&gWritePos, wp + no, memory_order_release);
 }
 
-// Consumer (RT audio thread): pop n mono int16. Returns 1 if filled; 0 on underrun (caller keeps
-// the real mic for that period rather than injecting a gap).
-static int VCamMicPop(int16_t *dst, uint32_t n) {
-    int ok = 0;
-    os_unfair_lock_lock(&gMicLock);
-    if (gMicPrimed && gMicFifoLen >= n) {
-        memcpy(dst, gMicFifo, n * sizeof(int16_t));
-        memmove(gMicFifo, gMicFifo + n, (gMicFifoLen - n) * sizeof(int16_t));
-        gMicFifoLen -= n;
-        ok = 1;
-    } else if (gMicFifoLen < n) {
-        gMicPrimed = 0;                                   // underran -> refill before popping again
-    }
-    os_unfair_lock_unlock(&gMicLock);
-    return ok;
+// Consumer (RT audio thread): fill dst[n] (float) from the drift-corrected read window. Returns 1 if
+// primed. Brief lock (arithmetic only; the ring copy is lock-free, 100 ms behind the producer).
+static int VCamMicRead(float *dst, uint32_t n) {
+    uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_acquire);
+    if (wp < (uint64_t)VCAM_LAT + n) return 0;                       // not primed yet
+    os_unfair_lock_lock(&gReadLock);
+    uint64_t now = mach_absolute_time();
+    if (!gReadSynced) { gReadPos = wp - VCAM_LAT; gLastHost = now; gReadSynced = 1; }
+    else { gReadPos += (uint64_t)((double)(now - gLastHost) * gHostToSamp); gLastHost = now; }
+    if (gReadPos + n > wp || gReadPos + 2u * VCAM_LAT < wp) gReadPos = wp - VCAM_LAT;   // underrun/over-drift resync
+    uint64_t rp = gReadPos;
+    os_unfair_lock_unlock(&gReadLock);
+    for (uint32_t i = 0; i < n; i++) dst[i] = (float)gRing[(rp + i) % VCAM_RING] / 32768.0f;
+    return 1;
 }
 
-// Feed wrapper installed over gVCamPCMSink: keep the stock-Camera emit ring fed AND fill the mic FIFO.
+// Feed wrapper installed over gVCamPCMSink: keep the stock-Camera emit ring fed AND fill the mic ring.
 static VCamPCMSink gPrevSink = NULL;
 static void VCamMicFeedSink(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch, int64_t pts) {
     if (gPrevSink) gPrevSink(pcm, frames, rate, ch, pts);
@@ -190,24 +193,15 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
                          UInt32 n, AudioBufferList *io) {
     OSStatus s = origAUP(u, f, t, n, io);
 
-    // OBS INJECT (gated): overwrite each mono float32 buffer with the OBS audio. Pop ONCE per audio
-    // period (keyed by mSampleTime) so every mic-effect unit in that period gets the SAME slice — the
-    // serial chain's final output is then the OBS audio. Underrun -> keep the real mic for that period.
+    // OBS INJECT (gated): overwrite each mono float32 buffer with the OBS audio, read from the
+    // time-anchored ring (continuous; never drains, so multiple independent-clock units can't
+    // over-consume it). Underrun (not primed) -> keep the real mic for that buffer.
     if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && io) {
-        static double gLastT = -1.0; static int16_t gSlice[8192]; static int gSliceOK = 0; static uint32_t gSliceN = 0;
-        double t0 = t ? t->mSampleTime : 0.0;
-        if (t0 != gLastT || gSliceN != n) {          // new period -> pop one slice
-            gLastT = t0; gSliceN = n;
-            gSliceOK = (n > 0 && n <= 8192) ? VCamMicPop(gSlice, n) : 0;
-        }
-        if (gSliceOK) {
-            for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
-                AudioBuffer *b = &io->mBuffers[bi];
-                if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
-                    float *o = (float *)b->mData;
-                    for (UInt32 i = 0; i < n; i++) o[i] = (float)gSlice[i] / 32768.0f;
-                    atomic_fetch_add_explicit(&gObsInjected, 1, memory_order_relaxed);
-                }
+        for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
+            AudioBuffer *b = &io->mBuffers[bi];
+            if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
+                if (!VCamMicRead((float *)b->mData, n)) break;   // not primed -> keep real mic
+                atomic_fetch_add_explicit(&gObsInjected, 1, memory_order_relaxed);
             }
         }
     } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io) {
@@ -237,10 +231,11 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
             UInt32 ch = (io && bufs) ? io->mBuffers[0].mNumberChannels : 0;
             int nz = VCamBufNonZero(io);
             VCamProbeLog([NSString stringWithFormat:
-                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu obs=%llu fifo=%u calls=%llu",
+                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu obs=%llu lat=%u calls=%llu",
                 u, (unsigned)n, (unsigned)bufs, (unsigned)ch, (unsigned)bytes, nz,
                 (unsigned long long)atomic_load(&gToneInjected),
-                (unsigned long long)atomic_load(&gObsInjected), (unsigned)gMicFifoLen, k]);
+                (unsigned long long)atomic_load(&gObsInjected),
+                (unsigned)(atomic_load_explicit(&gWritePos, memory_order_relaxed) - gReadPos), k]);
         }
     }
     return s;
@@ -296,8 +291,9 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
         MSHookFunction((void *)AudioComponentInstanceNew,       (void *)probeACIN, (void **)&origACIN);
         VCamLog(@"probe: mediaserverd audio probe installed (AURender/AUProcess/ACFill/ACConvert/NEWUNIT) — log-only");
 
-        // Feed the OBS mic FIFO from the shared AAC decoder by wrapping the existing PCM sink, so the
+        // Feed the OBS mic ring from the shared AAC decoder by wrapping the existing PCM sink, so the
         // stock-Camera emit ring keeps working AND the AUProcess hook has OBS audio to inject.
+        VCamMicInitClock();
         gPrevSink = gVCamPCMSink ?: IVCAMMediaActivePushPCM;
         gVCamPCMSink = VCamMicFeedSink;
 
