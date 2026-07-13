@@ -60,13 +60,17 @@ static _Atomic uint64_t gObsInjected = 0;
 // the write head absorbs SRS's bursts. The cursor advances by real elapsed time across ALL calls, so
 // total consumption is exactly 48 kHz no matter the unit count. ---
 #define VCAM_RING 96000u   // 2 s @ 48 kHz mono
-#define VCAM_LAT   4800u   // ~100 ms target latency behind the write head (jitter/drift headroom)
 static int16_t          gRing[VCAM_RING];
 static _Atomic uint64_t gWritePos = 0;              // producer: total samples written
 static uint64_t         gReadPos  = 0;              // consumer cursor (guarded by gReadLock)
 static uint64_t         gLastHost = 0;
 static double           gHostToSamp = 0.0;          // mach ticks -> 48 kHz samples
+static double           gFrac     = 0.0;            // carried fractional sample of the cursor advance (anti-drift)
 static int              gReadSynced = 0;
+// Target latency behind the write head (ms). Tunable LIVE via /var/mobile/Media/vcam_miclat (a plain
+// number of ms) because the A/V offset sign is stream-dependent: if lips lag, lower it; if audio leads
+// video, raise it. Default 100 ms; poller clamps to [10,1000] (ring is 2 s, so 1 s max leaves headroom).
+static _Atomic uint32_t gLatMs = 100;
 static os_unfair_lock   gReadLock = OS_UNFAIR_LOCK_INIT;
 
 static void VCamMicInitClock(void) {
@@ -93,15 +97,24 @@ static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint
 }
 
 // Consumer (RT audio thread): fill dst[n] (float) from the drift-corrected read window. Returns 1 if
-// primed. Brief lock (arithmetic only; the ring copy is lock-free, 100 ms behind the producer).
+// primed. Brief lock (arithmetic only; the ring copy is lock-free, ~gLatMs behind the producer). The
+// cursor advances by REAL elapsed mach time, carrying the fractional sample (gFrac) across calls so it
+// tracks 48 kHz exactly — truncating it each call lost <1 sample/call, a slow downward drift that
+// eventually tripped the over-drift resync and clicked. Fixing that removes the residual crackle.
 static int VCamMicRead(float *dst, uint32_t n) {
+    uint32_t lat = atomic_load_explicit(&gLatMs, memory_order_relaxed) * 48u;   // ms -> samples @ 48 kHz
     uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_acquire);
-    if (wp < (uint64_t)VCAM_LAT + n) return 0;                       // not primed yet
+    if (wp < (uint64_t)lat + n) return 0;                            // not primed yet
     os_unfair_lock_lock(&gReadLock);
     uint64_t now = mach_absolute_time();
-    if (!gReadSynced) { gReadPos = wp - VCAM_LAT; gLastHost = now; gReadSynced = 1; }
-    else { gReadPos += (uint64_t)((double)(now - gLastHost) * gHostToSamp); gLastHost = now; }
-    if (gReadPos + n > wp || gReadPos + 2u * VCAM_LAT < wp) gReadPos = wp - VCAM_LAT;   // underrun/over-drift resync
+    if (!gReadSynced) { gReadPos = wp - lat; gLastHost = now; gFrac = 0.0; gReadSynced = 1; }
+    else {
+        double adv = (double)(now - gLastHost) * gHostToSamp + gFrac;
+        uint64_t whole = (uint64_t)adv;
+        gFrac = adv - (double)whole;                                 // carry the sub-sample remainder
+        gReadPos += whole; gLastHost = now;
+    }
+    if (gReadPos + n > wp || gReadPos + 2u * lat < wp) { gReadPos = wp - lat; gFrac = 0.0; }  // underrun/over-drift resync
     uint64_t rp = gReadPos;
     os_unfair_lock_unlock(&gReadLock);
     for (uint32_t i = 0; i < n; i++) dst[i] = (float)gRing[(rp + i) % VCAM_RING] / 32768.0f;
@@ -193,32 +206,27 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
                          UInt32 n, AudioBufferList *io) {
     OSStatus s = origAUP(u, f, t, n, io);
 
-    // OBS INJECT (gated): overwrite each mono float32 buffer with the OBS audio, read from the
-    // time-anchored ring (continuous; never drains, so multiple independent-clock units can't
-    // over-consume it). Underrun (not primed) -> keep the real mic for that buffer.
-    if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && io) {
-        for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
-            AudioBuffer *b = &io->mBuffers[bi];
-            if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
-                if (!VCamMicRead((float *)b->mData, n)) break;   // not primed -> keep real mic
+    // OBS INJECT (gated): overwrite ONLY the exact mic-effect buffer — a single-buffer, mono, exactly-n
+    // float32 unit (the VPIO effect chain). Requiring mNumberBuffers==1 + mDataByteSize==n*4 excludes the
+    // stereo echo-cancel reference and the odd output buffers (bufs=2 / bytes=16384), which must NOT be
+    // clobbered (that broke the volume/output path and added crackle). Read is continuous (time-anchored
+    // ring); underrun -> keep the real mic.
+    if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && io && io->mNumberBuffers == 1) {
+        AudioBuffer *b = &io->mBuffers[0];
+        if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize == n * sizeof(float)) {
+            if (VCamMicRead((float *)b->mData, n))
                 atomic_fetch_add_explicit(&gObsInjected, 1, memory_order_relaxed);
-            }
         }
-    } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io) {
-        // TONE TEST (gated OFF by default): overwrite each MONO float32 buffer with a 440 Hz sine
-        // synced to the audio clock (mSampleTime), so every unit in a period gets the SAME continuous
-        // tone regardless of how many we fill. Mono only — the mic chain is mono; the stereo buffers
-        // are the silent echo-cancel reference/output. The `>= n*sizeof(float)` guard keeps us to
-        // float32 buffers (int16 ones are skipped, never overwritten past their length).
-        for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
-            AudioBuffer *b = &io->mBuffers[bi];
-            if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
-                float *o = (float *)b->mData;
-                double t0 = t ? t->mSampleTime : 0.0;
-                for (UInt32 i = 0; i < n; i++)
-                    o[i] = 0.25f * sinf((float)(2.0 * M_PI * 440.0 * (t0 + (double)i) / 48000.0));
-                atomic_fetch_add_explicit(&gToneInjected, 1, memory_order_relaxed);
-            }
+    } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io && io->mNumberBuffers == 1) {
+        // TONE TEST (gated OFF by default): 440 Hz sine into the same exact mic buffer, synced to the
+        // audio clock so it's continuous regardless of how many units we fill.
+        AudioBuffer *b = &io->mBuffers[0];
+        if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize == n * sizeof(float)) {
+            float *o = (float *)b->mData;
+            double t0 = t ? t->mSampleTime : 0.0;
+            for (UInt32 i = 0; i < n; i++)
+                o[i] = 0.25f * sinf((float)(2.0 * M_PI * 440.0 * (t0 + (double)i) / 48000.0));
+            atomic_fetch_add_explicit(&gToneInjected, 1, memory_order_relaxed);
         }
     }
 
@@ -306,6 +314,14 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_mictone"] ? 1 : 0);
                 atomic_store(&gMicInject,
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micinject"] ? 1 : 0);
+                // Live A/V-sync tuning: vcam_miclat holds the target latency in ms (e.g. `echo 60 > ...`).
+                NSString *ls = [NSString stringWithContentsOfFile:@"/var/mobile/Media/vcam_miclat"
+                                                         encoding:NSUTF8StringEncoding error:nil];
+                if (ls) {
+                    int ms = [ls intValue];
+                    if (ms < 10) ms = 10; else if (ms > 1000) ms = 1000;
+                    atomic_store(&gLatMs, (uint32_t)ms);
+                }
                 sleep(2);
             }
         });
