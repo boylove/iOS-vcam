@@ -240,14 +240,11 @@ CI_BRANCH=<branch> python scripts/ci_fetch.py status | wait | download <dir>
 
 ## 8. 附录
 
-### 8.1 逆向原始产物（保留）
-| 路径 | 内容 |
-|------|------|
-| `_orig_vcamera.dylib` / `_orig_vcamera.plist` | 原版二进制 + 注入 plist（= deb payload） |
-| `_re_static/analyze.py` `macho.py` `disas_*.py` | deb/Mach-O/符号解析 + arm64e 反汇编器 |
-| `_re_static/{cstrings,classnames,defined_classes,all_classes,engine_disasm}.txt` | 字符串/类/反汇编转储 |
-| `ios/iosvcam_base.deb` | 原版 deb 主控（有到期授权锁） |
-| `scripts/re_vcamera*.py` `re_xref.py` | 逆向脚本 |
+### 8.1 逆向原始产物（已移除）
+项目现在只维护 `ios/open_vcam_tweak/` 源码，闭源原版 vcamera 的逆向产物
+（原版 dylib/plist、`ios/iosvcam_base.deb`、`_re_static/`、`_analysis_iosvcam_base/`、
+`scripts/re_vcamera*.py`/`re_xref.py`/`extract_deb.py` 等逆向脚本）已从仓库删除。
+本文档余下章节即当时逆向所得的成果记录，逆向阶段已结束。
 
 ### 8.2 版本脉络（OpenVCam）
 - 0.5.3 修 RootHide 幻影安装/ellekit 破坏（符号链接感知）。

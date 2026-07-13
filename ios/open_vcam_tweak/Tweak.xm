@@ -18,7 +18,7 @@
 // OpenVCam — mediaserverd camera replacement.
 //
 // Replicates the closed com.x.vcamera approach per the deep binary reverse
-// (../../VCAMERA_OPENVCAM_COMPLETE_REFERENCE.md §2): hook the terminal BufferWorks
+// (../../docs/VCAMERA_OPENVCAM_COMPLETE_REFERENCE.md §2): hook the terminal BufferWorks
 // node `BWNodeOutput -emitSampleBuffer:` inside mediaserverd and OVERWRITE THE
 // CAMERA'S OWN CVImageBuffer IN PLACE with the decoded RTMP frame via
 // VTPixelTransferSessionTransferImage, then pass the SAME (now-overwritten) sample

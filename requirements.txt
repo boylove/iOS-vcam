@@ -1,0 +1,8 @@
+# iOS-VCAM Python dependencies
+# Install on a new machine with:  python -m pip install -r requirements.txt
+#
+# server.py  — Flask auth endpoint (port 80) for iOS app pairing
+flask>=2.0
+
+# scripts/ci_fetch.py and scripts/ci_logs.py use only the Python standard
+# library (urllib, json, zipfile, subprocess) — no extra packages required.

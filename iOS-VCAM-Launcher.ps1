@@ -1860,11 +1860,8 @@ function Start-MonibucaViaSshUsb {
     }
     Write-Host "  ✅ idevice_id found: $ideviceIdPath" -ForegroundColor Green
 
-    # Check for plink.exe (in project root)
-    $plinkPath = Join-Path $script:SRSHome "plink.exe"
-    if (-not (Test-Path $plinkPath)) {
-        $plinkPath = Resolve-ExecutablePath "" "plink.exe"
-    }
+    # Check for plink.exe (project root, tools\, or PATH)
+    $plinkPath = Resolve-ExecutablePath "" "plink.exe"
     if (-not $plinkPath -or -not (Test-Path $plinkPath)) {
         Write-Host "  ❌ plink.exe not found!" -ForegroundColor Red
         Write-Host "     Expected in project root or PATH" -ForegroundColor Gray
