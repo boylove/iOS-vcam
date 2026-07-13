@@ -30,8 +30,11 @@
 #import <substrate.h>
 #import <stdatomic.h>
 #import <math.h>
+#import <string.h>
+#import <os/lock.h>
 
 #import "VCamLog.h"
+#import "VCamAudioSink.h"   // gVCamPCMSink, VCamPCMSink, IVCAMMediaActivePushPCM
 
 // TONE TEST gate (default OFF). Set by a background poller from the flag file, so it can be
 // toggled without a reboot. When ON, the AUProcess hook overwrites the mono mic-effect buffers
@@ -39,6 +42,75 @@
 // overwriting here is crash-safe) before the real OBS pipeline is wired.
 static _Atomic int gMicTone = 0;
 static _Atomic uint64_t gToneInjected = 0;
+
+// OBS INJECT gate (default OFF, /var/mobile/Media/vcam_micinject). When ON, the AUProcess hook
+// overwrites the mono mic-effect buffers with the OBS audio (resampled to 48 kHz mono) instead of
+// the tone — the real fix. Kept flag-gated for this first OBS test; once confirmed it becomes the
+// default (driven by the 替换音频 toggle) and the probe/flags are removed.
+static _Atomic int gMicInject = 0;
+static _Atomic uint64_t gObsInjected = 0;
+
+// --- OBS mic FIFO: mono int16 @ 48 kHz, resampled on push from the shared AAC decoder. The AUProcess
+// hook pops one period per audio-clock tick and converts to float in place. A small jitter buffer
+// (prime before popping; re-prime on underrun) keeps it from stuttering on SRS's bursty delivery. ---
+#define VCAM_MIC_CAP   9600u   // ~200 ms @ 48 kHz mono
+#define VCAM_MIC_PRIME 2400u   // ~50 ms buffered before we start popping
+static int16_t  gMicFifo[VCAM_MIC_CAP];
+static uint32_t gMicFifoLen = 0;
+static int      gMicPrimed = 0;
+static os_unfair_lock gMicLock = OS_UNFAIR_LOCK_INIT;
+
+// Producer (AAC decode thread, off the RT audio thread): resample srcRate->48k, downmix ->mono, append.
+static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
+    if (!pcm || frames < 2 || !(ch == 1 || ch == 2) || rate == 0) return;
+    int16_t tmp[8192];
+    double step = (double)rate / 48000.0, pos = 0.0;
+    uint32_t no = 0;
+    while (no < 8192 && pos < (double)(frames - 1)) {
+        long i = (long)pos; double fr = pos - (double)i;
+        int a, b;
+        if (ch == 1) { a = pcm[i]; b = pcm[i + 1]; }
+        else { a = ((int)pcm[i*2] + pcm[i*2+1]) / 2; b = ((int)pcm[(i+1)*2] + pcm[(i+1)*2+1]) / 2; }
+        tmp[no++] = (int16_t)lround((double)a + ((double)b - (double)a) * fr);
+        pos += step;
+    }
+    if (no == 0 || no > VCAM_MIC_CAP) return;
+    os_unfair_lock_lock(&gMicLock);
+    if (gMicFifoLen + no > VCAM_MIC_CAP) {                 // overflow: drop oldest
+        uint32_t drop = gMicFifoLen + no - VCAM_MIC_CAP;
+        if (drop > gMicFifoLen) drop = gMicFifoLen;
+        memmove(gMicFifo, gMicFifo + drop, (gMicFifoLen - drop) * sizeof(int16_t));
+        gMicFifoLen -= drop;
+    }
+    memcpy(gMicFifo + gMicFifoLen, tmp, no * sizeof(int16_t));
+    gMicFifoLen += no;
+    if (!gMicPrimed && gMicFifoLen >= VCAM_MIC_PRIME) gMicPrimed = 1;
+    os_unfair_lock_unlock(&gMicLock);
+}
+
+// Consumer (RT audio thread): pop n mono int16. Returns 1 if filled; 0 on underrun (caller keeps
+// the real mic for that period rather than injecting a gap).
+static int VCamMicPop(int16_t *dst, uint32_t n) {
+    int ok = 0;
+    os_unfair_lock_lock(&gMicLock);
+    if (gMicPrimed && gMicFifoLen >= n) {
+        memcpy(dst, gMicFifo, n * sizeof(int16_t));
+        memmove(gMicFifo, gMicFifo + n, (gMicFifoLen - n) * sizeof(int16_t));
+        gMicFifoLen -= n;
+        ok = 1;
+    } else if (gMicFifoLen < n) {
+        gMicPrimed = 0;                                   // underran -> refill before popping again
+    }
+    os_unfair_lock_unlock(&gMicLock);
+    return ok;
+}
+
+// Feed wrapper installed over gVCamPCMSink: keep the stock-Camera emit ring fed AND fill the mic FIFO.
+static VCamPCMSink gPrevSink = NULL;
+static void VCamMicFeedSink(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch, int64_t pts) {
+    if (gPrevSink) gPrevSink(pcm, frames, rate, ch, pts);
+    VCamMicPush(pcm, frames, rate, ch);
+}
 
 
 static BOOL VCamProbeSilenced(void) {
@@ -118,12 +190,32 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
                          UInt32 n, AudioBufferList *io) {
     OSStatus s = origAUP(u, f, t, n, io);
 
-    // TONE TEST (gated OFF by default): overwrite each MONO float32 buffer with a 440 Hz sine
-    // synced to the audio clock (mSampleTime), so every unit in a period gets the SAME continuous
-    // tone regardless of how many we fill. Mono only — the mic chain is mono; the stereo buffers
-    // are the silent echo-cancel reference/output. The `>= n*sizeof(float)` guard keeps us to
-    // float32 buffers (int16 ones are skipped, never overwritten past their length).
-    if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io) {
+    // OBS INJECT (gated): overwrite each mono float32 buffer with the OBS audio. Pop ONCE per audio
+    // period (keyed by mSampleTime) so every mic-effect unit in that period gets the SAME slice — the
+    // serial chain's final output is then the OBS audio. Underrun -> keep the real mic for that period.
+    if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && io) {
+        static double gLastT = -1.0; static int16_t gSlice[8192]; static int gSliceOK = 0; static uint32_t gSliceN = 0;
+        double t0 = t ? t->mSampleTime : 0.0;
+        if (t0 != gLastT || gSliceN != n) {          // new period -> pop one slice
+            gLastT = t0; gSliceN = n;
+            gSliceOK = (n > 0 && n <= 8192) ? VCamMicPop(gSlice, n) : 0;
+        }
+        if (gSliceOK) {
+            for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
+                AudioBuffer *b = &io->mBuffers[bi];
+                if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
+                    float *o = (float *)b->mData;
+                    for (UInt32 i = 0; i < n; i++) o[i] = (float)gSlice[i] / 32768.0f;
+                    atomic_fetch_add_explicit(&gObsInjected, 1, memory_order_relaxed);
+                }
+            }
+        }
+    } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io) {
+        // TONE TEST (gated OFF by default): overwrite each MONO float32 buffer with a 440 Hz sine
+        // synced to the audio clock (mSampleTime), so every unit in a period gets the SAME continuous
+        // tone regardless of how many we fill. Mono only — the mic chain is mono; the stereo buffers
+        // are the silent echo-cancel reference/output. The `>= n*sizeof(float)` guard keeps us to
+        // float32 buffers (int16 ones are skipped, never overwritten past their length).
         for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
             AudioBuffer *b = &io->mBuffers[bi];
             if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
@@ -145,9 +237,10 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
             UInt32 ch = (io && bufs) ? io->mBuffers[0].mNumberChannels : 0;
             int nz = VCamBufNonZero(io);
             VCamProbeLog([NSString stringWithFormat:
-                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu calls=%llu",
+                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu obs=%llu fifo=%u calls=%llu",
                 u, (unsigned)n, (unsigned)bufs, (unsigned)ch, (unsigned)bytes, nz,
-                (unsigned long long)atomic_load(&gToneInjected), k]);
+                (unsigned long long)atomic_load(&gToneInjected),
+                (unsigned long long)atomic_load(&gObsInjected), (unsigned)gMicFifoLen, k]);
         }
     }
     return s;
@@ -203,13 +296,20 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
         MSHookFunction((void *)AudioComponentInstanceNew,       (void *)probeACIN, (void **)&origACIN);
         VCamLog(@"probe: mediaserverd audio probe installed (AURender/AUProcess/ACFill/ACConvert/NEWUNIT) — log-only");
 
-        // Flag poller: enable the tone test when /var/mobile/Media/vcam_mictone exists (toggles
-        // live, no reboot). Default OFF, so a normal install stays a pure log-only probe.
+        // Feed the OBS mic FIFO from the shared AAC decoder by wrapping the existing PCM sink, so the
+        // stock-Camera emit ring keeps working AND the AUProcess hook has OBS audio to inject.
+        gPrevSink = gVCamPCMSink ?: IVCAMMediaActivePushPCM;
+        gVCamPCMSink = VCamMicFeedSink;
+
+        // Flag poller: enable the tone test (vcam_mictone) / OBS injection (vcam_micinject) live,
+        // no reboot. Both default OFF, so a normal install stays a pure log-only probe.
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
             NSFileManager *fm = [NSFileManager defaultManager];
             for (;;) {
                 atomic_store(&gMicTone,
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_mictone"] ? 1 : 0);
+                atomic_store(&gMicInject,
+                             [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micinject"] ? 1 : 0);
                 sleep(2);
             }
         });
