@@ -29,6 +29,13 @@ void IVCAMSetVideoPTS(int64_t ptsMs);
 int64_t  IVCAMVideoPtsMs(void);
 uint64_t IVCAMVideoPtsHost(void);
 
+// Camera-capture-active heartbeat. VCamEmit (the capture-graph emit hook) calls IVCAMNoteCameraActive()
+// per frame; IVCAMCameraActive() is 1 only if a frame emitted within ~700 ms. The mic injection gates on
+// it so it fires during a real capture (recording/preview) but NOT during playback — playback OUTPUT
+// audio also runs through mono AudioUnitProcess units, which the injection must not overwrite.
+void IVCAMNoteCameraActive(void);
+int  IVCAMCameraActive(void);
+
 // Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). Read by IVCAMAudioOBSStreaming.
 void IVCAMSetOBSStreaming(int on);
 int  IVCAMAudioOBSStreaming(void);

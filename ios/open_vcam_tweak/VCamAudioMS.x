@@ -57,6 +57,27 @@ void IVCAMSetVideoPTS(int64_t ptsMs) {
 }
 int64_t  IVCAMVideoPtsMs(void)   { return atomic_load_explicit(&gVCamVideoPtsMs,   memory_order_acquire); }
 uint64_t IVCAMVideoPtsHost(void) { return atomic_load_explicit(&gVCamVideoPtsHost, memory_order_relaxed); }
+
+// Camera-capture-active heartbeat. The video emit hook (Tweak.xm VCamEmit) stamps this every time the
+// capture graph emits a frame; the mediaserverd mic injection (VCamAudioProbe.x) gates on it so it ONLY
+// overwrites the mic WHILE A CAPTURE IS RUNNING — not during Photos/music playback, whose OUTPUT audio
+// also flows through mono AudioUnitProcess units. The broad 0.6.58 inject clobbered those too, bleeding
+// OBS/tone over all device playback (that's why Photos playback carried the OBS sound / the tone).
+static _Atomic uint64_t gVCamCamHost = 0;
+void IVCAMNoteCameraActive(void) {
+    atomic_store_explicit(&gVCamCamHost, mach_absolute_time(), memory_order_relaxed);
+}
+int IVCAMCameraActive(void) {
+    uint64_t last = atomic_load_explicit(&gVCamCamHost, memory_order_relaxed);
+    if (!last) return 0;
+    static _Atomic double toMs = 0.0;
+    double m = atomic_load_explicit(&toMs, memory_order_relaxed);
+    if (m == 0.0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+                    m = (double)tb.numer / (double)tb.denom / 1.0e6;
+                    atomic_store_explicit(&toMs, m, memory_order_relaxed); }
+    uint64_t now = mach_absolute_time();
+    return (now > last) && ((double)(now - last) * m < 700.0);   // active if a frame emitted within 700 ms
+}
 void IVCAMSetOBSStreaming(int on) { __atomic_store_n(&gOBS, on ? 1 : 0, __ATOMIC_RELEASE); }
 int  IVCAMAudioOBSStreaming(void) { return __atomic_load_n(&gOBS, __ATOMIC_ACQUIRE); }
 

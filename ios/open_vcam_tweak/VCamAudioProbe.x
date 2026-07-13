@@ -220,17 +220,18 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
     OSStatus s = origAUP(u, f, t, n, io);
 
     // OBS INJECT (gated): overwrite ONLY the exact mic-effect buffer — a single-buffer, mono, exactly-n
-    // float32 unit (the VPIO effect chain). Requiring mNumberBuffers==1 + mDataByteSize==n*4 excludes the
-    // stereo echo-cancel reference and the odd output buffers (bufs=2 / bytes=16384), which must NOT be
-    // clobbered (that broke the volume/output path and added crackle). The read is keyed by THIS unit's
-    // mSampleTime so each of the ~7 mic-effect units gets a contiguous OBS stream; underrun -> real mic.
-    if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && io && io->mNumberBuffers == 1) {
+    // float32 unit. IVCAMCameraActive() is the KEY gate: the same mono AudioUnitProcess format is used by
+    // PLAYBACK output (Photos/music), so without it the inject bleeds OBS over all device playback (0.6.58
+    // — Photos playback carried the OBS sound/tone). Gating on a live capture (VCamEmit heartbeat) confines
+    // it to recording. Read is keyed by THIS unit's mSampleTime so each mic-effect unit gets a contiguous
+    // OBS stream; underrun -> real mic.
+    if (atomic_load_explicit(&gMicInject, memory_order_relaxed) && IVCAMCameraActive() && io && io->mNumberBuffers == 1) {
         AudioBuffer *b = &io->mBuffers[0];
         if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize == n * sizeof(float)) {
             if (VCamMicRead(u, t ? t->mSampleTime : 0.0, (float *)b->mData, n))
                 atomic_fetch_add_explicit(&gObsInjected, 1, memory_order_relaxed);
         }
-    } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io && io->mNumberBuffers == 1) {
+    } else if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && IVCAMCameraActive() && io && io->mNumberBuffers == 1) {
         // TONE TEST (gated OFF by default): 440 Hz sine into the same exact mic buffer, synced to the
         // audio clock so it's continuous regardless of how many units we fill.
         AudioBuffer *b = &io->mBuffers[0];

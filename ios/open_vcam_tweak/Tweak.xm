@@ -351,6 +351,7 @@ static void VCamEmit(id self, SEL _cmd, CMSampleBufferRef sb) {
     IMP orig = VCamFindOrig(gEmitOrigs, self);
     if (!orig) return;
     gEmitEntries++;                            // heartbeat: entered (before any work)
+    IVCAMNoteCameraActive();                   // mark camera capture active (gates the mediaserverd mic inject)
     [[VCamRTMPSource shared] ensureStarted];   // idempotent; keeps the RTMP puller alive
     CVImageBufferRef ib = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
     BOOL did = NO;
