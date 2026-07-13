@@ -36,6 +36,7 @@
 
 #import "VCamLog.h"
 #import "VCamAudioSink.h"   // gVCamPCMSink, VCamPCMSink, IVCAMMediaActivePushPCM
+#import "VCamConfig.h"      // [VCamConfig shared].replaceAudio — the 替换音频 toggle drives the inject
 
 // TONE TEST gate (default OFF). Set by a background poller from the flag file, so it can be
 // toggled without a reboot. When ON, the AUProcess hook overwrites the mono mic-effect buffers
@@ -44,10 +45,12 @@
 static _Atomic int gMicTone = 0;
 static _Atomic uint64_t gToneInjected = 0;
 
-// OBS INJECT gate (default OFF, /var/mobile/Media/vcam_micinject). When ON, the AUProcess hook
-// overwrites the mono mic-effect buffers with the OBS audio (resampled to 48 kHz mono) instead of
-// the tone — the real fix. Kept flag-gated for this first OBS test; once confirmed it becomes the
-// default (driven by the 替换音频 toggle) and the probe/flags are removed.
+// OBS INJECT gate. Driven by the floating panel's 替换音频 switch ([VCamConfig shared].replaceAudio,
+// default ON): the background poller mirrors that BOOL into this atomic so the RT AUProcess hook reads
+// ONE atomic and never touches objc/the config lock on the audio thread. The legacy flag file
+// /var/mobile/Media/vcam_micinject still force-enables it (a no-UI escape hatch / SSH test), OR'd in.
+// When ON, the AUProcess hook overwrites the mono mic-effect buffers with OBS audio (resampled to 48 kHz
+// mono). This is the RootHide-surviving TikTok mic replacement (the in-process hook never loads there).
 static _Atomic int gMicInject = 0;
 static _Atomic uint64_t gObsInjected = 0;
 
@@ -82,19 +85,53 @@ static int              gDbgLatMs = 0;              // current playback latency 
 static int              gDbgUnits = 0;              // number of registered mic-effect units
 
 // Producer (single AAC-decode thread, off the RT path): resample srcRate->48k, downmix ->mono, write ring.
+// CRITICAL: the resample PHASE is carried across calls (gSrcPhase = fractional position into THIS block's
+// input, plus a spilled last sample for interpolation across the block boundary). The old version reset
+// pos=0 each block AND stopped at frames-1, so it dropped the last input sample of EVERY block and started
+// each block at a fresh phase — a periodic discontinuity ≈ every (blockFrames/48k) that TikTok recorded as
+// a "滋滋啦啦" crackle. Now the last sample of block N is the interpolation anchor for the first sample of
+// block N+1, and the sub-sample phase persists, so the 48 kHz output is one continuous stream (like the
+// clean IVCAMAudioPopForEmit path the stock Camera uses). gPrevSample/gHavePrev/gSrcPhase touched only on
+// this single decode thread (no lock needed); the ring store is the release publish to the RT reader.
+static double  gSrcPhase = 0.0;    // fractional read position within the current input block
+static int16_t gPrevSample = 0;    // last mono sample of the previous block (cross-block interp anchor)
+static int     gHavePrev = 0;
 static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
-    if (!pcm || frames < 2 || !(ch == 1 || ch == 2) || rate == 0) return;
+    if (!pcm || frames < 1 || !(ch == 1 || ch == 2) || rate == 0) return;
     int16_t tmp[8192];
-    double step = (double)rate / 48000.0, pos = 0.0;
+    double step = (double)rate / 48000.0;
     uint32_t no = 0;
-    while (no < 8192 && pos < (double)(frames - 1)) {
-        long i = (long)pos; double fr = pos - (double)i; int a, b;
-        if (ch == 1) { a = pcm[i]; b = pcm[i + 1]; }
-        else { a = ((int)pcm[i*2] + pcm[i*2+1]) / 2; b = ((int)pcm[(i+1)*2] + pcm[(i+1)*2+1]) / 2; }
-        tmp[no++] = (int16_t)lround((double)a + ((double)b - (double)a) * fr);
+    uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_relaxed);
+
+    // Downmix helper (mono/stereo -> mono int16) for input index i in [-1 .. frames-1],
+    // where -1 refers to the carried last sample of the previous block.
+    #define VCAM_MONO_AT(i) ( (i) < 0 ? (int)gPrevSample \
+                              : (ch == 1 ? (int)pcm[(i)] \
+                                         : (((int)pcm[(i)*2] + (int)pcm[(i)*2+1]) / 2)) )
+
+    // pos is measured from the previous block's last sample: pos in [0,1) interpolates prev->first,
+    // pos in [k,k+1) interpolates input[k-1]->input[k]. On the very first block (no prev), start at
+    // the first real sample so we don't fabricate a leading sample from silence.
+    double pos = gHavePrev ? gSrcPhase : 1.0;
+    double limit = (double)frames;   // last valid interpolation is input[frames-2]->input[frames-1] at pos<frames
+    while (no < 8192 && pos < limit) {
+        long k = (long)pos;               // integer part: interpolate (k-1) -> (k)
+        double fr = pos - (double)k;
+        int a = VCAM_MONO_AT(k - 1);
+        int b = VCAM_MONO_AT(k);
+        int v = (int)lround((double)a + ((double)b - (double)a) * fr);
+        if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+        tmp[no++] = (int16_t)v;
         pos += step;
     }
-    uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_relaxed);
+    // Carry the sub-sample phase into the next block (measured from this block's last sample) and
+    // remember that last sample as the next block's interp anchor.
+    gSrcPhase = pos - (double)frames;     // how far past the block end we landed (0..step)
+    if (gSrcPhase < 0.0) gSrcPhase = 0.0;
+    gPrevSample = (int16_t)VCAM_MONO_AT((long)frames - 1);
+    gHavePrev = 1;
+    #undef VCAM_MONO_AT
+
     for (uint32_t i = 0; i < no; i++) gRing[(wp + i) % VCAM_RING] = tmp[i];
     atomic_store_explicit(&gWritePos, wp + no, memory_order_release);
 }
@@ -318,15 +355,19 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
         gPrevSink = gVCamPCMSink ?: IVCAMMediaActivePushPCM;
         gVCamPCMSink = VCamMicFeedSink;
 
-        // Flag poller: enable the tone test (vcam_mictone) / OBS injection (vcam_micinject) live, no
-        // reboot; vcam_miclat sets the fixed playback latency (ms) for lip-sync. Tone/inject default OFF.
+        // Toggle poller: the OBS mic injection is driven by the 替换音频 switch (VCamConfig.replaceAudio,
+        // default ON), so the UI controls TikTok's mic just like it controls the video. The legacy
+        // vcam_micinject flag file is OR'd in as a no-UI escape hatch. The tone test stays flag-only
+        // (vcam_mictone). vcam_miclat sets the fixed playback latency (ms) for lip-sync. Polling here keeps
+        // the RT AUProcess hook reading a single atomic (no objc / config lock on the audio thread).
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
             NSFileManager *fm = [NSFileManager defaultManager];
             for (;;) {
+                BOOL toggleOn = [VCamConfig shared].replaceAudio;
+                BOOL flagOn   = [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micinject"];
+                atomic_store(&gMicInject, (toggleOn || flagOn) ? 1 : 0);
                 atomic_store(&gMicTone,
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_mictone"] ? 1 : 0);
-                atomic_store(&gMicInject,
-                             [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micinject"] ? 1 : 0);
                 // Fixed playback latency: vcam_miclat holds the target ms (e.g. `echo 150 > ...`).
                 NSString *ls = [NSString stringWithContentsOfFile:@"/var/mobile/Media/vcam_miclat"
                                                          encoding:NSUTF8StringEncoding error:nil];
