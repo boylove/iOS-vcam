@@ -30,20 +30,6 @@ The distribution includes `plink.exe` and `pscp.exe`. Prefer read-only diagnosti
 
 ---
 
-## 🎨 Debranding
-
-You can modify the iOS package to inject your server's IP address, making the installation "Plug & Play" for the device.
-
-**Tool:** `ios/ios_deb_ip_changer_final.py`
-
-**Usage:**
-```bash
-python ios/ios_deb_ip_changer_final.py --base ios/iosvcam_base.deb 192.168.1.50
-```
-This creates a new `.deb` file with `192.168.1.50` hardcoded as the default control server.
-
----
-
 ## 🕵️ Frida & App Analysis
 
 For advanced users analyzing target applications (e.g., for bypassing jailbreak detection or SSL pinning), we use **Frida**.

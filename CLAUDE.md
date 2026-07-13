@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-iOS-VCAM is a Windows RTMP streaming server distribution for jailbroken iPhones. It bundles SRS (Simple Realtime Server) v5.0.213 with a PowerShell launcher, iPhone-optimized configurations, and iOS `.deb` package tools for IP injection and debranding.
+iOS-VCAM is a Windows RTMP streaming server distribution for jailbroken iPhones. It bundles SRS (Simple Realtime Server) v5.0.213 with a PowerShell launcher, iPhone-optimized configurations, and the OpenVCam iOS tweak (`ios/open_vcam_tweak/`) that replaces the iPhone camera and microphone with the OBS RTMP stream.
 
 ## Commands
 
@@ -31,17 +31,16 @@ pwsh -ExecutionPolicy Bypass -File tests/quick-test.ps1
 pwsh -ExecutionPolicy Bypass -File tests/test-launcher.ps1
 
 # Validate .deb package structure
-python ios/validate_deb.py ios/modified_debs/<file>.deb
+python ios/validate_deb.py <file>.deb
 ```
 
-### iOS Package Operations
-```bash
-# Generate IP-customized .deb package
-python ios/ios_deb_ip_changer_final.py --base ios/iosvcam_base.deb 192.168.1.100
+### iOS Tweak (OpenVCam)
 
-# Full debranding workflow
-python ios/ios_debrand_end_to_end.py --ip 192.168.1.100
-```
+The only maintained iOS package is the OpenVCam tweak in `ios/open_vcam_tweak/`
+(`com.iosvcam.opencam`), built via GitHub Actions (see `.github/workflows/build-open-vcam-tweak.yml`)
+and fetched with `python scripts/ci_fetch.py download _ci_out`. The RTMP pull URL and
+替换视频/替换音频 toggles are set at runtime from the tweak's floating panel — no per-IP
+`.deb` rebuild is needed.
 
 ### Stream Testing
 ```bash
@@ -67,11 +66,10 @@ curl http://localhost:1985/api/v1/versions
 
 3. **Flask Auth Server (`server.py`)** - iOS app authentication on port 80
 
-4. **iOS Tools (`ios/`)**
-   - `ios_deb_ip_changer_final.py` - IP injection into .deb packages
-   - `ios_debrand_end_to_end.py` - Full debranding workflow
-   - `deb_packer.py` - AR archive creation
-   - `validate_deb.py` - Package structure validation
+4. **iOS Tweak (`ios/open_vcam_tweak/`)** - the OpenVCam tweak source (`com.iosvcam.opencam`),
+   built via GitHub Actions. Supporting tools:
+   - `validate_deb.py` - Package structure validation (used by the OpenVCam CI)
+   - `retag_deb_architecture.py` - Rewrite control Architecture to arm64e (used by the OpenVCam CI)
 
 ### Key Launcher Functions
 | Function | Line | Purpose |
@@ -80,8 +78,7 @@ curl http://localhost:1985/api/v1/versions
 | `Update-SRSConfigForNewIP` | ~570 | IP placeholder replacement |
 | `Show-MainMenu` | ~605 | Interactive menu display |
 | `Start-CombinedFlaskAndSRS` | ~740 | Main streaming launcher |
-| `Start-MonibucaViaSshUsb` | ~1312 | USB streaming via SSH tunnel (option U) |
-| `Show-iOSDebCreator` | ~2463 | iOS .deb builder (option 8) |
+| `Start-MonibucaViaSshUsb` | ~1312 | USB streaming via SSH tunnel (option U); includes the auto-reconnect watchdog |
 | `Show-ConfigSelector` | ~2714 | Configuration profile picker |
 | `Show-ConfigurationSettings` | ~3261 | Settings menu (option C) |
 
@@ -107,7 +104,7 @@ Stream RTMP from iPhone to PC over USB cable using SSH reverse tunneling. Elimin
 - `iproxy.exe` and `idevice_id.exe` at `C:\iProxy\` (libimobiledevice)
 - `plink.exe` in project root (PuTTY suite)
 - OpenSSH installed on jailbroken iPhone
-- iPhone .deb patched with `127.10.10.10` IP address
+- OpenVCam tweak installed; RTMP URL set to `rtmp://127.10.10.10:1935/live/srs` in its floating panel
 
 **How it works:**
 1. iproxy forwards `localhost:2222 → iPhone:22` over USB
@@ -116,7 +113,6 @@ Stream RTMP from iPhone to PC over USB cable using SSH reverse tunneling. Elimin
 4. Traffic flows: iPhone → SSH tunnel → USB → PC Monibuca
 
 **Files:**
-- Pre-built .deb: `ios/modified_debs/iosvcam_base_127_10_10_10.deb`
 - Full docs: `docs/Streaming-Guide.md`
 
 **Jetsam Protection (Requires jetsamctl):**
@@ -135,8 +131,6 @@ Without jetsamctl, VNC will crash when camera apps open. The launcher checks for
 | jetsamctl runtime | Needs reapply each session | ✅ Actually works |
 
 The launcher now uses **both** methods: plist (backup) + jetsamctl (primary). jetsamctl runs every USB streaming session to apply kernel-level protection.
-
-See `docs/USB-Camera-Conflict-Analysis.md` for technical details.
 
 ### CRITICAL: After iPhone Reboot / Re-Jailbreak
 
@@ -166,17 +160,15 @@ $fp = (.\plink.exe -ssh -batch -P 2222 -pw icemat root@localhost exit 2>&1 | Sel
 $fp = (.\plink.exe -ssh -batch -P 2222 -pw icemat root@localhost exit 2>&1 | Select-String "SHA256:").Matches.Value
 ```
 
-### iOS .deb Package System
+### iOS Tweak Build (OpenVCam)
 
-The debranding workflow:
-1. **Extract**: AR archive → control.tar.gz + data.tar.lzma
-2. **Patch**: Binary replacement preserving byte lengths
-3. **Repack**: LZMA-alone compression (not XZ - iOS requirement)
-4. **Validate**: Member order: debian-binary, control.tar.gz, data.tar.lzma
-
-Debranding patterns:
-- `www.bkatm.com` → `localhost` (padded)
-- `https://www.bkatm.com` → `http://localhost` (padded)
+The OpenVCam tweak (`ios/open_vcam_tweak/`, `com.iosvcam.opencam`) is a Theos/Logos
+project built on GitHub Actions (`.github/workflows/build-open-vcam-tweak.yml`), not on
+Windows. The dev loop: push, then `python scripts/ci_fetch.py download _ci_out` to fetch
+the built `.deb`. The CI runs `ios/retag_deb_architecture.py` (control Architecture →
+arm64e) and `ios/validate_deb.py` (member order: debian-binary, control.tar.gz,
+data.tar.*) on the artifact. Install the `.deb` on the phone manually — the launcher never
+modifies the device (read-only iron rule).
 
 ## Coding Conventions
 
@@ -262,7 +254,7 @@ User-facing wiki documentation lives in `docs/`:
 | `Configuration.md` | SRS config profiles and parameters |
 | `Streaming-Guide.md` | WiFi/USB streaming howto |
 | `Troubleshooting.md` | Common issues and fixes |
-| `Advanced-Features.md` | SSH, debranding, Frida, architecture |
+| `Advanced-Features.md` | SSH, Frida, architecture |
 | `iPhone-SSH-Quick-Reference.md` | SSH via USB (iproxy + plink) - device UDIDs, credentials |
 | `USB-Streaming-Debugging.md` | Comprehensive USB tunnel debugging guide |
 | `Post-Reboot-Checklist.md` | Recovery steps after iPhone reboot |

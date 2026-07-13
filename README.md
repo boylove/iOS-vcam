@@ -79,12 +79,11 @@ iOS-VCAM-v4.2-Distribution/
 │   │   └── srs_usb_smooth_playback.conf          # USB streaming
 │   └── archived/                      # Legacy/experimental configs
 │
-├── ios/                               # iOS package tools
-│   ├── ios_deb_ip_changer_final.py   # Inject server IP into .deb
-│   ├── ios_debrand_end_to_end.py     # Full debranding workflow
-│   ├── iosvcam_base.deb              # Base iOS package (pre-debranded)
+├── ios/                               # iOS tweak + build tools
+│   ├── open_vcam_tweak/              # OpenVCam tweak source (com.iosvcam.opencam)
 │   ├── tools/                         # Additional iOS utilities
-│   └── validate_deb.py               # Package validation
+│   ├── retag_deb_architecture.py     # Control Architecture → arm64e (CI)
+│   └── validate_deb.py               # Package validation (CI)
 │
 ├── docs/                              # Documentation
 ├── tests/                             # Test scripts
@@ -130,27 +129,20 @@ mw_latency      100-500; # Target latency in ms
 
 ---
 
-## iOS Package Tools
+## iOS Tweak (OpenVCam)
 
-### Generate IP-Customized Package
+The iOS side is the OpenVCam tweak (`ios/open_vcam_tweak/`, `com.iosvcam.opencam`), built on
+GitHub Actions. Fetch the built package with:
 
 ```bash
-# Create .deb with your server IP embedded
-python ios/ios_deb_ip_changer_final.py --base ios/iosvcam_base.deb 192.168.1.100
-
-# Output: ios/modified_debs/iosvcam_192_168_1_100.deb
+python scripts/ci_fetch.py download _ci_out
 ```
 
-### Validate Package Structure
+The RTMP pull URL and 替换视频/替换音频 toggles are set at runtime from the tweak's floating
+panel, so no per-IP `.deb` rebuild is needed. Validate a built package structure with:
 
 ```bash
-python ios/validate_deb.py ios/modified_debs/your_package.deb
-```
-
-### Full Debranding Workflow
-
-```bash
-python ios/ios_debrand_end_to_end.py --ip 192.168.1.100
+python ios/validate_deb.py <file>.deb
 ```
 
 ---
@@ -175,11 +167,10 @@ iproxy 8080 8080    # HLS/HTTP
 iproxy 80 80        # Flask auth (if needed)
 ```
 
-### 3. Generate Localhost Package
+### 3. Set the RTMP URL
 
-```bash
-python ios/ios_deb_ip_changer_final.py --base ios/iosvcam_base.deb 127.0.0.1
-```
+In the OpenVCam floating panel, set the pull URL to `rtmp://127.10.10.10:1935/live/srs`
+(the USB tunnel address). No per-IP `.deb` rebuild is needed.
 
 ### 4. Use USB-Optimized Config
 
@@ -207,9 +198,6 @@ pwsh -ExecutionPolicy Bypass -File tests/quick-test.ps1
 
 # Full structural verification
 pwsh -ExecutionPolicy Bypass -File tests/test-launcher.ps1
-
-# iOS setup validation
-pwsh -ExecutionPolicy Bypass -File tests/verify_ios_setup.ps1
 ```
 
 ---

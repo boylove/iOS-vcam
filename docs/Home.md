@@ -4,8 +4,8 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 
 ## 🆕 What's New (v3.2+)
 
-*   **USB Setup Validation (Option [9]):** Check local USB streaming prerequisites without installing `.deb` packages from the launcher. [Read more](Advanced-Features.md#usb-setup-validation-option-9)
-*   **Enhanced Debranding:** Improved tools for customizing the iOS package identity.
+*   **USB Setup Validation (Option [9]):** Check local USB streaming prerequisites. [Read more](Advanced-Features.md#usb-setup-validation-option-9)
+*   **Auto-Reconnect Watchdog:** USB streaming self-heals across phone reboots without restarting SRS (OBS keeps publishing).
 *   **Stability Fixes:** Solved PowerShell parser errors and improved USB tunneling stability.
 
 ## 📚 Table of Contents
@@ -44,7 +44,6 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 
 ### [🧠 Advanced Features](Advanced-Features.md)
 *   **USB Setup Validation** (Read-only diagnostics and manual SSH references)
-*   **Debranding** (Customizing the iOS package)
 *   **Frida & Hooks** (Application analysis)
 *   **Architecture** (SRS, Monibuca, Flask)
 

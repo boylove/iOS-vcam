@@ -44,15 +44,12 @@ Ensure your device is jailbroken. Open your package manager (Sileo/Zebra/Cydia) 
 *   `PreferenceLoader`
 *   `Cephei Tweak Support` (common dependency)
 
-### 2. Install the VCAM Tweak
-You can install the VCAM tweak using the launcher's built-in tool:
-1.  Connect your iPhone via USB.
-2.  Run `iOS-VCAM-Launcher.exe`.
-3.  Select **Option [9]** (Install .deb).
-4.  Choose the `iosvcam_base.deb` (or a modified version).
-5.  Follow the prompts to install via SSH.
-
-Alternatively, use Filza on the device to install the `.deb` file.
+### 2. Install the OpenVCam Tweak
+Fetch the built tweak package and install it on the device:
+1.  Download the latest build: `python scripts/ci_fetch.py download _ci_out`.
+2.  Copy `_ci_out/com.iosvcam.opencam_*.deb` to the iPhone (Filza, `pscp`, or your package manager).
+3.  Install it and userspace-reboot (respring) so mediaserverd reloads.
+4.  Open the OpenVCam floating panel and set the RTMP pull URL.
 
 ### 3. Trust the Computer
 *   Connect iPhone to PC via USB.

@@ -87,11 +87,9 @@ try {
     Write-Host "  - Is completely self-contained" -ForegroundColor White
     Write-Host "  - Can be distributed to any Windows system" -ForegroundColor White
     Write-Host ""
-    Write-Host "New Features in v3.2.0:" -ForegroundColor Cyan
-    Write-Host "  - Install .deb to iPhone via SSH (Option 9)" -ForegroundColor Green
-    Write-Host "  - Automatic .deb file selection from modified_debs" -ForegroundColor Green
+    Write-Host "Features:" -ForegroundColor Cyan
+    Write-Host "  - USB streaming via SSH reverse tunnel (Option U) with auto-reconnect watchdog" -ForegroundColor Green
     Write-Host "  - SSH connection testing and validation" -ForegroundColor Green
-    Write-Host "  - Service restart after installation" -ForegroundColor Green
     Write-Host ""
 
 } catch {

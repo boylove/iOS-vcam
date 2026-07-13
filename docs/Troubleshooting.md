@@ -81,7 +81,7 @@
 ### "dpkg: error processing archive"
 *   **Cause:** Corrupt .deb file or architecture mismatch.
 *   **Fix:**
-    *   Regenerate the .deb using `ios_deb_ip_changer_final.py`.
+    *   Re-download the OpenVCam build (`python scripts/ci_fetch.py download _ci_out`) and verify it with `python ios/validate_deb.py <file>.deb`.
     *   Ensure the iPhone has enough storage space (`df -h`).
     *   Try installing manually via Filza on the device to see the exact error message.
 
