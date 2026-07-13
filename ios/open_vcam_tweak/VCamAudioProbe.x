@@ -65,21 +65,37 @@ static _Atomic uint64_t gWritePos = 0;              // producer: total samples w
 static uint64_t         gReadPos  = 0;              // consumer cursor (guarded by gReadLock)
 static uint64_t         gLastHost = 0;
 static double           gHostToSamp = 0.0;          // mach ticks -> 48 kHz samples
+static double           gHostToMs   = 0.0;          // mach ticks -> milliseconds
 static double           gFrac     = 0.0;            // carried fractional sample of the cursor advance (anti-drift)
 static int              gReadSynced = 0;
-// Target latency behind the write head (ms). Tunable LIVE via /var/mobile/Media/vcam_miclat (a plain
-// number of ms) because the A/V offset sign is stream-dependent: if lips lag, lower it; if audio leads
-// video, raise it. Default 100 ms; poller clamps to [10,1000] (ring is 2 s, so 1 s max leaves headroom).
+// Fixed-mode / fallback target latency behind the write head (ms). Used when dynamic PTS sync is off
+// (vcam_micfixed) or before the first video/audio PTS. Tunable LIVE via /var/mobile/Media/vcam_miclat.
 static _Atomic uint32_t gLatMs = 100;
 static os_unfair_lock   gReadLock = OS_UNFAIR_LOCK_INIT;
+
+// PTS anchor for dynamic A/V sync: the newest push's first output sample sits at gAnchorPos carrying
+// RTMP PTS gAnchorPts (ms). Audio PTS is linear in sample position (contiguous 48 kHz), so ONE rolling
+// anchor maps any recent position <-> stream time. Updated under gReadLock by the producer.
+static uint64_t         gAnchorPos = 0;
+static int64_t          gAnchorPts = 0;
+static int              gAnchorSet = 0;
+// Dynamic PTS sync ON by default; /var/mobile/Media/vcam_micfixed forces the old fixed-latency behaviour
+// (a no-rebuild escape hatch if dynamic ever misbehaves).
+static _Atomic int      gDynSync = 1;
+// Health-log telemetry (written under gReadLock, read unlocked — approximate is fine).
+static int              gDbgErrMs = 0;              // residual A/V error (ms) after correction
+static int              gDbgDyn   = 0;              // 1 if the last read locked to the PTS target, else 0
 
 static void VCamMicInitClock(void) {
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     gHostToSamp = ((double)tb.numer / (double)tb.denom) * 48000.0 / 1.0e9;   // ticks -> ns -> samples
+    gHostToMs   = ((double)tb.numer / (double)tb.denom) / 1.0e6;             // ticks -> ns -> ms
 }
 
 // Producer (single AAC-decode thread, off the RT path): resample srcRate->48k, downmix ->mono, write ring.
-static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
+// ptsMs is this frame's RTMP presentation timestamp; the first output sample (at wp) carries it, anchoring
+// the position<->stream-time map the dynamic reader uses.
+static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch, int64_t ptsMs) {
     if (!pcm || frames < 2 || !(ch == 1 || ch == 2) || rate == 0) return;
     int16_t tmp[8192];
     double step = (double)rate / 48000.0, pos = 0.0;
@@ -93,30 +109,69 @@ static void VCamMicPush(const int16_t *pcm, uint32_t frames, uint32_t rate, uint
     }
     uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_relaxed);
     for (uint32_t i = 0; i < no; i++) gRing[(wp + i) % VCAM_RING] = tmp[i];
+    os_unfair_lock_lock(&gReadLock);
+    gAnchorPos = wp; gAnchorPts = ptsMs; gAnchorSet = 1;    // this push's first sample <-> its stream PTS
+    os_unfair_lock_unlock(&gReadLock);
     atomic_store_explicit(&gWritePos, wp + no, memory_order_release);
 }
 
-// Consumer (RT audio thread): fill dst[n] (float) from the drift-corrected read window. Returns 1 if
-// primed. Brief lock (arithmetic only; the ring copy is lock-free, ~gLatMs behind the producer). The
-// cursor advances by REAL elapsed mach time, carrying the fractional sample (gFrac) across calls so it
-// tracks 48 kHz exactly — truncating it each call lost <1 sample/call, a slow downward drift that
-// eventually tripped the over-drift resync and clicked. Fixing that removes the residual crackle.
+// Consumer (RT audio thread): fill dst[n] (float) locked to the displayed video. Returns 1 if primed.
+// Two-part clock: (1) the read cursor advances by REAL elapsed mach time (glitch-free, carrying the
+// sub-sample remainder gFrac so it tracks 48 kHz exactly); (2) a SLOW, capped pull nudges it toward the
+// PTS TARGET — the audio sample whose RTMP PTS equals the video shown right now (gVideoPTS extrapolated
+// to `now`, mapped through the audio anchor). The slow pull rejects per-frame decode jitter while
+// correcting drift/offset inaudibly (±2 samples/call outside a ~2.5 ms deadband); a big error snaps.
+// The target is clamped to a [30 ms, 400 ms] latency envelope for underrun headroom. Fixed fallback
+// (vcam_micfixed, or before any PTS): stay a constant gLatMs behind the write head, like 0.6.56.
+#define VCAM_LAT_MIN 1440u    //  30 ms @ 48 kHz — min headroom behind the write head
+#define VCAM_LAT_MAX 19200u   // 400 ms @ 48 kHz — max buffered latency
+#define VCAM_SNAP    12000     // 250 ms error -> hard resync (stream discontinuity / seek)
 static int VCamMicRead(float *dst, uint32_t n) {
     uint32_t lat = atomic_load_explicit(&gLatMs, memory_order_relaxed) * 48u;   // ms -> samples @ 48 kHz
-    uint64_t wp = atomic_load_explicit(&gWritePos, memory_order_acquire);
-    if (wp < (uint64_t)lat + n) return 0;                            // not primed yet
+    uint64_t wp  = atomic_load_explicit(&gWritePos, memory_order_acquire);
+    if (wp < (uint64_t)VCAM_LAT_MAX + n) return 0;                   // not primed yet (need full envelope)
+
     os_unfair_lock_lock(&gReadLock);
     uint64_t now = mach_absolute_time();
-    if (!gReadSynced) { gReadPos = wp - lat; gLastHost = now; gFrac = 0.0; gReadSynced = 1; }
-    else {
-        double adv = (double)(now - gLastHost) * gHostToSamp + gFrac;
-        uint64_t whole = (uint64_t)adv;
-        gFrac = adv - (double)whole;                                 // carry the sub-sample remainder
-        gReadPos += whole; gLastHost = now;
+
+    // Choose the target read position.
+    uint64_t target = (wp > lat) ? wp - lat : 0;                     // fixed / fallback default
+    int usedPts = 0;
+    if (atomic_load_explicit(&gDynSync, memory_order_relaxed) && gAnchorSet) {
+        int64_t  vpts  = IVCAMVideoPtsMs();
+        uint64_t vhost = IVCAMVideoPtsHost();
+        double   vage  = (vhost && now > vhost) ? (double)(now - vhost) * gHostToMs : 1.0e9;
+        if (vpts > 0 && vage < 500.0) {                              // fresh video PTS -> lock to it
+            double curVideoMs = (double)vpts + vage;                 // video stream-time at `now`
+            double d = (double)gAnchorPos + (curVideoMs - (double)gAnchorPts) * 48.0;  // matching audio sample
+            double hi = (wp > VCAM_LAT_MIN) ? (double)(wp - VCAM_LAT_MIN) : 0.0;        // >=30 ms behind head
+            double lo = (wp > VCAM_LAT_MAX) ? (double)(wp - VCAM_LAT_MAX) : 0.0;        // <=400 ms behind head
+            if (d < lo) d = lo; else if (d > hi) d = hi;
+            target = (uint64_t)d;
+            usedPts = 1;
+        }
     }
-    if (gReadPos + n > wp || gReadPos + 2u * lat < wp) { gReadPos = wp - lat; gFrac = 0.0; }  // underrun/over-drift resync
+
+    if (!gReadSynced) { gReadPos = target; gLastHost = now; gFrac = 0.0; gReadSynced = 1; }
+    else {
+        double adv = (double)(now - gLastHost) * gHostToSamp + gFrac; // smooth real-time advance
+        uint64_t whole = (uint64_t)adv; gFrac = adv - (double)whole;
+        gReadPos += whole; gLastHost = now;
+        int64_t err = (int64_t)target - (int64_t)gReadPos;           // + => cursor is behind the target
+        if (err > VCAM_SNAP || err < -VCAM_SNAP) { gReadPos = target; gFrac = 0.0; }  // discontinuity -> snap
+        else if (err > 120 || err < -120) {                         // outside ~2.5 ms deadband -> nudge
+            int64_t stepv = err / 64;
+            if (stepv >  2) stepv =  2; else if (stepv < -2) stepv = -2;
+            if (stepv == 0) stepv = (err > 0) ? 1 : -1;
+            gReadPos = (uint64_t)((int64_t)gReadPos + stepv);
+        }
+    }
+    if (gReadPos + n > wp) { gReadPos = (wp > (uint64_t)n) ? wp - n : 0; gFrac = 0.0; }  // underrun guard
     uint64_t rp = gReadPos;
+    gDbgErrMs = (int)(((int64_t)target - (int64_t)gReadPos) / 48);   // residual after correction
+    gDbgDyn = usedPts;
     os_unfair_lock_unlock(&gReadLock);
+
     for (uint32_t i = 0; i < n; i++) dst[i] = (float)gRing[(rp + i) % VCAM_RING] / 32768.0f;
     return 1;
 }
@@ -125,7 +180,7 @@ static int VCamMicRead(float *dst, uint32_t n) {
 static VCamPCMSink gPrevSink = NULL;
 static void VCamMicFeedSink(const int16_t *pcm, uint32_t frames, uint32_t rate, uint32_t ch, int64_t pts) {
     if (gPrevSink) gPrevSink(pcm, frames, rate, ch, pts);
-    VCamMicPush(pcm, frames, rate, ch);
+    VCamMicPush(pcm, frames, rate, ch, pts);
 }
 
 
@@ -239,11 +294,12 @@ static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const Audio
             UInt32 ch = (io && bufs) ? io->mBuffers[0].mNumberChannels : 0;
             int nz = VCamBufNonZero(io);
             VCamProbeLog([NSString stringWithFormat:
-                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu obs=%llu lat=%u calls=%llu",
+                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu obs=%llu buf=%u dyn=%d averr=%dms calls=%llu",
                 u, (unsigned)n, (unsigned)bufs, (unsigned)ch, (unsigned)bytes, nz,
                 (unsigned long long)atomic_load(&gToneInjected),
                 (unsigned long long)atomic_load(&gObsInjected),
-                (unsigned)(atomic_load_explicit(&gWritePos, memory_order_relaxed) - gReadPos), k]);
+                (unsigned)(atomic_load_explicit(&gWritePos, memory_order_relaxed) - gReadPos),
+                gDbgDyn, gDbgErrMs, k]);
         }
     }
     return s;
@@ -314,7 +370,10 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_mictone"] ? 1 : 0);
                 atomic_store(&gMicInject,
                              [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micinject"] ? 1 : 0);
-                // Live A/V-sync tuning: vcam_miclat holds the target latency in ms (e.g. `echo 60 > ...`).
+                // Dynamic PTS sync is ON unless vcam_micfixed exists (then use the fixed vcam_miclat latency).
+                atomic_store(&gDynSync,
+                             [fm fileExistsAtPath:@"/var/mobile/Media/vcam_micfixed"] ? 0 : 1);
+                // Fixed-mode / fallback latency: vcam_miclat holds the target ms (e.g. `echo 60 > ...`).
                 NSString *ls = [NSString stringWithContentsOfFile:@"/var/mobile/Media/vcam_miclat"
                                                          encoding:NSUTF8StringEncoding error:nil];
                 if (ls) {

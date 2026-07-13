@@ -23,6 +23,12 @@ void IVCAMMediaActivePushPCM(const int16_t *pcm, uint32_t srcFrames,
 // lands on the shown video's PTS — dynamic, self-correcting A/V sync (no fixed delay).
 void IVCAMSetVideoPTS(int64_t ptsMs);
 
+// Read the last-published video PTS (ms) and the mach_absolute_time() ticks when it was set. The mic
+// ring extrapolates (ptsMs + elapsed) to lock audio playback onto the displayed video. Both 0 until the
+// first decoded frame (the consumer then falls back to a fixed latency).
+int64_t  IVCAMVideoPtsMs(void);
+uint64_t IVCAMVideoPtsHost(void);
+
 // Signal OBS streaming state (1 on RTMP connect, 0 on disconnect). Read by IVCAMAudioOBSStreaming.
 void IVCAMSetOBSStreaming(int on);
 int  IVCAMAudioOBSStreaming(void);

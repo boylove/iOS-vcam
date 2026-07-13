@@ -21,6 +21,8 @@
 #import <os/lock.h>
 #import <stdlib.h>
 #import <string.h>
+#import <stdatomic.h>
+#import <mach/mach_time.h>
 
 #import "VCamAudioSink.h"
 
@@ -42,7 +44,19 @@ static volatile uint64_t gPushed = 0;
 static volatile uint64_t gPopHit = 0;
 static volatile uint64_t gPopMiss = 0;
 
-void IVCAMSetVideoPTS(int64_t ptsMs) { (void)ptsMs; }                 // telemetry-only stub (ABI kept)
+// Displayed-video PTS bus for dynamic A/V sync. The H264 decoder publishes the newest decoded OBS
+// frame's RTMP PTS here (VCamH264Decoder output callback) together with the mach time it landed; the
+// mediaserverd mic-injection ring (VCamAudioProbe.x) reads it to lock the audio it plays onto the video
+// shown NOW, instead of a fixed guessed latency. Two plain atomics (ms + host ticks); a torn read is at
+// most one frame stale and self-corrects on the next render.
+static _Atomic int64_t  gVCamVideoPtsMs   = 0;
+static _Atomic uint64_t gVCamVideoPtsHost = 0;
+void IVCAMSetVideoPTS(int64_t ptsMs) {
+    atomic_store_explicit(&gVCamVideoPtsHost, mach_absolute_time(), memory_order_relaxed);
+    atomic_store_explicit(&gVCamVideoPtsMs,   ptsMs, memory_order_release);
+}
+int64_t  IVCAMVideoPtsMs(void)   { return atomic_load_explicit(&gVCamVideoPtsMs,   memory_order_acquire); }
+uint64_t IVCAMVideoPtsHost(void) { return atomic_load_explicit(&gVCamVideoPtsHost, memory_order_relaxed); }
 void IVCAMSetOBSStreaming(int on) { __atomic_store_n(&gOBS, on ? 1 : 0, __ATOMIC_RELEASE); }
 int  IVCAMAudioOBSStreaming(void) { return __atomic_load_n(&gOBS, __ATOMIC_ACQUIRE); }
 
