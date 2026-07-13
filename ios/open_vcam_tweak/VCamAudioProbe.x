@@ -76,10 +76,22 @@ static _Atomic uint32_t gLatMs = 100;
 // Per-unit OBS play mapping: obsPos = gUnitBase[i] + mSampleTime for the matching unit. One base per
 // mic-effect unit gives each a contiguous read (see comment above). Small fixed table, scanned under
 // gReadLock on the RT thread (a handful of entries — trivial).
+//
+// CROSS-SESSION RESET (device-proven bug: 1st TikTok clean, then stock Camera, then 2nd TikTok crackles).
+// This table is NEVER cleared between capture sessions, and CoreAudio DESTROYS the VPIO effect units when
+// recording stops and creates FRESH ones (new pointers) next time. Two failures compound: (a) dead unit
+// pointers from old sessions accumulate and never match, filling the 16 slots; once full, every new unit
+// evicts to slot 0 (the `gUnitCount<MICUNITS ? ... : 0` fallback), so a whole new session's ~7 units
+// COLLAPSE onto ONE shared base — exactly the shared-cursor scramble the per-unit table exists to prevent
+// -> crackle/hum. (b) even below capacity, a re-centre is per-unit so a stale base can linger. Fix: detect
+// a NEW session by the gap in VCamMicRead calls (recording stops -> the mic units stop rendering for
+// seconds; a real render cadence is ~<50 ms apart) and FLUSH the table at the start of each session, so
+// every session rebuilds a clean, collision-free set of per-unit bases with no dead pointers.
 #define VCAM_MICUNITS 16
 static AudioUnit gUnitKey[VCAM_MICUNITS];
 static int64_t   gUnitBase[VCAM_MICUNITS];
 static int       gUnitCount = 0;
+static uint64_t  gLastReadHost = 0;    // mach time of the previous VCamMicRead (session-gap detector)
 // Health-log telemetry (written under gReadLock, read unlocked — approximate is fine).
 static int              gDbgLatMs = 0;              // current playback latency behind the head (ms)
 static int              gDbgUnits = 0;              // number of registered mic-effect units
@@ -148,6 +160,25 @@ static int VCamMicRead(AudioUnit u, double sampleTime, float *dst, uint32_t n) {
     else if (lat > VCAM_LAT_MAX - 2400u) lat = VCAM_LAT_MAX - 2400u; // keep headroom on both sides
 
     os_unfair_lock_lock(&gReadLock);
+
+    // NEW-SESSION FLUSH: if the mic units haven't rendered for a while (recording stopped between apps),
+    // the old units are gone and their pointers are stale — CoreAudio makes fresh ones next session. Clear
+    // the whole table so the new session rebuilds clean per-unit bases with no dead entries and no
+    // collapse-to-slot-0 (the 2nd-TikTok crackle). A live render cadence is tens of ms; use a 400 ms gap.
+    {
+        static _Atomic double toMs = 0.0;
+        double m = atomic_load_explicit(&toMs, memory_order_relaxed);
+        if (m == 0.0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+                        m = (double)tb.numer / (double)tb.denom / 1.0e6;
+                        atomic_store_explicit(&toMs, m, memory_order_relaxed); }
+        uint64_t now = mach_absolute_time();
+        if (gLastReadHost && now > gLastReadHost && (double)(now - gLastReadHost) * m > 400.0) {
+            gUnitCount = 0;                                          // drop all stale units -> fresh session
+            for (int i = 0; i < VCAM_MICUNITS; i++) gUnitKey[i] = NULL;
+        }
+        gLastReadHost = now;
+    }
+
     int64_t st = (int64_t)sampleTime;
     int idx = -1;
     for (int i = 0; i < gUnitCount; i++) if (gUnitKey[i] == u) { idx = i; break; }
