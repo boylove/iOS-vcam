@@ -29,8 +29,17 @@
 #import <AudioUnit/AudioUnit.h>
 #import <substrate.h>
 #import <stdatomic.h>
+#import <math.h>
 
 #import "VCamLog.h"
+
+// TONE TEST gate (default OFF). Set by a background poller from the flag file, so it can be
+// toggled without a reboot. When ON, the AUProcess hook overwrites the mono mic-effect buffers
+// with a 440 Hz sine — proving this is the point that reaches TikTok's recorded mic (and that
+// overwriting here is crash-safe) before the real OBS pipeline is wired.
+static _Atomic int gMicTone = 0;
+static _Atomic uint64_t gToneInjected = 0;
+
 
 static BOOL VCamProbeSilenced(void) {
     static int off = -1;
@@ -108,16 +117,37 @@ static OSStatus (*origAUP)(AudioUnit, AudioUnitRenderActionFlags *, const AudioT
 static OSStatus probeAUP(AudioUnit u, AudioUnitRenderActionFlags *f, const AudioTimeStamp *t,
                          UInt32 n, AudioBufferList *io) {
     OSStatus s = origAUP(u, f, t, n, io);
+
+    // TONE TEST (gated OFF by default): overwrite each MONO float32 buffer with a 440 Hz sine
+    // synced to the audio clock (mSampleTime), so every unit in a period gets the SAME continuous
+    // tone regardless of how many we fill. Mono only — the mic chain is mono; the stereo buffers
+    // are the silent echo-cancel reference/output. The `>= n*sizeof(float)` guard keeps us to
+    // float32 buffers (int16 ones are skipped, never overwritten past their length).
+    if (atomic_load_explicit(&gMicTone, memory_order_relaxed) && io) {
+        for (UInt32 bi = 0; bi < io->mNumberBuffers; bi++) {
+            AudioBuffer *b = &io->mBuffers[bi];
+            if (b->mNumberChannels == 1 && b->mData && b->mDataByteSize >= n * sizeof(float)) {
+                float *o = (float *)b->mData;
+                double t0 = t ? t->mSampleTime : 0.0;
+                for (UInt32 i = 0; i < n; i++)
+                    o[i] = 0.25f * sinf((float)(2.0 * M_PI * 440.0 * (t0 + (double)i) / 48000.0));
+                atomic_fetch_add_explicit(&gToneInjected, 1, memory_order_relaxed);
+            }
+        }
+    }
+
     if (!VCamProbeSilenced()) {
         static _Atomic uint64_t c = 0;
         uint64_t k = atomic_fetch_add(&c, 1) + 1;
         if ((k % 500) == 1) {
             UInt32 bufs = io ? io->mNumberBuffers : 0;
             UInt32 bytes = (io && bufs) ? io->mBuffers[0].mDataByteSize : 0;
+            UInt32 ch = (io && bufs) ? io->mBuffers[0].mNumberChannels : 0;
             int nz = VCamBufNonZero(io);
             VCamProbeLog([NSString stringWithFormat:
-                @"probe AUProcess u=%p frames=%u bufs=%u bytes=%u nz=%d calls=%llu",
-                u, (unsigned)n, (unsigned)bufs, (unsigned)bytes, nz, k]);
+                @"probe AUProcess u=%p frames=%u bufs=%u ch=%u bytes=%u nz=%d tone=%llu calls=%llu",
+                u, (unsigned)n, (unsigned)bufs, (unsigned)ch, (unsigned)bytes, nz,
+                (unsigned long long)atomic_load(&gToneInjected), k]);
         }
     }
     return s;
@@ -172,5 +202,16 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
         MSHookFunction((void *)AudioConverterConvertComplexBuffer, (void *)probeACC, (void **)&origACC);
         MSHookFunction((void *)AudioComponentInstanceNew,       (void *)probeACIN, (void **)&origACIN);
         VCamLog(@"probe: mediaserverd audio probe installed (AURender/AUProcess/ACFill/ACConvert/NEWUNIT) — log-only");
+
+        // Flag poller: enable the tone test when /var/mobile/Media/vcam_mictone exists (toggles
+        // live, no reboot). Default OFF, so a normal install stays a pure log-only probe.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            NSFileManager *fm = [NSFileManager defaultManager];
+            for (;;) {
+                atomic_store(&gMicTone,
+                             [fm fileExistsAtPath:@"/var/mobile/Media/vcam_mictone"] ? 1 : 0);
+                sleep(2);
+            }
+        });
     }
 }
