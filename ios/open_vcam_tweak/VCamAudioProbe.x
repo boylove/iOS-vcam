@@ -55,6 +55,32 @@ static void VCamProbeLog(NSString *msg) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ VCamLog(@"%@", msg); });
 }
 
+// Render a CoreAudio 4-char-code (e.g. 'auou','vpio') as text. The constants are host-int;
+// swap to big-endian so the bytes read in natural order.
+static NSString *VCamFourCC(UInt32 c) {
+    union { UInt32 u; unsigned char b[4]; } x;
+    x.u = CFSwapInt32HostToBig(c);
+    return [[NSString alloc] initWithBytes:x.b length:4 encoding:NSASCIIStringEncoding] ?: @"????";
+}
+
+// ---- AudioComponentInstanceNew: logs each audio unit's TYPE as it is created, so the
+// AUProcess/AURender unit pointers above can be mapped to a role (VoiceProcessingIO = the
+// mic IO, 'aufx' = effect, 'aumx' = mixer, ...). Called on the setup thread (not the RT
+// audio thread), so the description fetch + log here are safe. ----
+static OSStatus (*origACIN)(AudioComponent, AudioComponentInstance *);
+static OSStatus probeACIN(AudioComponent comp, AudioComponentInstance *out) {
+    OSStatus s = origACIN(comp, out);
+    if (!VCamProbeSilenced() && s == noErr && out && *out) {
+        AudioComponentDescription d; memset(&d, 0, sizeof(d));
+        OSStatus g = AudioComponentGetDescription(comp, &d);
+        VCamProbeLog([NSString stringWithFormat:
+            @"probe NEWUNIT inst=%p type=%@ sub=%@ mfr=%@ (g=%d)",
+            (void *)*out, VCamFourCC(d.componentType), VCamFourCC(d.componentSubType),
+            VCamFourCC(d.componentManufacturer), (int)g]);
+    }
+    return s;
+}
+
 // ---- AudioUnitRender ----
 static OSStatus (*origAUR)(AudioUnit, AudioUnitRenderActionFlags *, const AudioTimeStamp *,
                            UInt32, UInt32, AudioBufferList *);
@@ -144,6 +170,7 @@ static OSStatus probeACC(AudioConverterRef cv, UInt32 nframes, const AudioBuffer
         MSHookFunction((void *)AudioUnitProcess,                (void *)probeAUP, (void **)&origAUP);
         MSHookFunction((void *)AudioConverterFillComplexBuffer, (void *)probeACF, (void **)&origACF);
         MSHookFunction((void *)AudioConverterConvertComplexBuffer, (void *)probeACC, (void **)&origACC);
-        VCamLog(@"probe: mediaserverd audio probe installed (AURender/AUProcess/ACFill/ACConvert) — log-only");
+        MSHookFunction((void *)AudioComponentInstanceNew,       (void *)probeACIN, (void **)&origACIN);
+        VCamLog(@"probe: mediaserverd audio probe installed (AURender/AUProcess/ACFill/ACConvert/NEWUNIT) — log-only");
     }
 }
