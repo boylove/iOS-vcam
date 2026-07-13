@@ -1,9 +1,0 @@
-Package: com.iosvcam.audiobridge.media-active
-Name: iOS-VCAM Audio Bridge Media Active
-Version: 0.1.3
-Architecture: iphoneos-arm64e
-Description: RootHide-compatible experimental mediaserverd AudioBridge client. Manual install only.
-Maintainer: iOS-VCAM
-Author: iOS-VCAM
-Section: Tweaks
-Conflicts: com.iosvcam.audiobridge, com.iosvcam.audiobridge.media-probe

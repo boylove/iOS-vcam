@@ -1,9 +1,0 @@
-Package: com.iosvcam.audiobridge.media-probe
-Name: iOS-VCAM Audio Bridge Media Probe
-Version: 0.1.0
-Architecture: iphoneos-arm64e
-Description: Passive iOS-VCAM media-layer load probe for mediaserverd. Does not replace audio.
-Maintainer: iOS-VCAM
-Author: iOS-VCAM
-Section: Tweaks
-Conflicts: com.iosvcam.audiobridge

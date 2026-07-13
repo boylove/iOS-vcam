@@ -13,7 +13,7 @@ Option [9] runs prerequisite checks for USB streaming. It is not the old SSH `.d
 3.  **Ports:** Whether local streaming/auth ports are free or already bound.
 4.  **Device visibility:** Whether libimobiledevice can see the attached iPhone.
 
-If you need to install or update an iOS `.deb`, generate the package with the tools in `ios/` and perform the install deliberately outside Option [9]. Do not use or install the quarantined `com.iosvcam.audiobridge` package.
+If you need to install or update an iOS `.deb`, generate the package with the tools in `ios/` and perform the install deliberately outside Option [9].
 
 ### Customizing SSH
 The launcher can prompt for SSH credentials when Option [U] needs to establish a tunnel.
@@ -92,7 +92,6 @@ This makes the iPhone "think" it has a local service on 1935, which is actually 
 2.  **Flask (Python)**: Provides a lightweight API and authentication endpoint (`/auth`).
 3.  **Nginx (Optional)**: Can be used as a reverse proxy (bundled in some distributions).
 4.  **Launcher (PowerShell)**: Orchestrator. Checks network, updates configs, manages processes.
-5.  **AudioBridge System v0.1 (Experimental)**: PC bridge prepares OBS audio; manual iOS daemon/system-hook packages are Phase 1 passive test artifacts.
 
 ### Data Flow
 1.  **PC (OBS)** --[RTMP]--> **SRS (Port 1935)**

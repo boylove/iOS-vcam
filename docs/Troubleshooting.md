@@ -17,16 +17,12 @@
     *   Restart the SRS server (Option [1] in Launcher).
 
 ### No OBS Audio on iPhone / Target App
-*   **Cause:** The existing VCAM path mainly replaces the camera/video feed. OBS audio in RTMP is not automatically injected as the iPhone microphone.
+*   **Cause:** OBS audio is replaced by the OpenVCam tweak (`com.iosvcam.opencam`) inside `mediaserverd`, demuxed from the same RTMP stream as the video. If there is no audio, either the toggle is off or the stream carries no audio.
 *   **Fix/checks:**
     *   In OBS, enable AAC audio and make sure the expected sources are assigned to the streaming track.
     *   Verify the PC-side RTMP stream actually contains audio before debugging the phone.
-    *   Check `logs/audio-bridge-*.out.log`: `client connected:` means an iOS audio client reached the PC bridge. PC bridge/tunnel readiness alone is not enough.
-    *   AudioBridge System v0.1 Phase 1 uses `com.iosvcam.audiobridge.daemon` plus `com.iosvcam.audiobridge.system-hook`; the hook is passive and must not replace microphone audio yet.
-    *   `com.iosvcam.audiobridge.media-probe` is passive and will never connect to port `1936` or replace microphone audio.
-    *   Avoid treating `com.iosvcam.audiobridge.media-active` as the main stability path; it is the older direct-network mediaserverd experiment.
-    *   Only use reviewed manual experiments after explicit approval, and keep disable flags available.
-    *   Do not install `com.iosvcam.audiobridge`; it affected the tested Dopamine iOS 16.1.2 jailbreak/camera environment and is quarantined.
+    *   Turn ON the floating panel's 替换音频 switch (it drives the mic replacement for both stock Camera and TikTok).
+    *   Verify the recorded FILE off-device (import to a PC): on-device playback can re-inject live audio and is not a reliable check.
 
 ### iPhone Can't Connect via USB
 *   **Cause:** `iproxy` not running or cable issue.

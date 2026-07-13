@@ -25,17 +25,11 @@ Welcome to the **iOS-VCAM-Server** documentation. This wiki provides comprehensi
 *   **WiFi Streaming** (Best practices)
 *   **USB Streaming** (High reliability, low latency)
 *   **OBS Integration** (Streaming from PC to iPhone)
-*   **Experimental Audio Bridge** (PC-side OBS audio plus manual daemon/system-hook tests)
 
 ### [🔧 Troubleshooting](Troubleshooting.md)
 *   **Common Issues** (Connection failed, Choppy stream)
 *   **Diagnostics** (Using the launcher diagnostics)
 *   **Crash Fixes** (Known solutions)
-
-### [🎙️ Audio Bridge / DiCoy Notes](Audio-Bridge-DiCoy-Integration.md)
-*   **Safety Warning** (`com.iosvcam.audiobridge` is quarantined)
-*   **DiCoy Findings** (research reference only)
-*   **Current Support** (video-only stable path; manual AudioBridge System v0.1 experiments)
 
 ### [🔄 Post-Reboot Checklist](Post-Reboot-Checklist.md)
 *   **What Gets Lost** (sshd config, host keys, aliases)

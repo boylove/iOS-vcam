@@ -150,6 +150,10 @@ $script:LogFile = Join-Path $script:SRSHome "debug.log"
 $script:CrashLog = Join-Path $script:SRSHome "crash.log"
 $script:MaxLogSize = 1MB
 $script:IsFirstLaunch = $false
+# USB streaming auto-reconnect watchdog state (set when the persistent reverse tunnel starts;
+# used to rebuild ONLY the tunnel across a phone reboot without restarting SRS — see Start-MonibucaViaSshUsb).
+$script:UsbTunnelPid = $null
+$script:UsbTunnelArgs = $null
 
 # Verify SRS installation - silently fail for EXE, show error for PS1
 if (-not (Test-Path "$script:SRSHome\objs\srs.exe")) {
@@ -223,11 +227,6 @@ function Read-Config {
         "StreamingServer" = "monibuca"  # Options: "monibuca", "srs" - Default to Monibuca
         "MonibucaConfig" = "monibuca_iphone_optimized.yaml"  # Default Monibuca profile
         "SSHPassword" = "alpine"  # Default SSH password for jailbroken devices
-        "AudioBridgeEnabled" = "false"  # PC AudioBridge endpoint; iOS daemon/system-hook packages are manual experiments
-        "AudioBridgePort" = "1936"  # PC localhost AudioBridge port
-        "AudioBridgeSampleRate" = "48000"  # PCM sample rate for PC-side diagnostics
-        "AudioBridgeChannels" = "1"  # Mono keeps the first bridge version simple and compatible
-        "AudioDelayMs" = "0"  # Optional future audio/video sync offset
         "IPhoneReadOnlyMode" = "true"  # Never modify iPhone files/settings automatically
     }
 
@@ -1619,27 +1618,6 @@ function Stop-UsbStreamingProcesses {
         } catch { }
     }
 
-    # Kill the optional audio bridge and its ffmpeg decoder without touching unrelated tools.
-    $audioBridgePort = 1936
-    try {
-        $config = Read-Config
-        if ($config.AudioBridgePort) { $audioBridgePort = [int]$config.AudioBridgePort }
-    } catch { }
-
-    $processesKilled += Stop-LocalTcpListeners -Ports @($audioBridgePort) -NameRegex 'python|pythonw|py' -Silent:$Silent
-
-    try {
-        $ffmpegProcs = Get-CimInstance Win32_Process -Filter "Name='ffmpeg.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'rtmp://127\.0\.0\.1:1935/live/srs' }
-        foreach ($proc in $ffmpegProcs) {
-            try {
-                if (-not $Silent) { Write-Host "  🔥 Stopping OBS audio ffmpeg decoder (PID: $($proc.ProcessId))" -ForegroundColor Red }
-                Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-                $processesKilled++
-            } catch { }
-        }
-    } catch { }
-
     # Also clear media-server ports, including SRS API/HTTP ports.
     $processesKilled += Stop-LocalTcpListeners -Ports @(1935, 1985, 8080, 8081, 50051) -Silent:$Silent
 
@@ -1718,7 +1696,7 @@ function Start-MonibucaViaSshUsb {
             }
             "K" {
                 Write-Host ""
-                Stop-UsbStreamingProcesses
+                [void](Stop-UsbStreamingProcesses)
                 Write-Host "  🔄 Restarting USB streaming..." -ForegroundColor Cyan
                 Write-Host ""
                 Start-Sleep -Seconds 1
@@ -1801,8 +1779,6 @@ function Start-MonibucaViaSshUsb {
     $flaskReady = $false
     $srsReady = $false
     $tunnelReady = $false
-    $audioTunnelRequested = $false
-    $audioTunnelReady = $false
 
     Write-Host "[INFO] Preparing complete USB streaming solution..." -ForegroundColor Green
     Write-Host "       Flask (HTTP auth) + SRS (RTMP) + Dual SSH tunnels" -ForegroundColor Gray
@@ -1910,7 +1886,12 @@ function Start-MonibucaViaSshUsb {
     }
     Write-Host "  ✅ SRS found: $srsPath" -ForegroundColor Green
 
-    $usbSrsConfigPath = Join-Path $script:SRSHome "config\active\srs_usb_smooth_playback.conf"
+    # Prefer the low-latency A/V-sync profile; fall back to the smooth profile
+    # if it is missing so an incomplete checkout never blocks streaming.
+    $usbSrsConfigPath = Join-Path $script:SRSHome "config\active\srs_iphone_lowlatency_sync.conf"
+    if (-not (Test-Path $usbSrsConfigPath)) {
+        $usbSrsConfigPath = Join-Path $script:SRSHome "config\active\srs_usb_smooth_playback.conf"
+    }
     if (-not (Test-Path $usbSrsConfigPath)) {
         Write-Host "  ❌ USB SRS config not found: $usbSrsConfigPath" -ForegroundColor Red
         Write-Host ""
@@ -2042,17 +2023,6 @@ function Start-MonibucaViaSshUsb {
         $savedPassword = "alpine"
     }
 
-    $audioBridgeEnabled = ($config.AudioBridgeEnabled -eq "true")
-    $audioBridgePort = 1936
-    $audioBridgeSampleRate = 48000
-    $audioBridgeChannels = 1
-    $audioDelayMs = 0
-    try { if ($config.AudioBridgePort) { $audioBridgePort = [int]$config.AudioBridgePort } } catch { $audioBridgePort = 1936 }
-    try { if ($config.AudioBridgeSampleRate) { $audioBridgeSampleRate = [int]$config.AudioBridgeSampleRate } } catch { $audioBridgeSampleRate = 48000 }
-    try { if ($config.AudioBridgeChannels) { $audioBridgeChannels = [int]$config.AudioBridgeChannels } } catch { $audioBridgeChannels = 1 }
-    try { if ($config.AudioDelayMs) { $audioDelayMs = [int]$config.AudioDelayMs } } catch { $audioDelayMs = 0 }
-    $audioWarning = $false
-    $audioBridgeStarted = $false
     $iPhoneReadOnlyMode = ($config.IPhoneReadOnlyMode -ne "false")
 
     Write-Host ""
@@ -2142,7 +2112,11 @@ function Start-MonibucaViaSshUsb {
     # ============================================================================
     Write-Host "[STEP 5/9] 📄 Preparing SRS USB configuration..." -ForegroundColor Yellow
 
-    $configPath = Join-Path $script:SRSHome "config\active\srs_usb_smooth_playback.conf"
+    # Prefer the low-latency A/V-sync profile; fall back to the smooth profile.
+    $configPath = Join-Path $script:SRSHome "config\active\srs_iphone_lowlatency_sync.conf"
+    if (-not (Test-Path $configPath)) {
+        $configPath = Join-Path $script:SRSHome "config\active\srs_usb_smooth_playback.conf"
+    }
     if (-not (Test-Path $configPath)) {
         Write-Host "  ❌ No SRS USB config found!" -ForegroundColor Red
         Write-Host ""
@@ -2281,79 +2255,6 @@ Set-Location -LiteralPath $srsHomeLiteral;
         $allReady = $false
     }
     Write-Host ""
-
-    # Optional PC-side OBS audio diagnostics. This is intentionally non-fatal:
-    # video USB streaming must keep working, and no iOS audio companion is supported.
-    if ($audioBridgeEnabled) {
-        Write-Host "[OPTIONAL] 🎙️ Starting OBS audio bridge (port $audioBridgePort)..." -ForegroundColor Yellow
-        $audioBridgeScript = Join-Path $script:SRSHome "scripts\audio_bridge.py"
-        $ffmpegPath = Resolve-ExecutablePath "" "ffmpeg.exe"
-        if (-not $ffmpegPath) { $ffmpegPath = Resolve-ExecutablePath "" "ffmpeg" }
-
-        if (-not (Test-Path $audioBridgeScript)) {
-            Write-Host "  ⚠️ Audio bridge script not found: $audioBridgeScript" -ForegroundColor Yellow
-            Write-Host "     Continuing with video-only USB streaming." -ForegroundColor Gray
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: script missing - disabled"
-            $audioBridgeEnabled = $false
-            $audioWarning = $true
-        } elseif (-not $ffmpegPath) {
-            Write-Host "  ⚠️ ffmpeg not found in PATH or project folders" -ForegroundColor Yellow
-            Write-Host "     Install ffmpeg to extract OBS audio. Continuing video-only." -ForegroundColor Gray
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: ffmpeg missing - disabled"
-            $audioBridgeEnabled = $false
-            $audioWarning = $true
-        } else {
-            $audioPortAlreadyListening = Test-LocalTcpPortListen -Port $audioBridgePort
-            if ($audioPortAlreadyListening) {
-                Write-Host "  ⚠️ Port $audioBridgePort was already listening before AudioBridge launch" -ForegroundColor Yellow
-                Write-Host "     Not treating the existing listener as this session's bridge." -ForegroundColor Gray
-                Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: port $audioBridgePort already in use before launch"
-            }
-
-            $srsHomeLiteral = ConvertTo-PowerShellLiteral $script:SRSHome
-            $audioBridgeScriptLiteral = ConvertTo-PowerShellLiteral $audioBridgeScript
-            $ffmpegPathLiteral = ConvertTo-PowerShellLiteral $ffmpegPath
-            $audioCommand = @"
-Set-Location -LiteralPath $srsHomeLiteral;
-& python -u $audioBridgeScriptLiteral --source 'rtmp://127.0.0.1:1935/live/srs' --host 127.0.0.1 --port $audioBridgePort --sample-rate $audioBridgeSampleRate --channels $audioBridgeChannels --delay-ms $audioDelayMs --ffmpeg $ffmpegPathLiteral
-"@
-            $encodedAudioCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($audioCommand))
-            $audioLogDir = if ($script:UsbLogFile) { Split-Path -Parent $script:UsbLogFile } else { Join-Path $script:SRSHome "logs" }
-            if (-not (Test-Path $audioLogDir)) { New-Item -ItemType Directory -Path $audioLogDir -Force | Out-Null }
-            $audioBridgeOutLog = Join-Path $audioLogDir ("audio-bridge-" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".out.log")
-            $audioBridgeErrLog = Join-Path $audioLogDir ("audio-bridge-" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".err.log")
-            $audioBridgeProcess = Start-Process powershell -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encodedAudioCommand) -RedirectStandardOutput $audioBridgeOutLog -RedirectStandardError $audioBridgeErrLog -PassThru -WindowStyle Hidden
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: bridge process started PID=$($audioBridgeProcess.Id) stdout=$audioBridgeOutLog stderr=$audioBridgeErrLog"
-
-            $audioTimeout = 10
-            $audioStart = Get-Date
-            $audioBridgeProcessAlive = $false
-            do {
-                Start-Sleep -Milliseconds 500
-                try { $audioBridgeProcess.Refresh() } catch { }
-                $audioBridgeProcessAlive = ($audioBridgeProcess -and -not $audioBridgeProcess.HasExited)
-                $audioBridgeStarted = ((-not $audioPortAlreadyListening) -and $audioBridgeProcessAlive -and (Test-LocalTcpPortListen -Port $audioBridgePort))
-            } while (-not $audioBridgeStarted -and $audioBridgeProcessAlive -and ((Get-Date) - $audioStart).TotalSeconds -lt $audioTimeout)
-
-            if ($audioBridgeStarted) {
-                Write-Host "  ✅ Audio bridge listening on 127.0.0.1:$audioBridgePort" -ForegroundColor Green
-                Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: bridge OK on port $audioBridgePort"
-            } else {
-                Write-Host "  ⚠️ Audio bridge did not start on port $audioBridgePort" -ForegroundColor Yellow
-                if ($audioPortAlreadyListening) {
-                    Write-Host "     Port was already in use before launch; leaving it untouched." -ForegroundColor Gray
-                } elseif (-not $audioBridgeProcessAlive) {
-                    Write-Host "     Audio bridge process exited during startup." -ForegroundColor Gray
-                }
-                Write-Host "     Continuing with video-only USB streaming." -ForegroundColor Gray
-                if ($audioBridgeErrLog) { Write-Host "     Audio bridge log: $audioBridgeErrLog" -ForegroundColor Gray }
-                Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: bridge failed - disabled (stderr=$audioBridgeErrLog)"
-                $audioBridgeEnabled = $false
-                $audioWarning = $true
-            }
-        }
-        Write-Host ""
-    }
 
     # ============================================================================
     # STEP 9: Launch SSH tunnels + iPhone IP alias
@@ -2772,23 +2673,20 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
             $plinkLogFile = $null
         }
 
-        $audioTunnelRequested = ($audioBridgeEnabled -and $audioBridgeStarted)
         $tunnelArgs = @(
             '-4', '-ssh', '-batch', '-N', '-T',
             '-R', '127.10.10.10:80:127.0.0.1:80',
             '-R', '127.10.10.10:1935:127.0.0.1:1935'
         )
-        if ($audioTunnelRequested) {
-            $audioForward = "127.10.10.10:{0}:127.0.0.1:{0}" -f $audioBridgePort
-            $tunnelArgs += @('-R', $audioForward)
-            Write-Host "  🎙️ Adding AudioBridge reverse tunnel: 127.10.10.10:$audioBridgePort -> PC 127.0.0.1:$audioBridgePort" -ForegroundColor Cyan
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] STEP9: AudioBridge tunnel requested on port $audioBridgePort"
-        }
         $tunnelArgs += @('-P', '2222', '-pw', "$sshPassword", 'root@127.0.0.1')
         if ($plinkLogFile) { $tunnelArgs = @('-sshlog', $plinkLogFile) + $tunnelArgs }
         if ($hostKeyFp) { $tunnelArgs = @('-hostkey', $hostKeyFp) + $tunnelArgs }
 
-        Start-Process -WindowStyle Hidden -FilePath "$plinkPath" -ArgumentList (Join-ProcessArguments -Arguments $tunnelArgs)
+        $tunnelProc = Start-Process -WindowStyle Hidden -FilePath "$plinkPath" -ArgumentList (Join-ProcessArguments -Arguments $tunnelArgs) -PassThru
+        # Remember what launched the persistent tunnel so the auto-reconnect watchdog can rebuild it
+        # verbatim (only iproxy+plink, never SRS/Flask) when the phone reboots and the USB link drops.
+        $script:UsbTunnelPid  = if ($tunnelProc) { $tunnelProc.Id } else { $null }
+        $script:UsbTunnelArgs = $tunnelArgs
 
         # Give SSH time to connect
         Start-Sleep -Seconds 2
@@ -2809,20 +2707,14 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
                 $listenerCheck = ""
 
                 if ($plinkLogFile -and (Test-Path $plinkLogFile)) {
-                    $audioPortEnabledPattern = "Remote port forwarding from 127\.10\.10\.10:$audioBridgePort enabled"
                     for ($logAttempt = 1; $logAttempt -le 6; $logAttempt++) {
                         Start-Sleep -Milliseconds 500
                         $plinkLogText = Get-Content -LiteralPath $plinkLogFile -Raw -ErrorAction SilentlyContinue
                         $corePortsReady = ($plinkLogText -match 'Remote port forwarding from 127\.10\.10\.10:80 enabled' -and
                             $plinkLogText -match 'Remote port forwarding from 127\.10\.10\.10:1935 enabled')
-                        if ($audioTunnelRequested -and ($plinkLogText -match $audioPortEnabledPattern)) {
-                            $audioTunnelReady = $true
-                        }
                         if ($corePortsReady) {
                             $listenerVerified = $true
-                            if ((-not $audioTunnelRequested) -or $audioTunnelReady -or $logAttempt -ge 6) {
-                                break
-                            }
+                            break
                         }
                         $coreRefused = ($plinkLogText -match '127\.10\.10\.10:(80|1935).*(refused|prohibited|cannot listen)' -or
                             $plinkLogText -match 'cannot listen.*127\.10\.10\.10:(80|1935)')
@@ -2833,30 +2725,16 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
                     }
                 }
 
-                if ((-not $listenerVerified -and -not $listenerCheck) -or ($audioTunnelRequested -and -not $audioTunnelReady -and -not $listenerCheck)) {
-                    $listenerPorts = @('80', '1935')
-                    if ($audioTunnelRequested) { $listenerPorts += [string]$audioBridgePort }
-                    $listenerPortRegex = (($listenerPorts | ForEach-Object { [regex]::Escape($_) }) -join '|')
-                    $checkListeners = "netstat -an | grep -E '127\.10\.10\.10\.($listenerPortRegex).*LISTEN' || echo NO_LISTENERS"
+                if (-not $listenerVerified -and -not $listenerCheck) {
+                    $checkListeners = "netstat -an | grep -E '127\.10\.10\.10\.(80|1935).*LISTEN' || echo NO_LISTENERS"
                     $listenerArgs = @('-4', '-ssh', '-batch', '-T', '-P', '2222', '-pw', $sshPassword, 'root@127.0.0.1', $checkListeners)
                     if ($hostKeyFp) { $listenerArgs = @('-hostkey', $hostKeyFp) + $listenerArgs }
                     $listenerCheck = (& $plinkPath $listenerArgs 2>&1) | Out-String
                 }
 
                 $listenerCoreVerified = ($listenerCheck -match '127\.10\.10\.10\.80' -and $listenerCheck -match '127\.10\.10\.10\.1935')
-                $listenerAudioVerified = ((-not $audioTunnelRequested) -or $audioTunnelReady -or ($listenerCheck -match "127\.10\.10\.10\.$audioBridgePort"))
                 if ($listenerVerified -or $listenerCoreVerified) {
                     $verifiedPortsText = "80 + 1935"
-                    if ($audioTunnelRequested) {
-                        if ($listenerAudioVerified) {
-                            $audioTunnelReady = $true
-                            $verifiedPortsText = "$verifiedPortsText + $audioBridgePort"
-                        } else {
-                            Write-Host "  ⚠️ AudioBridge tunnel port $audioBridgePort was not verified; video tunnel remains usable" -ForegroundColor Yellow
-                            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] STEP9: AudioBridge tunnel NOT verified on port $audioBridgePort"
-                            $audioWarning = $true
-                        }
-                    }
                     Write-Host "  ✅ Tunnel ports verified on iPhone ($verifiedPortsText)" -ForegroundColor Green
                     Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] STEP9: Tunnel ports VERIFIED listening on iPhone ($verifiedPortsText)"
                     $tunnelReady = $true
@@ -2889,18 +2767,8 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
     # ============================================================================
     # FINAL STATUS
     # ============================================================================
-    $audioClientConnected = $false
-    if ($audioBridgeEnabled -and $audioBridgeStarted -and $audioBridgeOutLog -and (Test-Path $audioBridgeOutLog)) {
-        $audioBridgeOutText = Get-Content -LiteralPath $audioBridgeOutLog -Raw -ErrorAction SilentlyContinue
-        $audioClientConnected = ($audioBridgeOutText -match 'client connected:')
-        if ($audioClientConnected) {
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: iOS AudioBridge client connected"
-        } elseif ($audioTunnelReady) {
-            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] AUDIO: PC bridge/tunnel ready, waiting for manual iOS daemon/system-hook client"
-        }
-    }
     Write-Host ""
-    if ($allReady -and -not $audioWarning) {
+    if ($allReady) {
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Green
         Write-Host "                    ✅ USB STREAMING SOLUTION READY                         " -BackgroundColor DarkGreen -ForegroundColor White
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Green
@@ -2925,32 +2793,11 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
     Write-Host "     $flaskStatus Flask       (background) - HTTP auth on port 80" -ForegroundColor $flaskColor
     Write-Host "     $tunnelStatus SSH Tunnel  (background) - Reverse tunnels to iPhone" -ForegroundColor $tunnelColor
     Write-Host "     $srsStatus SRS         (visible)    - RTMP streaming on port 1935" -ForegroundColor $srsColor
-    if ($audioBridgeEnabled -and $audioBridgeStarted -and $audioTunnelReady) {
-        Write-Host "     ✅ AudioBridge PC (background) - listening on 127.0.0.1:$audioBridgePort" -ForegroundColor Green
-        Write-Host "     ✅ AudioBridge tunnel       - iPhone can reach 127.10.10.10:$audioBridgePort" -ForegroundColor Green
-        if ($audioClientConnected) {
-            Write-Host "     ✅ AudioBridge client       - iOS daemon/system hook connected" -ForegroundColor Green
-        } else {
-            Write-Host "     ⏳ AudioBridge client       - waiting for manual iOS daemon/system-hook test" -ForegroundColor Yellow
-            Write-Host "        Phase 1 system-hook is passive and must not replace microphone audio" -ForegroundColor Gray
-        }
-    } elseif ($audioBridgeEnabled -and $audioBridgeStarted -and $audioTunnelRequested) {
-        Write-Host "     🎙️ AudioBridge PC bridge is running, but iPhone tunnel port $audioBridgePort was not verified" -ForegroundColor Yellow
-    } elseif ($audioWarning) {
-        Write-Host "     🎙️ AudioBridge disabled due to warnings - video-only streaming continues" -ForegroundColor Yellow
-    }
     Write-Host ""
     Write-Host "  🎬 OBS Stream Settings:" -ForegroundColor White
     Write-Host "     Server: rtmp://localhost:1935/live" -ForegroundColor Cyan
     Write-Host "     Stream Key: srs" -ForegroundColor Cyan
-    if ($audioBridgeEnabled -and $audioBridgeStarted -and $audioTunnelReady) {
-        Write-Host "     Audio: enable AAC output in OBS; PC bridge and tunnel are ready on port $audioBridgePort" -ForegroundColor Cyan
-        if ($audioClientConnected) {
-            Write-Host "     Audio system: iOS daemon/system-hook client is connected" -ForegroundColor Green
-        } else {
-            Write-Host "     Audio system: pending until manual daemon/system-hook test connects" -ForegroundColor Yellow
-        }
-    }
+    Write-Host "     Audio: enable AAC output in OBS; the OpenVCam tweak replaces the mic (替换音频 switch)" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  📱 iPhone App (PULLS stream via tunnel):" -ForegroundColor White
     if ($allReady -and $tunnelReady) {
@@ -2967,7 +2814,133 @@ echo "VNC_PID=$VNC_PID VNC_OK=$VNC_OK SSHD_PID=$SSHD_PID SSHD_OK=$SSHD_OK"
     Write-Host ""
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Green
     Write-Host ""
-    Read-Host "Press Enter to return to menu..."
+
+    # ============================================================================
+    # AUTO-RECONNECT WATCHDOG
+    # ----------------------------------------------------------------------------
+    # The phone reboots -> USB drops -> iproxy(2222) and the plink reverse tunnel die.
+    # Previously the ONLY recovery was re-running this whole function, whose STEP 4/8
+    # force-kills SRS and clears port 1935 -> your OBS publish connection is dropped and
+    # OBS must reconnect. This watchdog instead rebuilds ONLY the USB layer (iproxy +
+    # plink tunnel + the reboot-volatile sshd GatewayPorts/host-key/127.10.10.10 alias),
+    # and NEVER touches SRS/Flask -> OBS keeps publishing straight through a phone reboot.
+    # The on-device tweak re-pulls the RTMP stream automatically once the tunnel is back.
+    # ============================================================================
+    if ($tunnelReady) {
+
+        # Rebuild just the reverse tunnel over a (freshly restarted) iproxy. Re-probes the
+        # host key and re-applies the reboot-volatile sshd config + loopback alias, exactly
+        # like STEP 9b/9c, then relaunches plink with the SAME forwards captured at startup.
+        # Returns $true and refreshes $script:UsbTunnelPid on success. Does NOT touch SRS.
+        function Restart-UsbTunnelOnly {
+            param([string]$Reason = "")
+
+            Write-Host ""
+            Write-Host "  🔄 [watchdog] Rebuilding USB tunnel ($Reason)..." -ForegroundColor Cyan
+            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] WATCHDOG: reconnect start ($Reason)" -ErrorAction SilentlyContinue
+
+            # 1) Kill the dead tunnel plink (leave SRS/Flask/VNC iproxy untouched).
+            if ($script:UsbTunnelPid) {
+                Stop-Process -Id $script:UsbTunnelPid -Force -ErrorAction SilentlyContinue
+                $script:UsbTunnelPid = $null
+            }
+
+            # 2) Rebuild iproxy (USB->2222). This is what actually re-attaches to the phone
+            #    once it has finished rebooting; retry until the device re-enumerates.
+            if (-not (Restart-UsbSshForwarding -Reason $Reason)) {
+                return $false
+            }
+
+            # 3) Re-probe the SSH host key (a reboot / sshd restart usually rotates it).
+            $fp = Get-SshFingerprint -PlinkExe $plinkPath -Password $sshPassword
+            if ($fp) { $hostKeyFp = $fp }
+
+            # 4) Re-apply the reboot-volatile sshd forwarding config + loopback alias (skipped
+            #    in iPhone read-only mode, matching STEP 9b/9c). Without these the reverse
+            #    tunnel binds are refused after a reboot.
+            if (-not $iPhoneReadOnlyMode) {
+                $fixCmd = 'grep -q "^GatewayPorts clientspecified" /etc/ssh/sshd_config || echo "GatewayPorts clientspecified" >> /etc/ssh/sshd_config; grep -q "^AllowTcpForwarding yes" /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config; echo SSHOK'
+                $null = Invoke-PlinkWithRetry -PlinkExe $plinkPath -Password $sshPassword -Fingerprint $hostKeyFp -Command $fixCmd
+                $aliasRun = Invoke-PlinkWithRetry -PlinkExe $plinkPath -Password $sshPassword -Fingerprint $hostKeyFp -Command 'ifconfig lo0 alias 127.10.10.10 netmask 255.255.255.255; echo ALIAS_OK'
+                $hostKeyFp = $aliasRun.Fingerprint
+            }
+
+            # 5) Relaunch the persistent reverse tunnel with the SAME forwards as startup,
+            #    refreshing only the pinned host key (it may have rotated in step 3). Strip any
+            #    existing "-hostkey <fp>" pair from the saved args, then prepend the current one.
+            $stripped = @()
+            for ($i = 0; $i -lt $script:UsbTunnelArgs.Count; $i++) {
+                if ($script:UsbTunnelArgs[$i] -eq '-hostkey') { $i++; continue }   # skip flag + its value
+                $stripped += $script:UsbTunnelArgs[$i]
+            }
+            $freshArgs = if ($hostKeyFp) { @('-hostkey', $hostKeyFp) + $stripped } else { $stripped }
+            $newProc = Start-Process -WindowStyle Hidden -FilePath "$plinkPath" `
+                -ArgumentList (Join-ProcessArguments -Arguments $freshArgs) -PassThru
+            Start-Sleep -Seconds 2
+            $alive = $newProc -and (Get-Process -Id $newProc.Id -ErrorAction SilentlyContinue)
+            if ($alive) {
+                $script:UsbTunnelPid = $newProc.Id
+                Write-Host "  ✅ [watchdog] Tunnel restored (plink PID $($newProc.Id)) — OBS was never interrupted" -ForegroundColor Green
+                Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] WATCHDOG: reconnect OK, plink PID=$($newProc.Id)" -ErrorAction SilentlyContinue
+                return $true
+            }
+            Write-Host "  ⚠️ [watchdog] Tunnel plink did not stay up; will retry" -ForegroundColor Yellow
+            Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] WATCHDOG: reconnect plink died" -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        Write-Host "  🐕 Auto-reconnect watchdog active — the tunnel self-heals across phone reboots." -ForegroundColor Green
+        Write-Host "     SRS keeps running, so OBS never needs to reconnect. Press [Q] then Enter to stop." -ForegroundColor Gray
+        Write-Host ""
+
+        # Non-blocking key poll for [Q]/Enter to stop the watchdog. Guarded: a non-interactive host
+        # (launched via .bat pipe / as a service) throws on [Console]::KeyAvailable — there we just
+        # can't poll keys, so the watchdog runs until the window is closed / Ctrl+C (still fine).
+        $canPollKeys = $true
+        try { $null = [Console]::KeyAvailable } catch { $canPollKeys = $false }
+        function Test-WatchdogStopKey {
+            if (-not $canPollKeys) { return $false }
+            try {
+                while ([Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    if ($k.Key -eq 'Q' -or $k.Key -eq 'Enter') { return $true }
+                }
+            } catch { }
+            return $false
+        }
+
+        $watch = $true
+        while ($watch) {
+            # Non-blocking key check so the loop can both watch the tunnel AND accept [Q]/Enter to exit.
+            if (Test-WatchdogStopKey) { $watch = $false; break }
+
+            # Tunnel considered DOWN if the plink PID is gone OR the USB SSH port (2222) is unbound
+            # (the phone rebooted / cable dropped). iproxy staying up but 2222 refusing = phone gone.
+            $plinkAlive = $script:UsbTunnelPid -and (Get-Process -Id $script:UsbTunnelPid -ErrorAction SilentlyContinue)
+            $usbAlive   = Test-LocalTcpPortListen -Port 2222
+            if (-not $plinkAlive -or -not $usbAlive) {
+                Write-Host ""
+                Write-Host "  ⚠️ [watchdog] Tunnel down (plink=$([bool]$plinkAlive) usb2222=$usbAlive) — reconnecting…" -ForegroundColor Yellow
+                Add-Content -Path $script:UsbLogFile -Value "[$(Get-Date -Format 'HH:mm:ss')] WATCHDOG: down plink=$([bool]$plinkAlive) usb=$usbAlive" -ErrorAction SilentlyContinue
+                # Retry until the phone finishes rebooting and the device re-enumerates on USB.
+                $attempt = 0
+                while ($watch -and -not (Restart-UsbTunnelOnly -Reason "phone reboot / USB drop")) {
+                    $attempt++
+                    # Allow [Q] to break out of a long reconnect wait (phone left off).
+                    if (Test-WatchdogStopKey) { $watch = $false; break }
+                    Start-Sleep -Seconds ([Math]::Min(15, 3 + $attempt))   # backoff, capped at 15s
+                }
+            }
+            Start-Sleep -Seconds 3
+        }
+
+        Write-Host ""
+        Write-Host "  🛑 Watchdog stopped. SRS/Flask/tunnel are still running in the background." -ForegroundColor Yellow
+        Write-Host "     Use Option [K] from the USB menu to kill everything, or just leave it running." -ForegroundColor Gray
+        Write-Host ""
+    } else {
+        Read-Host "Press Enter to return to menu..."
+    }
 }
 
 function Start-CombinedFlaskAndMonibuca {
@@ -3403,37 +3376,6 @@ function Show-USBValidation {
     Write-Host ""
 
     $config = Read-Config
-    $audioBridgeScript = Join-Path $script:SRSHome "scripts\audio_bridge.py"
-    $audioBridgePort = 1936
-    try { $audioBridgePort = [int]$config.AudioBridgePort } catch { $audioBridgePort = 1936 }
-    $ffmpegPath = Resolve-ExecutablePath "" "ffmpeg.exe"
-    if (-not $ffmpegPath) { $ffmpegPath = Resolve-ExecutablePath "" "ffmpeg" }
-    $unsafeAudioDebs = @()
-    $unsafeAudioDebDirs = @(
-        (Join-Path $script:SRSHome "ios\modified_debs"),
-        (Join-Path $script:SRSHome "ios\audio_bridge_tweak\packages")
-    )
-    foreach ($unsafeAudioDebDir in $unsafeAudioDebDirs) {
-        if (Test-Path $unsafeAudioDebDir) {
-            $unsafeAudioDebs += @(Get-ChildItem -Path $unsafeAudioDebDir -Filter "*.deb" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'iosvcam\.audiobridge|iOSVCAMAudioBridge|audiobridge' })
-        }
-    }
-    $audioBridgeListening = $false
-    try { $audioBridgeListening = [bool](Test-NetConnection -ComputerName 127.0.0.1 -Port $audioBridgePort -InformationLevel Quiet -WarningAction SilentlyContinue) } catch { }
-
-    Write-Host "  🎙️ Audio Bridge (PC endpoint + manual iOS daemon/system-hook experiments):" -ForegroundColor Cyan
-    $audioEnabledStatus = if ($config.AudioBridgeEnabled -eq "true") { "✅ Enabled" } else { "⬚ Disabled" }
-    $audioScriptStatus = if (Test-Path $audioBridgeScript) { "✅" } else { "❌" }
-    $ffmpegStatus = if ($ffmpegPath) { "✅" } else { "⚠️" }
-    $audioPortStatus = if ($audioBridgeListening) { "✅" } else { "⬚" }
-    $unsafeDebStatus = if ($unsafeAudioDebs.Count -gt 0) { "⚠️" } else { "✅" }
-    $ffmpegInfo = if ($ffmpegPath) { " ($ffmpegPath)" } else { " (install ffmpeg to decode OBS audio)" }
-    Write-Host "  $audioEnabledStatus in config.ini" -ForegroundColor Gray
-    Write-Host "  $audioScriptStatus scripts\audio_bridge.py" -ForegroundColor Gray
-    Write-Host "  $ffmpegStatus ffmpeg$ffmpegInfo" -ForegroundColor Gray
-    Write-Host "  $audioPortStatus Audio bridge listening on 127.0.0.1:$audioBridgePort" -ForegroundColor Gray
-    Write-Host "  $unsafeDebStatus Unsafe com.iosvcam.audiobridge package absent ($($unsafeAudioDebs.Count) found)" -ForegroundColor Gray
-    Write-Host ""
 
     $srsRunning = $false
     try { if (Get-Process -Name "srs" -ErrorAction SilentlyContinue) { $srsRunning = $true } } catch { }
@@ -4651,11 +4593,12 @@ function Show-ConfigurationSettings {
         Write-Host "MONIBUCA (Default)" -ForegroundColor Magenta
     }
 
-    Write-Host "  🎙️ Audio Bridge: " -NoNewline -ForegroundColor White
-    if ($config.AudioBridgeEnabled -eq "true") {
-        Write-Host "Enabled (port $($config.AudioBridgePort), $($config.AudioBridgeSampleRate) Hz, $($config.AudioBridgeChannels) ch)" -ForegroundColor Green
+
+    Write-Host "  🔒 iPhone Read-Only Mode: " -NoNewline -ForegroundColor White
+    if ($config.IPhoneReadOnlyMode -eq "false") {
+        Write-Host "Disabled" -ForegroundColor Yellow
     } else {
-        Write-Host "Disabled" -ForegroundColor Gray
+        Write-Host "Enabled" -ForegroundColor Green
     }
     Write-Host ""
 
@@ -4679,9 +4622,6 @@ function Show-ConfigurationSettings {
     Write-Host "  [4] 📺 STREAMING SERVER ENGINE" -ForegroundColor White
     Write-Host "      • Switch between Monibuca and SRS" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "  [5] 🎙️ TOGGLE AUDIO BRIDGE (PC endpoint + manual iOS experiments)" -ForegroundColor White
-    Write-Host "      • Starts the PC PCM endpoint; iOS companions must be installed manually" -ForegroundColor Gray
-    Write-Host ""
     Write-Host "  [B] ← BACK TO MAIN MENU" -ForegroundColor White
     Write-Host ""
     Write-Host "    " -NoNewline
@@ -4689,7 +4629,7 @@ function Show-ConfigurationSettings {
     Write-Host ""
 
     do {
-        $choice = Read-Host "Choose option [1-5, B]"
+        $choice = Read-Host "Choose option [1-4, B]"
 
         switch ($choice.ToUpper()) {
             "1" {
@@ -4771,26 +4711,6 @@ function Show-ConfigurationSettings {
                         Write-Host "  ❌ Invalid choice" -ForegroundColor Red
                     }
                 }
-                Read-Host "Press Enter to continue"
-                return Show-ConfigurationSettings
-            }
-            "5" {
-                Write-Host ""
-                if ($config.AudioBridgeEnabled -eq "true") {
-                    $config.AudioBridgeEnabled = "false"
-                    Write-Host "  🎙️ Audio Bridge disabled. USB video streaming remains unchanged." -ForegroundColor Yellow
-                } else {
-                    $config.AudioBridgeEnabled = "true"
-                    if ([string]::IsNullOrWhiteSpace($config.AudioBridgePort)) { $config.AudioBridgePort = "1936" }
-                    if ([string]::IsNullOrWhiteSpace($config.AudioBridgeSampleRate)) { $config.AudioBridgeSampleRate = "48000" }
-                    if ([string]::IsNullOrWhiteSpace($config.AudioBridgeChannels)) { $config.AudioBridgeChannels = "1" }
-                    if ([string]::IsNullOrWhiteSpace($config.AudioDelayMs)) { $config.AudioDelayMs = "0" }
-                    Write-Host "  🎙️ Audio Bridge enabled (PC endpoint)." -ForegroundColor Green
-                    Write-Host "     Requires ffmpeg. iOS audio replacement still requires a manual experimental companion." -ForegroundColor Gray
-                    Write-Host "     Do NOT install com.iosvcam.audiobridge; it is quarantined as unsafe." -ForegroundColor Yellow
-                    Write-Host "     No iPhone files will be modified automatically." -ForegroundColor Gray
-                }
-                Write-Config $config
                 Read-Host "Press Enter to continue"
                 return Show-ConfigurationSettings
             }
