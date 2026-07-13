@@ -21,7 +21,12 @@ TWEAK_NAME := OpenVCam
 # writes /var/mobile/Media/vc.plist (mediaserverd reads it) AND publishes the toggles on a
 # Darwin-notify bus (VCamControlChannel) that also reaches TikTok's in-process mic path — the
 # one channel that crosses its sandbox. The panel is gated to SpringBoard and fail-open.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm VCamFloatingPanel.xm VCamControlChannel.m vendor/rtmp/vcam_rtmp.c
+# VCamAudioProbe.x (0.6.51 DIAGNOSTIC, log-only, mediaserverd-only): pass-through hooks on
+# AudioUnitRender/AudioUnitProcess/AudioConverter* to LOCATE where TikTok's VPIO/HAL mic PCM
+# flows in mediaserverd (RootHide blocks in-process injection, so the mic must be replaced
+# system-side like video). Safe: no buffer edits, off-thread logging. Remove once the point
+# is found and the real mediaserverd mic replacement is wired.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm VCamFloatingPanel.xm VCamControlChannel.m VCamAudioProbe.x vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS
