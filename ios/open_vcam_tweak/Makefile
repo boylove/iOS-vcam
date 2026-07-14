@@ -19,14 +19,14 @@ TWEAK_NAME := OpenVCam
 # VCamFloatingPanel.xm + VCamControlChannel.m add the SpringBoard floating control panel:
 # a draggable button (over apps) with an RTMP-URL field and 替换视频/替换音频 switches. Save
 # writes /var/mobile/Media/vc.plist (mediaserverd reads it) AND publishes the toggles on a
-# Darwin-notify bus (VCamControlChannel) that also reaches TikTok's in-process mic path — the
-# one channel that crosses its sandbox. The panel is gated to SpringBoard and fail-open.
-# VCamAudioProbe.x (0.6.51 DIAGNOSTIC, log-only, mediaserverd-only): pass-through hooks on
-# AudioUnitRender/AudioUnitProcess/AudioConverter* to LOCATE where TikTok's VPIO/HAL mic PCM
-# flows in mediaserverd (RootHide blocks in-process injection, so the mic must be replaced
-# system-side like video). Safe: no buffer edits, off-thread logging. Remove once the point
-# is found and the real mediaserverd mic replacement is wired.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamAudioApp.xm VCamFloatingPanel.xm VCamControlChannel.m VCamAudioProbe.x vendor/rtmp/vcam_rtmp.c
+# Darwin-notify bus (VCamControlChannel) so mediaserverd's VCamConfig picks them up instantly
+# (no 1.5s poll wait). The panel is gated to SpringBoard and fail-open.
+# VCamAudioProbe.x (mediaserverd-only) is the RootHide-surviving TikTok/VPIO mic replacement:
+# it hooks AudioUnitProcess and overwrites the VoiceProcessingIO mic-effect buffers with OBS
+# audio (PTS-dynamically aligned, 0.6.62), gated on 替换音频 + a live capture. This is the
+# system-side mic path that covers every app whose mic mediaserverd processes (TikTok, Shopee,
+# ...), which is why no per-app in-process audio hook is needed.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamFloatingPanel.xm VCamControlChannel.m VCamAudioProbe.x vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS

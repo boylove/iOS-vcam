@@ -4,8 +4,8 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 
-// Routable PCM sink (see VCamAudioSink.h). Defaults to the mediaserverd ring push; an app process
-// (VCamAudioApp) overrides it to route decoded OBS PCM into its own in-process FIFO instead.
+// Routable PCM sink (see VCamAudioSink.h). Defaults to the mediaserverd ring push; VCamAudioProbe
+// wraps it in mediaserverd to also feed the TikTok/VPIO AUProcess mic-inject ring.
 VCamPCMSink gVCamPCMSink = IVCAMMediaActivePushPCM;
 
 // AAC-LC decodes 1024 PCM frames per access unit; HE-AAC/SBR up to 2048. Size the output

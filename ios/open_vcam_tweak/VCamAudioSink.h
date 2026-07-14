@@ -52,10 +52,10 @@ int IVCAMAudioPopForEmit(int16_t *dst, uint32_t frames, uint32_t rate, uint32_t 
 void IVCAMAudioStats(uint64_t *pushed, uint64_t *hit, uint64_t *miss, uint32_t *rate, uint32_t *ch, uint32_t *fillMs);
 
 // Routable PCM sink. VCamAACDecoder pushes decoded OBS PCM through this pointer instead of calling
-// IVCAMMediaActivePushPCM directly, so the SAME decoder feeds either the mediaserverd ring
-// (default) or, in an app process (TikTok), the in-process FIFO in VCamAudioApp. Globals are
-// per-process, so mediaserverd keeps the ring while TikTok routes to its own FIFO; set it before
-// starting the RTMP source. Defaults to IVCAMMediaActivePushPCM.
+// IVCAMMediaActivePushPCM directly, so the decoder's output can be re-routed without touching the
+// decoder. In mediaserverd VCamAudioProbe wraps it to feed BOTH the stock-Camera emit ring AND the
+// TikTok/VPIO AUProcess mic-inject ring; set it before starting the RTMP source. Defaults to
+// IVCAMMediaActivePushPCM.
 typedef void (*VCamPCMSink)(const int16_t *pcm, uint32_t srcFrames, uint32_t srcRate, uint32_t srcCh, int64_t ptsMs);
 extern VCamPCMSink gVCamPCMSink;
 
