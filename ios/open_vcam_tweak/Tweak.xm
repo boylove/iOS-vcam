@@ -7,6 +7,7 @@
 #import <substrate.h>
 #import <stdarg.h>
 #import <string.h>
+#import <os/lock.h>
 
 #import "VCamConfig.h"
 #import "VCamFrameStore.h"
@@ -163,6 +164,57 @@ static NSString *VCamLogPath(void) {
     return [@"/tmp" stringByAppendingPathComponent:VCAM_LOG_NAME];
 }
 
+// Rotate the log when it reaches this size, keeping ONE previous generation (.1). mediaserverd
+// is a long-lived daemon (it does not restart per app launch), so on a multi-day continuous
+// session an un-capped log grows without bound; this bounds on-disk use to ~2x the threshold.
+#define VCAM_LOG_MAX_BYTES (1 * 1024 * 1024)   // 1 MiB per file -> ~2 MiB worst case with the .1
+
+// VCamLog is called concurrently from the RTMP, decode, emit and heartbeat threads. Serialise
+// with one lock and reuse a single always-open handle: this fixes the previous per-call
+// fileHandleForWritingAtPath race (independent handles each seeked to end and could overwrite
+// one another's bytes, not just interleave lines) and drops the per-line open/seek/close. The
+// write stays SYNCHRONOUS under the lock (not dispatched to a queue): this is the crash/error
+// log, and a synchronous write guarantees the last lines are on disk before a crash, and keeps
+// the file order consistent with the synchronous NSLog above. At the release log rate (~one
+// line every 10-20s) lock contention is negligible.
+static os_unfair_lock gLogLock = OS_UNFAIR_LOCK_INIT;
+static NSFileHandle *gLogHandle = nil;   // reused across calls; reopened after a rotation
+static BOOL gLogOpenFailed = NO;         // sandbox denied the file -> stop retrying, NSLog only
+
+// Caller must hold gLogLock. Opens gLogHandle (creating the file if needed) unless a prior
+// open failed. Leaves gLogHandle nil on failure.
+static void VCamLogOpenLocked(void) {
+    if (gLogHandle || gLogOpenFailed) return;
+    NSString *path = VCamLogPath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        if (![fm createFileAtPath:path contents:nil attributes:nil]) { gLogOpenFailed = YES; return; }
+    }
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!h) { gLogOpenFailed = YES; return; }   // sandbox denied writes: give up, keep NSLog
+    [h seekToEndOfFile];
+    gLogHandle = h;
+}
+
+// Caller must hold gLogLock. If the open file has reached the size cap, close it, move it to
+// "<path>.1" (replacing any previous generation), and reopen a fresh empty file.
+static void VCamLogRotateIfNeededLocked(void) {
+    if (!gLogHandle) return;
+    unsigned long long size = 0;
+    @try { size = [gLogHandle offsetInFile]; } @catch (__unused NSException *e) { return; }
+    if (size < VCAM_LOG_MAX_BYTES) return;
+
+    @try { [gLogHandle closeFile]; } @catch (__unused NSException *e) {}
+    gLogHandle = nil;
+
+    NSString *path = VCamLogPath();
+    NSString *prev = [path stringByAppendingPathExtension:@"1"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:prev error:nil];          // drop the older generation (best-effort)
+    [fm moveItemAtPath:path toPath:prev error:nil]; // current -> .1
+    VCamLogOpenLocked();                            // reopen a fresh, empty current file
+}
+
 void VCamLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -171,18 +223,22 @@ void VCamLog(NSString *format, ...) {
 
     NSLog(@"[OpenVCam] %@", message);
 
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+    if (!data) return;
+
+    os_unfair_lock_lock(&gLogLock);
     @try {
-        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
-        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSString *path = VCamLogPath();
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:path]) {
-            [data writeToFile:path atomically:NO];
-        } else {
-            NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (h) { [h seekToEndOfFile]; [h writeData:data]; [h closeFile]; }
+        VCamLogOpenLocked();
+        if (gLogHandle) {
+            [gLogHandle writeData:data];
+            VCamLogRotateIfNeededLocked();
         }
-    } @catch (__unused NSException *e) { /* sandbox may deny file writes */ }
+    } @catch (__unused NSException *e) {
+        // A mid-write failure can leave a bad handle; drop it so the next call reopens.
+        gLogHandle = nil;
+    }
+    os_unfair_lock_unlock(&gLogLock);
 }
 
 // ---------------------------------------------------------------------------
