@@ -56,6 +56,17 @@ endif
 ifdef VCAM_VIDEO_DEDUP
 OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
 endif
+# VCAM_PHOTO_COLOR (default 1) — saved-photo red-cast fix, scoped to the full-res still buffer only:
+#   0 = baseline (no colour handling), 1 = restore the still buffer's native (P3) colour tags over
+#   the transfer session's 709 stamp, 2 = strip the tags so the encoder infers from the format.
+ifdef VCAM_PHOTO_COLOR
+OpenVCam_CFLAGS += -DVCAM_PHOTO_COLOR=$(VCAM_PHOTO_COLOR)
+endif
+# VCAM_STILL_MIN_DIM (default 2200) — a dst buffer with short side >= this is treated as the still
+#   (photo-colour fix applies only to it; preview 1728 / record 720 never enter that path).
+ifdef VCAM_STILL_MIN_DIM
+OpenVCam_CFLAGS += -DVCAM_STILL_MIN_DIM=$(VCAM_STILL_MIN_DIM)
+endif
 OpenVCam_FRAMEWORKS := Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
 
 after-install::
