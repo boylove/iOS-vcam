@@ -45,6 +45,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// with this. NULL only if the session failed to create.
 - (nullable VTPixelTransferSessionRef)transferSession;
 
+/// STILL-ONLY transfer session — identical to -transferSession except its destination color
+/// primaries are Display P3 (not 709), so the OBS frame is gamut-mapped 709->P3 to match the P3
+/// tag deferredmediad stamps on the saved HEIC (fixes the saved-photo red cast; preview/record
+/// keep the 709 -transferSession). Created eagerly at init; NULL -> caller falls back to
+/// -transferSession (fail-open). Used only for the full-res still (Tweak.xm isStill gate).
+- (nullable VTPixelTransferSessionRef)stillTransferSession;
+
 /// Set the engine "live" flag (== _bLive / -setLive:, ivar 9). The emit overwrites ONLY when
 /// live AND a frame exists. The RTMP layer sets YES on connect and NO on disconnect WITHOUT
 /// clearing the frame — so a disconnected stream falls open to the real camera via this gate

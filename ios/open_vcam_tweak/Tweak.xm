@@ -107,26 +107,26 @@
 #define VCAM_DEST_MATRIX_709 0
 #endif
 
-// VCAM_PHOTO_COLOR — fix for the SAVED-PHOTO RED CAST (preview/record are fine, only the still
-// thumbnail + opened photo are red, in ALL lighting, immediately). Root cause (memory
-// openvcam-photo-red-dest-stamp-p3, reconfirmed by control 0.6.5): the ONE 601/709 transfer
-// session writes into EVERY destination buffer including the full-res still, so it stamps ITU-R
-// 709 colour tags onto the still buffer. That still buffer is wide-gamut (Display P3), so the
-// HEIC encoder re-colour-manages the 709-tagged pixels into P3 and PUSHES RED. Preview (1728) /
-// record (720) buffers are not re-colour-managed the same way, so they look correct — which is
-// exactly why only the photo reddens. This is DISTINCT from the archived dark-scene deferred red
-// (VCAMERA_OPENVCAM_COMPLETE_REFERENCE.md §5: dark-only, appears on swipe-back, preview fine).
+// VCAM_PHOTO_COLOR — fix for the SAVED-PHOTO RED CAST (preview/record fine; only the saved still
+// is red, in ALL lighting, immediately, and its file is ~3x smaller than a real photo). DEVICE-
+// DIAGNOSED (0.6.64->0.6.65): pulled the saved HEIC and parsed its nclx colour box — it is tagged
+// primaries=12 (Display P3) / transfer=1 (709) / matrix=6 (601), the NORMAL tag for an iPhone photo.
+// deferredmediad stamps that P3 tag independently; it does NOT inherit the buffer tag we set in
+// mediaserverd (which is why the 0.6.64 tag snapshot/restore did nothing on-device). But the main
+// transfer session writes 709-PRIMARIES pixel VALUES into the still buffer, so iOS then interprets
+// those 709 values as the wider P3 gamut -> every colour over-saturates toward the gamut edge, and
+// since P3 expands RED the most, the photo reddens (and the reduced colour entropy shrinks the HEIC).
+// Preview (1728) / record (720) are not re-colour-managed into P3, so they look correct — exactly why
+// only the photo reddens. DISTINCT from the archived dark-scene deferred red (REFERENCE §5).
 //
-// The fix is SCOPED TO THE STILL BUFFER ONLY (short side >= VCAM_STILL_MIN_DIM) so the video /
-// preview colour path is byte-for-byte unchanged (user constraint: do not touch recording).
-//   0 = baseline (no colour handling; the pre-fix behaviour — A/B reference).
-//   1 = DEFAULT: snapshot the still buffer's OWN (native P3) colour tags BEFORE the transfer and
-//       RESTORE them AFTER, overwriting the 709 the session stamps. The saved photo is then
-//       colour-managed with its native tags, matching the real camera.
-//   2 = STRIP: remove the colour tags from the still buffer after the transfer, so the encoder
-//       infers colour from the buffer's own format instead of the 709 stamp (fallback if 1 still
-//       reds — e.g. if the native tags themselves are the wrong ones).
-// Fail-open: any failure leaves the already-overwritten pixels in place; the photo still saves.
+// FIX (values, not tags): transfer the still through a SEPARATE session whose DestinationColorPrimaries
+// = P3_D65 (VCamFrameStore -stillTransferSession), so VT gamut-maps the OBS frame 709->P3 — a 709 red
+// becomes the P3 value for the SAME absolute colour, which then matches the P3 tag and renders correctly.
+// SCOPED TO THE STILL BUFFER ONLY (short side >= VCAM_STILL_MIN_DIM); preview/record keep the untouched
+// 709 main session (user constraint: do not touch recording).
+//   0 = baseline (still uses the 709 main session — the pre-fix red behaviour, for A/B).
+//   1 = DEFAULT: still uses the P3 session (the fix).
+// Fail-open: if the P3 session is NULL the still falls back to the main session (current behaviour).
 #ifndef VCAM_PHOTO_COLOR
 #define VCAM_PHOTO_COLOR 1
 #endif
@@ -334,58 +334,13 @@ static long VCamAutoOrientDegrees(CVPixelBufferRef src, CVImageBufferRef dst) {
 static uint64_t gRPortrait;   // landscape-gate skips (health diagnostic)
 
 #if VCAM_PHOTO_COLOR
-// The colour-management tags that decide how the encoder interprets the pixels. The transfer
-// session stamps these (709) onto its destination; on the wide-gamut still buffer that is what
-// reddens the saved photo, so we snapshot/restore ONLY these on the still buffer. The keys are
-// extern `const CFStringRef` (NOT compile-time constants), so they can't initialise a file-scope
-// static array in C — fill a caller-provided local array at runtime instead.
-enum { kVCamColorKeyCount = 4 };
-static void VCamColorKeys(CFStringRef keys[kVCamColorKeyCount]) {
-    keys[0] = kCVImageBufferColorPrimariesKey;
-    keys[1] = kCVImageBufferTransferFunctionKey;
-    keys[2] = kCVImageBufferYCbCrMatrixKey;
-    keys[3] = kCVImageBufferICCProfileKey;
-}
-
 // Is this destination the full-res still (vs preview/record)? Scoped by short side so the colour
 // handling NEVER touches the video/preview path (user constraint: recording is already correct).
+// Device-confirmed geometry (0.6.64 syslog): still short side 3168/3024; preview 1728; record 720.
 static BOOL VCamIsStillBuffer(CVImageBufferRef buf) {
     size_t w = CVPixelBufferGetWidth(buf), h = CVPixelBufferGetHeight(buf);
     size_t shortSide = (w < h) ? w : h;
     return shortSide >= (size_t)VCAM_STILL_MIN_DIM;
-}
-
-// Snapshot the still buffer's OWN colour tags into `out` (each +1 retained or NULL). Uses
-// CVBufferCopyAttachment (CVBufferGetAttachment is deprecated under -Werror).
-static void VCamColorSnapshot(CVImageBufferRef buf, CFTypeRef out[kVCamColorKeyCount]) {
-    CFStringRef keys[kVCamColorKeyCount];
-    VCamColorKeys(keys);
-    for (int i = 0; i < kVCamColorKeyCount; i++) {
-        // mode is passed NULL (we always re-attach ShouldPropagate below) — the param is nullable.
-        out[i] = CVBufferCopyAttachment(buf, keys[i], NULL);
-    }
-}
-
-// Restore (mode 1) the snapshotted native tags over whatever the transfer stamped, or strip
-// (mode 2) the tags entirely so the encoder infers colour from the buffer format. Releases the
-// snapshot's +1 references either way.
-static void VCamColorRestore(CVImageBufferRef buf, CFTypeRef snap[kVCamColorKeyCount], int mode) {
-    CFStringRef keys[kVCamColorKeyCount];
-    VCamColorKeys(keys);
-    for (int i = 0; i < kVCamColorKeyCount; i++) {
-        if (mode == 2) {
-            // STRIP: drop the 709 the transfer stamped; let the encoder use the buffer's format.
-            CVBufferRemoveAttachment(buf, keys[i]);
-        } else if (snap[i]) {
-            // RESTORE the buffer's native (P3) tag, overwriting the transfer's 709 stamp.
-            CVBufferSetAttachment(buf, keys[i], snap[i], kCVAttachmentMode_ShouldPropagate);
-        } else {
-            // The still buffer had no such tag natively -> remove the one the transfer added, so
-            // we don't leave a 709 stamp the native buffer never carried.
-            CVBufferRemoveAttachment(buf, keys[i]);
-        }
-        if (snap[i]) CFRelease(snap[i]);
-    }
 }
 #endif
 
@@ -427,40 +382,33 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 #endif
     size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
 
+    // STILL-PHOTO COLOUR FIX (device-diagnosed 0.6.64->0.6.65; scoped to the full-res still ONLY).
+    // The saved HEIC is tagged Display P3 (nclx primaries=12) by deferredmediad, but the main 709
+    // session writes 709-primaries pixel VALUES into the still buffer, so iOS reads 709 values as the
+    // wider P3 -> over-saturation toward the gamut edge (reddest first, P3 expands red most) = red cast
+    // + smaller file. The still session is identical EXCEPT DestinationColorPrimaries=P3_D65, so VT
+    // gamut-maps 709->P3 and the pixel values match the P3 tag. Preview/record (short side <
+    // VCAM_STILL_MIN_DIM) keep the main 709 session, byte-for-byte unchanged. Fail-open: if the still
+    // session is NULL (creation failed), use the main session (== current 0.6.64 behaviour).
+    VTPixelTransferSessionRef useXfer = xfer;
 #if VCAM_PHOTO_COLOR
-    // STILL-PHOTO COLOUR FIX (scoped to the full-res still buffer only; preview/record untouched).
-    // The single 601 session (0.6.5) stamps 709 primaries/transfer onto whatever it transfers into.
-    // On the wide-gamut (Display P3) still buffer the HEIC encoder then re-colour-manages those 709
-    // tags into P3 -> reddened saved photo (memory openvcam-photo-red-dest-stamp-p3). Snapshot the
-    // still buffer's OWN native tags before the transfer and restore/strip them after, so the encoder
-    // reads the pixels in the buffer's native colour space. Preview/record buffers (short side <
-    // VCAM_STILL_MIN_DIM) never enter this branch. Fail-open: on any anomaly the pixels are already
-    // written and the photo still saves.
     BOOL isStill = VCamIsStillBuffer(cameraBuf);
-    CFTypeRef colorSnap[kVCamColorKeyCount] = {0};
-    if (isStill) VCamColorSnapshot(cameraBuf, colorSnap);
-#endif
-
-    // ONE transfer, one 601 session for every buffer (preview, video, still) — no per-size
-    // routing, like the closed vcamera. ScalingMode=Trim (on the session) aspect-fills.
-    OSStatus ts = VTPixelTransferSessionTransferImage(xfer, src, cameraBuf);
-
-#if VCAM_PHOTO_COLOR
-    if (isStill && ts == noErr) {
-        VCamColorRestore(cameraBuf, colorSnap, VCAM_PHOTO_COLOR);
+    if (isStill) {
+        VTPixelTransferSessionRef sxfer = [store stillTransferSession];
+        if (sxfer) useXfer = sxfer;
         static BOOL loggedStill = NO;
         if (!loggedStill) {
             loggedStill = YES;
-            VCamLog(@"photo-color: still %zux%zu colour %@ (mode %d)",
+            VCamLog(@"photo-color: still %zux%zu using %@ session (VCAM_PHOTO_COLOR=%d)",
                     CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                    VCAM_PHOTO_COLOR == 2 ? @"stripped" : @"restored to native", VCAM_PHOTO_COLOR);
+                    sxfer ? @"P3" : @"709-fallback", VCAM_PHOTO_COLOR);
         }
-    } else if (isStill) {
-        // Transfer failed: release the snapshot we took (VCamColorRestore would also do this, but
-        // we skip it since the pixels weren't overwritten). Fail-open.
-        for (int i = 0; i < kVCamColorKeyCount; i++) if (colorSnap[i]) CFRelease(colorSnap[i]);
     }
 #endif
+
+    // ONE transfer. Preview/video use the 709 main session; the full-res still uses the P3 session
+    // (VCAM_PHOTO_COLOR) so the saved photo's pixel values match its P3 tag. ScalingMode=Trim aspect-fills.
+    OSStatus ts = VTPixelTransferSessionTransferImage(useXfer, src, cameraBuf);
 
     [store endEmitAccess];
 

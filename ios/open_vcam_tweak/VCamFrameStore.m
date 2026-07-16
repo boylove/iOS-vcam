@@ -22,6 +22,11 @@
     CVPixelBufferRef _rotated;               // CCW90 pre-rotated copy   (== engine ivar 0x70)
     VTPixelRotationSessionRef _rotSession;   // CCW90 rotation session   (== engine ivar 0x98)
     VTPixelTransferSessionRef _transferSession; // scale/convert session (== engine ivar 0x88)
+    VTPixelTransferSessionRef _stillTransferSession; // STILL-ONLY session: identical config but
+                                             // Destination primaries = Display P3, so the OBS
+                                             // pixels written into the full-res still buffer are
+                                             // gamut-mapped 709->P3 to match the P3 tag deferredmediad
+                                             // stamps on the saved HEIC (fixes the red cast + small file).
     BOOL _live;                              // overwrite gate           (== engine ivar 9 / _bLive)
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
     CVPixelBufferPoolRef _rotPool;           // RECYCLES rotated dst buffers (bounds IOSurface churn)
@@ -79,6 +84,30 @@
 #endif
             _transferSession = ts;
         }
+
+        // STILL-ONLY transfer session (saved-photo red-cast fix, device-diagnosed 0.6.64->0.6.65).
+        // The saved HEIC is tagged Display P3 (nclx primaries=12) by deferredmediad, but the main
+        // session above writes 709-primaries pixel VALUES into the still buffer, so iOS interprets
+        // 709 values as the wider P3 -> everything over-saturates toward the gamut edge, reddest of
+        // all (P3 expands red most) -> red cast + smaller file (colour entropy drops). This session
+        // is IDENTICAL to the main one EXCEPT its DestinationColorPrimaries = P3_D65, so VT gamut-maps
+        // the OBS frame 709->P3: a 709 red becomes the P3 value for the SAME absolute colour, matching
+        // the P3 tag. Used ONLY for the full-res still (Tweak.xm isStill gate); preview/record keep the
+        // untouched 709 main session. Created eagerly like the main session; NULL -> Tweak.xm falls
+        // back to the main session (fail-open, i.e. current behaviour).
+        VTPixelTransferSessionRef sts = NULL;
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &sts) == noErr && sts) {
+            VTSessionSetProperty(sts, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            VTSessionSetProperty(sts, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+            VTSessionSetProperty(sts, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 kCVImageBufferColorPrimaries_P3_D65);
+            VTSessionSetProperty(sts, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(sts, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+            _stillTransferSession = sts;
+        }
     }
     return self;
 }
@@ -99,9 +128,14 @@
         VTPixelTransferSessionInvalidate(_transferSession);
         CFRelease(_transferSession);
     }
+    if (_stillTransferSession) {
+        VTPixelTransferSessionInvalidate(_stillTransferSession);
+        CFRelease(_stillTransferSession);
+    }
 }
 
 - (VTPixelTransferSessionRef)transferSession { return _transferSession; }
+- (VTPixelTransferSessionRef)stillTransferSession { return _stillTransferSession; }
 
 // Faithful port of the closed vcamera's `create90ImageBuffer:` (0x829e0): CCW90-rotate
 // `src` into a FRESH buffer with swapped W/H, whose IOSurface uses exactly
