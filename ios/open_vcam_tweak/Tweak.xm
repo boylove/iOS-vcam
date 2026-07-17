@@ -356,13 +356,22 @@ static NSString *VCamDescribeBuffer(CVPixelBufferRef b) {
     OSType f = CVPixelBufferGetPixelFormatType(b);
     char fcc[5] = { (char)((f >> 24) & 0xff), (char)((f >> 16) & 0xff),
                     (char)((f >> 8) & 0xff), (char)(f & 0xff), 0 };
-    id prim = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferColorPrimariesKey, NULL);
-    id xfer = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferTransferFunctionKey, NULL);
-    id mat  = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferYCbCrMatrixKey, NULL);
-    BOOL icc = CVBufferGetAttachment(b, kCVImageBufferICCProfileKey, NULL) != NULL;
-    return [NSString stringWithFormat:@"fmt=%s %zux%zu planar=%d prim=%@ xfer=%@ mat=%@ icc=%d",
+    // CVBufferCopyAttachment (iOS 15+, returns +1) — the non-deprecated replacement for
+    // CVBufferGetAttachment (the build treats the deprecation warning as an error).
+    CFTypeRef primR = CVBufferCopyAttachment(b, kCVImageBufferColorPrimariesKey, NULL);
+    CFTypeRef xferR = CVBufferCopyAttachment(b, kCVImageBufferTransferFunctionKey, NULL);
+    CFTypeRef matR  = CVBufferCopyAttachment(b, kCVImageBufferYCbCrMatrixKey, NULL);
+    CFTypeRef iccR  = CVBufferCopyAttachment(b, kCVImageBufferICCProfileKey, NULL);
+    NSString *out = [NSString stringWithFormat:@"fmt=%s %zux%zu planar=%d prim=%@ xfer=%@ mat=%@ icc=%d",
             fcc, CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b),
-            (int)CVPixelBufferIsPlanar(b), prim ?: @"-", xfer ?: @"-", mat ?: @"-", icc];
+            (int)CVPixelBufferIsPlanar(b),
+            primR ? (__bridge id)primR : @"-", xferR ? (__bridge id)xferR : @"-",
+            matR ? (__bridge id)matR : @"-", (int)(iccR != NULL)];
+    if (primR) CFRelease(primR);
+    if (xferR) CFRelease(xferR);
+    if (matR)  CFRelease(matR);
+    if (iccR)  CFRelease(iccR);
+    return out;
 }
 
 // Centre sample under a read-only lock (rare, still-only). Planar YCbCr -> Y and Cb/Cr; else 4 bytes.
