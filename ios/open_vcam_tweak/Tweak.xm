@@ -127,10 +127,12 @@
 // SCOPED TO THE STILL BUFFER ONLY (short side >= VCAM_STILL_MIN_DIM); preview/record keep the untouched
 // 709 main session (user constraint: do not touch recording).
 //   0 = baseline (still uses the 709 main session — the pre-fix red behaviour, for A/B).
-//   1 = DEFAULT: still uses the P3 session (the fix).
+//   1 = still uses the P3 session only (0.6.65; re-tags but does NOT remap values — insufficient).
+//   2 = DEFAULT (0.6.72): gamut-map the still's VALUES 709->P3 (the real fix, VCamStillGamut709toP3)
+//       + red-keep compression (VCAM_PHOTO_REDKEEP) to cancel deferredmediad's still-render red boost.
 // Fail-open: if the P3 session is NULL the still falls back to the main session (current behaviour).
 #ifndef VCAM_PHOTO_COLOR
-#define VCAM_PHOTO_COLOR 1
+#define VCAM_PHOTO_COLOR 2
 #endif
 
 // VCAM_STILL_MIN_DIM — a destination buffer whose SHORT side is >= this is treated as the
@@ -139,6 +141,16 @@
 // per device if a model's still geometry differs.
 #ifndef VCAM_STILL_MIN_DIM
 #define VCAM_STILL_MIN_DIM 2200
+#endif
+
+// VCAM_PHOTO_REDKEEP — compiled default red-keep percent for the mode-2 still fix (0..100; 100 = off).
+// After the exact 709->P3 value map, this compresses ONLY the red EXCESS over green (keeps 60% of it),
+// cancelling deferredmediad's still-render re-saturation WITHOUT washing out any non-red colour. Because
+// the compression is PROPORTIONAL to each pixel's own red-over-green gap, ONE value auto-scales across
+// lighting (cool/cloudy -> little red -> barely touched; warm/evening -> more red -> compressed more),
+// so no per-scene tuning is needed. Hot-overridable via /var/tmp/vcam_photored (no rebuild).
+#ifndef VCAM_PHOTO_REDKEEP
+#define VCAM_PHOTO_REDKEEP 60
 #endif
 
 
@@ -500,7 +512,7 @@ static int VCamPhotoRedKeep(void) {
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
     if (cached < 0 || now - last >= 2.0) {
         last = now;
-        int v = 100;
+        int v = VCAM_PHOTO_REDKEEP;
         NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photored"
                                                   encoding:NSUTF8StringEncoding error:NULL];
         if (str.length > 0) {
