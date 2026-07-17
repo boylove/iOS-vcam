@@ -447,12 +447,16 @@ static void VCamPhotoDiagOnce(CVPixelBufferRef src) {
     });
 }
 
-// Runtime photo-colour mode, hot-overridable via /var/mobile/Media/vcam_photocolor (first byte
-// '0'..'2'); falls back to the compiled VCAM_PHOTO_COLOR default. Re-read at most ~every 2s (stills
-// are rare, so this is negligible). Lets the fix be A/B'd on-device with no rebuild:
+// Runtime photo-colour mode, hot-overridable via a one-byte flag file ('0'..'2'); falls back to the
+// compiled VCAM_PHOTO_COLOR default. Re-read at most ~every 2s (stills are rare, so negligible).
 //   0 = still uses the 709 main session (pre-fix red baseline)
 //   1 = still uses the P3-dest session (0.6.65 — tag only, still red: VT does not remap values)
 //   2 = still is GAMUT-MAPPED 709->P3 in pixel VALUES (0.6.67 fix) so it matches its P3 tag
+// PATH: /var/tmp is the dir mediaserverd's sandbox can actually read on this RootHide device — it is
+// where the log lives and where VCamConfig's vc.plist is read from (device log: "config
+// source=/var/tmp/vc.plist"; the /var/mobile/Media candidates are tried first and FAIL). 0.6.67 read
+// the flag from /var/mobile/Media and so never saw it (still fell back to the compiled default).
+// /var/mobile/Media is kept as a second try for app-level contexts.
 static int VCamPhotoColorMode(void) {
     static int cached = -1;
     static NSTimeInterval last = 0;
@@ -460,9 +464,13 @@ static int VCamPhotoColorMode(void) {
     if (cached < 0 || now - last >= 2.0) {
         last = now;
         int m = VCAM_PHOTO_COLOR;
-        NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Media/vcam_photocolor"
-                                                encoding:NSUTF8StringEncoding error:NULL];
-        if (s.length > 0) { unichar c = [s characterAtIndex:0]; if (c >= '0' && c <= '9') m = c - '0'; }
+        for (NSString *path in @[ @"/var/tmp/vcam_photocolor", @"/var/mobile/Media/vcam_photocolor" ]) {
+            NSString *s = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+            if (s.length > 0) {
+                unichar c = [s characterAtIndex:0];
+                if (c >= '0' && c <= '9') { m = c - '0'; break; }
+            }
+        }
         cached = m;
     }
     return cached;
