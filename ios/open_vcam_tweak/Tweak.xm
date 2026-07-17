@@ -379,6 +379,16 @@ static NSString *VCamDescribeBuffer(CVPixelBufferRef b) {
 // Centre sample under a read-only lock (rare, still-only). Planar YCbCr -> Y and Cb/Cr; else 4 bytes.
 static NSString *VCamCentreSample(CVPixelBufferRef b) {
     if (!b) return @"(null)";
+    // CPU-read ONLY known linear pixel formats. The full-res still is &xf0 (10-bit PACKED LOSSLESS,
+    // AGX-compressed): after a lock its base address is NOT linearly addressable, so the centre read
+    // below indexes past the mapped region and SIGSEGVs mediaserverd — this is the 0.6.68 crash that
+    // fired on every still (killed capture -> photo never saved). Attachment reads (VCamDescribeBuffer)
+    // stay safe; only the raw pixel fetch is gated here. Anything not on this allow-list is skipped.
+    OSType f = CVPixelBufferGetPixelFormatType(b);
+    if (f != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
+        f != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+        f != kCVPixelFormatType_32BGRA)
+        return @"(fmt-skip)";
     if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return @"(lockfail)";
     NSString *s = @"(?)";
     @try {
