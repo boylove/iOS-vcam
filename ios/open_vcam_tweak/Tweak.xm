@@ -143,14 +143,23 @@
 #define VCAM_STILL_MIN_DIM 2200
 #endif
 
-// VCAM_PHOTO_REDKEEP — compiled default red-keep percent for the mode-2 still fix (0..100; 100 = off).
-// After the exact 709->P3 value map, this compresses ONLY the red EXCESS over green (keeps 60% of it),
-// cancelling deferredmediad's still-render re-saturation WITHOUT washing out any non-red colour. Because
-// the compression is PROPORTIONAL to each pixel's own red-over-green gap, ONE value auto-scales across
-// lighting (cool/cloudy -> little red -> barely touched; warm/evening -> more red -> compressed more),
-// so no per-scene tuning is needed. Hot-overridable via /var/tmp/vcam_photored (no rebuild).
+// VCAM_PHOTO_REDKEEP — compiled default MIDTONE red-keep percent for the mode-2 still fix (0..100;
+// 100 = off). After the exact 709->P3 value map, this compresses ONLY the red EXCESS over green in the
+// SKIN/midtone luma range, cancelling deferredmediad's still-render re-saturation WITHOUT washing out
+// non-red colours and WITHOUT the hue shift a global desaturation causes. It is PROPORTIONAL to each
+// pixel's own red-over-green gap (so it auto-scales across lighting) AND luminance-ramped (see
+// VCAM_PHOTO_REDKEEP_HI) so skin keeps its blood-red while neutral highlights stay neutral.
+// Hot-overridable via /var/tmp/vcam_photored (no rebuild). Device-confirmed skin value = 85.
 #ifndef VCAM_PHOTO_REDKEEP
-#define VCAM_PHOTO_REDKEEP 60
+#define VCAM_PHOTO_REDKEEP 85
+#endif
+
+// VCAM_PHOTO_REDKEEP_HI — highlight red-keep floor (0..100). The red compression is LUMINANCE-RAMPED:
+// midtone pixels (skin) keep VCAM_PHOTO_REDKEEP of their red (blood colour), but BRIGHT pixels ramp down
+// to this lower floor, so specular highlights on neutral objects (a clear glass / white cup) de-warm
+// back toward neutral instead of glaring pink. Hot-overridable via /var/tmp/vcam_photohl (no rebuild).
+#ifndef VCAM_PHOTO_REDKEEP_HI
+#define VCAM_PHOTO_REDKEEP_HI 35
 #endif
 
 
@@ -524,6 +533,28 @@ static int VCamPhotoRedKeep(void) {
     return cached;
 }
 
+// Still-photo HIGHLIGHT red-keep floor percent (0..100; 100 = OFF), hot via /var/tmp/vcam_photohl.
+// This is the low end of the luminance ramp: bright specular highlights on neutral objects (a clear
+// glass, a white cup) are compressed toward this floor so they de-warm back to neutral instead of
+// glaring pink, while the SKIN midtones stay at VCamPhotoRedKeep(). Still-only; never touches preview.
+static int VCamPhotoRedKeepHi(void) {
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int v = VCAM_PHOTO_REDKEEP_HI;
+        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photohl"
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (str.length > 0) {
+            int n = [str intValue];
+            if (n >= 0 && n <= 100) v = n;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
 // THE FIX (0.6.67): write TRUE Display-P3 pixel values into the full-res still, so the colour the
 // P3-tagged HEIC renders equals the OBS colour the (709) preview/record already show correctly.
 // Device-diagnosed chain: the still buffer is natively P3-tagged (prim=P3_D65) and 10-bit LOSSLESS
@@ -589,21 +620,32 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                 vImage_Buffer d = { CVPixelBufferGetBaseAddress(rgbP3),  sh, sw, CVPixelBufferGetBytesPerRow(rgbP3) };
                 vImage_Error e = vImageConvert_AnyToAny(gCvt, &s, &d, NULL, kvImageNoFlags);
                 wrote = (e == kvImageNoError);
-                // Compress ONLY the red EXCESS over green to cancel deferredmediad's still-render red
-                // boost WITHOUT washing out the picture: where R>G, pull R toward G by (1-rk); G, B and
-                // every cool/neutral pixel are left untouched, so non-red colours keep full saturation.
-                // Result stays in [0,255] (G <= R' <= R). redKeep==100 -> skip (pure 709->P3). Still-only.
-                int redKeep = VCamPhotoRedKeep();
-                if (wrote && redKeep < 100) {
-                    float rk = redKeep / 100.0f;
+                // Compress ONLY the red EXCESS over green (where R>G, pull R toward G by (1-rk); G, B and
+                // every cool/neutral pixel are untouched, so nothing washes out) to cancel deferredmediad's
+                // still-render red boost. rk is LUMINANCE-RAMPED so one image serves two subjects that a
+                // single global value cannot: SKIN (midtone) keeps rkMid of its red = blood colour, while
+                // BRIGHT specular highlights ramp to rkHi so a clear glass / white cup de-warms to neutral
+                // instead of glaring pink. Result stays in [0,255] (G <= R' <= R). Still-only.
+                int redKeep = VCamPhotoRedKeep();       // midtone/skin red-keep %
+                int redKeepHi = VCamPhotoRedKeepHi();   // highlight red-keep floor %
+                if (wrote && (redKeep < 100 || redKeepHi < 100)) {
+                    float rkMid = redKeep / 100.0f;
+                    float rkHi  = redKeepHi / 100.0f;
                     uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t rb2 = CVPixelBufferGetBytesPerRow(rgbP3);
                     for (size_t yy = 0; yy < sh; yy++) {
                         uint8_t *row = base + yy * rb2;
                         for (size_t xx = 0; xx < sw; xx++) {
                             uint8_t *px = row + xx * 4;   // BGRA byte order
-                            float Gv = px[1], Rv = px[2];
-                            if (Rv > Gv) px[2] = (uint8_t)(Gv + rk * (Rv - Gv) + 0.5f);
+                            float Bv = px[0], Gv = px[1], Rv = px[2];
+                            if (Rv > Gv) {
+                                // 709 luma picks skin(mid) vs specular highlight(bright); ramp 170->235.
+                                float L = 0.2126f * Rv + 0.7152f * Gv + 0.0722f * Bv;
+                                float t = (L - 170.0f) * (1.0f / 65.0f);
+                                if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+                                float rk = rkMid + t * (rkHi - rkMid);
+                                px[2] = (uint8_t)(Gv + rk * (Rv - Gv) + 0.5f);
+                            }
                         }
                     }
                 }
@@ -614,8 +656,8 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                     uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
                     uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
-                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
-                                        (long)e, redKeep, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
+                                        (long)e, redKeep, redKeepHi, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
                 }
                 CVPixelBufferUnlockBaseAddress(rgbP3, 0);
             }
