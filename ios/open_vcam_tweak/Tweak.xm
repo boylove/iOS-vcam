@@ -162,6 +162,18 @@
 #define VCAM_PHOTO_REDKEEP_HI 35
 #endif
 
+// VCAM_PHOTO_HITHRESH — where the highlight ramp STARTS, as a percent of THIS image's own white point
+// (its 98th-percentile luma), not an absolute luma. Relative-to-white-point is deliberate: the fix runs
+// on the pre-deferredmediad buffer, which deferredmediad then BRIGHTENS, so any absolute luma threshold
+// calibrated on the saved photo never engages on the darker buffer (0.6.73 lesson). A fraction of the
+// buffer's own white point self-calibrates and generalises across scenes/lighting. Below this fraction
+// -> full midtone red-keep (skin); from here up to ~0.94*whitePoint it ramps to the highlight floor.
+// Hot-overridable via /var/tmp/vcam_photolt: lower it if neutral highlights stay warm, raise it if skin
+// highlights lose their red.
+#ifndef VCAM_PHOTO_HITHRESH
+#define VCAM_PHOTO_HITHRESH 60
+#endif
+
 
 // ---------------------------------------------------------------------------
 // Stall watchdog / heartbeat (diagnostic for the "moves once then freezes" bug).
@@ -555,6 +567,25 @@ static int VCamPhotoRedKeepHi(void) {
     return cached;
 }
 
+// Highlight-ramp START threshold, percent of the still's own white point (0..100). See VCAM_PHOTO_HITHRESH.
+static int VCamPhotoHiThreshold(void) {
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int v = VCAM_PHOTO_HITHRESH;
+        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photolt"
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (str.length > 0) {
+            int n = [str intValue];
+            if (n >= 0 && n <= 100) v = n;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
 // THE FIX (0.6.67): write TRUE Display-P3 pixel values into the full-res still, so the colour the
 // P3-tagged HEIC renders equals the OBS colour the (709) preview/record already show correctly.
 // Device-diagnosed chain: the still buffer is natively P3-tagged (prim=P3_D65) and 10-bit LOSSLESS
@@ -622,26 +653,49 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                 wrote = (e == kvImageNoError);
                 // Compress ONLY the red EXCESS over green (where R>G, pull R toward G by (1-rk); G, B and
                 // every cool/neutral pixel are untouched, so nothing washes out) to cancel deferredmediad's
-                // still-render red boost. rk is LUMINANCE-RAMPED so one image serves two subjects that a
-                // single global value cannot: SKIN (midtone) keeps rkMid of its red = blood colour, while
-                // BRIGHT specular highlights ramp to rkHi so a clear glass / white cup de-warms to neutral
-                // instead of glaring pink. Result stays in [0,255] (G <= R' <= R). Still-only.
+                // still-render red boost. rk is LUMINANCE-RAMPED so one image serves two subjects a single
+                // global value cannot: SKIN (midtone) keeps rkMid of its red = blood colour, while BRIGHT
+                // specular highlights ramp to rkHi so a clear glass / white cup de-warms to neutral instead
+                // of glaring pink. The ramp is placed RELATIVE to this image's OWN white point (98th-pct
+                // luma), NOT an absolute luma: the fix runs on the pre-deferredmediad buffer, which
+                // deferredmediad then brightens, so an absolute threshold (0.6.73) never engaged. Result
+                // stays in [0,255] (G <= R' <= R). Still-only.
                 int redKeep = VCamPhotoRedKeep();       // midtone/skin red-keep %
                 int redKeepHi = VCamPhotoRedKeepHi();   // highlight red-keep floor %
+                int loPct = VCamPhotoHiThreshold();     // ramp start, % of the image's own white point
+                int Lw = 0;                             // buffer white point (98th-pct luma), for the trace
                 if (wrote && (redKeep < 100 || redKeepHi < 100)) {
                     float rkMid = redKeep / 100.0f;
                     float rkHi  = redKeepHi / 100.0f;
                     uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t rb2 = CVPixelBufferGetBytesPerRow(rgbP3);
+                    // Pass 1: luma histogram -> the buffer's own white point (98th percentile).
+                    uint32_t hist[256]; memset(hist, 0, sizeof(hist));
+                    for (size_t yy = 0; yy < sh; yy++) {
+                        uint8_t *row = base + yy * rb2;
+                        for (size_t xx = 0; xx < sw; xx++) {
+                            uint8_t *px = row + xx * 4;   // BGRA
+                            int L = (int)(0.2126f * px[2] + 0.7152f * px[1] + 0.0722f * px[0] + 0.5f);
+                            if (L > 255) L = 255;
+                            hist[L]++;
+                        }
+                    }
+                    size_t total = sw * sh, acc = 0, thr = (total * 98) / 100;
+                    Lw = 255;
+                    for (int i = 0; i < 256; i++) { acc += hist[i]; if (acc >= thr) { Lw = i; break; } }
+                    // Ramp window [lo, hi] as fractions of the white point.
+                    float lo = (loPct / 100.0f) * (float)Lw;
+                    float hi = 0.94f * (float)Lw;
+                    float span = hi - lo; if (span < 1.0f) span = 1.0f;
+                    // Pass 2: luminance-ramped red-excess compression.
                     for (size_t yy = 0; yy < sh; yy++) {
                         uint8_t *row = base + yy * rb2;
                         for (size_t xx = 0; xx < sw; xx++) {
                             uint8_t *px = row + xx * 4;   // BGRA byte order
-                            float Bv = px[0], Gv = px[1], Rv = px[2];
+                            float Gv = px[1], Rv = px[2];
                             if (Rv > Gv) {
-                                // 709 luma picks skin(mid) vs specular highlight(bright); ramp 170->235.
-                                float L = 0.2126f * Rv + 0.7152f * Gv + 0.0722f * Bv;
-                                float t = (L - 170.0f) * (1.0f / 65.0f);
+                                float L = 0.2126f * Rv + 0.7152f * Gv + 0.0722f * (float)px[0];
+                                float t = (L - lo) / span;
                                 if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
                                 float rk = rkMid + t * (rkHi - rkMid);
                                 px[2] = (uint8_t)(Gv + rk * (Rv - Gv) + 0.5f);
@@ -656,8 +710,8 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                     uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
                     uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
-                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
-                                        (long)e, redKeep, redKeepHi, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d lw=%d lo=%d%% 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
+                                        (long)e, redKeep, redKeepHi, Lw, loPct, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
                 }
                 CVPixelBufferUnlockBaseAddress(rgbP3, 0);
             }
