@@ -3,6 +3,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <Accelerate/Accelerate.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <stdarg.h>
@@ -444,6 +446,126 @@ static void VCamPhotoDiagOnce(CVPixelBufferRef src) {
         if (dP3)  CVPixelBufferRelease(dP3);
     });
 }
+
+// Runtime photo-colour mode, hot-overridable via /var/mobile/Media/vcam_photocolor (first byte
+// '0'..'2'); falls back to the compiled VCAM_PHOTO_COLOR default. Re-read at most ~every 2s (stills
+// are rare, so this is negligible). Lets the fix be A/B'd on-device with no rebuild:
+//   0 = still uses the 709 main session (pre-fix red baseline)
+//   1 = still uses the P3-dest session (0.6.65 — tag only, still red: VT does not remap values)
+//   2 = still is GAMUT-MAPPED 709->P3 in pixel VALUES (0.6.67 fix) so it matches its P3 tag
+static int VCamPhotoColorMode(void) {
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int m = VCAM_PHOTO_COLOR;
+        NSString *s = [NSString stringWithContentsOfFile:@"/var/mobile/Media/vcam_photocolor"
+                                                encoding:NSUTF8StringEncoding error:NULL];
+        if (s.length > 0) { unichar c = [s characterAtIndex:0]; if (c >= '0' && c <= '9') m = c - '0'; }
+        cached = m;
+    }
+    return cached;
+}
+
+// THE FIX (0.6.67): write TRUE Display-P3 pixel values into the full-res still, so the colour the
+// P3-tagged HEIC renders equals the OBS colour the (709) preview/record already show correctly.
+// Device-diagnosed chain: the still buffer is natively P3-tagged (prim=P3_D65) and 10-bit LOSSLESS
+// (fmt &xf0), deferredmediad keeps that P3 tag, but our transfer writes 709-primaries VALUES into it
+// (VTPixelTransferSession's DestinationColorPrimaries only re-tags, it does NOT gamut-convert — the
+// on-device 709-vs-P3 probe proved identical values). 709 values under a P3 tag over-saturate toward
+// the gamut edge, reddest first -> the red cast. Fix path (all still-only, rare, fail-open):
+//   1) VT: OBS src (420f 709) -> BGRA scratch (VT decodes YCbCr->RGB; the still is lossless so it is
+//      NOT directly writable by vImage — hence the plain-BGRA detour);
+//   2) vImage colour-managed 709->DisplayP3 on that plain BGRA (CPU/Accelerate, no GPU fence — safe
+//      in mediaserverd, unlike a CIContext) — this is the actual gamut remap;
+//   3) VT: BGRA(P3 values) -> the still buffer (scaled), so it now holds P3 values under its P3 tag.
+// Returns YES only if all three steps succeed; on ANY failure the caller keeps the plain transfer
+// (== current red behaviour, never worse, never a black/again frame). The video/preview path never
+// calls this (guarded by isStill upstream).
+static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) {
+    if (!src || !still) return NO;
+    size_t sw = CVPixelBufferGetWidth(src), sh = CVPixelBufferGetHeight(src);
+    if (sw == 0 || sh == 0) return NO;
+
+    // Lazy, reused: the two colour spaces and the single-plane BGRA 709->DisplayP3 vImage converter.
+    static CGColorSpaceRef cs709 = NULL, csP3 = NULL;
+    static vImageConverterRef gCvt = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cs709 = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
+        csP3  = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+        if (cs709 && csP3) {
+            // 32-bit BGRA (the layout VTPixelTransferSession writes for kCVPixelFormatType_32BGRA):
+            // little-endian 0xAARRGGBB, alpha in the high byte -> NoneSkipFirst | ByteOrder32Little.
+            vImage_CGImageFormat f709 = {
+                .bitsPerComponent = 8, .bitsPerPixel = 32, .colorSpace = cs709,
+                .bitmapInfo = (CGBitmapInfo)(kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little),
+                .version = 0, .decode = NULL, .renderingIntent = kCGRenderingIntentDefault,
+            };
+            vImage_CGImageFormat fP3 = f709; fP3.colorSpace = csP3;
+            vImage_Error e = kvImageNoError;
+            gCvt = vImageConverter_CreateWithCGImageFormat(&f709, &fP3, NULL, kvImageNoFlags, &e);
+            if (!gCvt) VCamLog(@"photo-fix: vImage converter create failed (%ld)", (long)e);
+        }
+    });
+    if (!gCvt) return NO;
+
+    BOOL ok = NO;
+    CVPixelBufferRef rgb709 = NULL, rgbP3 = NULL;
+    VTPixelTransferSessionRef toRGB = NULL, toYUV = NULL;
+    NSDictionary *bgra = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+                            (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
+    do {
+        // 1) OBS src (420f, 709) -> rgb709 (BGRA, src size). VT decodes YCbCr->RGB (601 matrix, 709).
+        if (CVPixelBufferCreate(kCFAllocatorDefault, sw, sh, kCVPixelFormatType_32BGRA,
+                                (__bridge CFDictionaryRef)bgra, &rgb709) != kCVReturnSuccess) break;
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &toRGB) != noErr || !toRGB) break;
+        if (VTPixelTransferSessionTransferImage(toRGB, src, rgb709) != noErr) break;
+
+        // 2) vImage colour-managed 709 -> DisplayP3 on the plain BGRA (the real gamut remap).
+        if (CVPixelBufferCreate(kCFAllocatorDefault, sw, sh, kCVPixelFormatType_32BGRA,
+                                (__bridge CFDictionaryRef)bgra, &rgbP3) != kCVReturnSuccess) break;
+        BOOL wrote = NO;
+        if (CVPixelBufferLockBaseAddress(rgb709, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+            if (CVPixelBufferLockBaseAddress(rgbP3, 0) == kCVReturnSuccess) {
+                vImage_Buffer s = { CVPixelBufferGetBaseAddress(rgb709), sh, sw, CVPixelBufferGetBytesPerRow(rgb709) };
+                vImage_Buffer d = { CVPixelBufferGetBaseAddress(rgbP3),  sh, sw, CVPixelBufferGetBytesPerRow(rgbP3) };
+                vImage_Error e = vImageConvert_AnyToAny(gCvt, &s, &d, NULL, kvImageNoFlags);
+                wrote = (e == kvImageNoError);
+                // Sanity/A-B trace: a 709->P3 map preserves neutrals and PULLS saturated chroma inward,
+                // so for a red-ish sample the P3 R should not exceed the 709 R. Logged once.
+                static BOOL tracedFix = NO;
+                if (!tracedFix) {
+                    tracedFix = YES;
+                    uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
+                    uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
+                    size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld 709BGRA[%d %d %d] -> P3BGRA[%d %d %d]",
+                                        (long)e, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                }
+                CVPixelBufferUnlockBaseAddress(rgbP3, 0);
+            }
+            CVPixelBufferUnlockBaseAddress(rgb709, kCVPixelBufferLock_ReadOnly);
+        }
+        if (!wrote) break;
+
+        // 3) rgbP3 (BGRA, P3 values) -> still (lossless 10-bit P3, scaled). RGB->YCbCr matrix only;
+        //    values already P3, so the still now matches the P3 tag deferredmediad stamps.
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &toYUV) != noErr || !toYUV) break;
+        VTSessionSetProperty(toYUV, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+        VTSessionSetProperty(toYUV, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_P3_D65);
+        VTSessionSetProperty(toYUV, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+        if (VTPixelTransferSessionTransferImage(toYUV, rgbP3, still) != noErr) break;
+        ok = YES;
+    } while (0);
+
+    if (toRGB) { VTPixelTransferSessionInvalidate(toRGB); CFRelease(toRGB); }
+    if (toYUV) { VTPixelTransferSessionInvalidate(toYUV); CFRelease(toYUV); }
+    if (rgb709) CVPixelBufferRelease(rgb709);
+    if (rgbP3)  CVPixelBufferRelease(rgbP3);
+    return ok;
+}
 #endif
 
 static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
@@ -495,19 +617,23 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     VTPixelTransferSessionRef useXfer = xfer;
 #if VCAM_PHOTO_COLOR
     BOOL isStill = VCamIsStillBuffer(cameraBuf);
+    int pcMode = 0;                        // 0=709 baseline, 1=P3-tag session, 2=gamut-map fix
     NSString *dstNative = nil;             // still dst's NATIVE colour attrs (before our transfer)
-    CVPixelBufferRef srcForDiag = NULL;    // +1 retained OBS src for the one-time VT gamut probe
+    CVPixelBufferRef srcForDiag = NULL;    // +1 retained OBS src for the one-time VT gamut probe + fix
     if (isStill) {
+        pcMode = VCamPhotoColorMode();
         VTPixelTransferSessionRef sxfer = [store stillTransferSession];
-        if (sxfer) useXfer = sxfer;
+        // mode 0 keeps the 709 main session; modes 1 & 2 use the P3-dest session as the base transfer
+        // (mode 2 then remaps the VALUES afterwards, which is the part that actually fixes the red).
+        if (pcMode >= 1 && sxfer) useXfer = sxfer;
         dstNative = VCamDescribeBuffer(cameraBuf);
         if (src) srcForDiag = (CVPixelBufferRef)CVPixelBufferRetain(src);
-        static BOOL loggedStill = NO;
-        if (!loggedStill) {
-            loggedStill = YES;
-            VCamLog(@"photo-color: still %zux%zu using %@ session (VCAM_PHOTO_COLOR=%d)",
-                    CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                    sxfer ? @"P3" : @"709-fallback", VCAM_PHOTO_COLOR);
+        static int loggedMode = -1;
+        if (loggedMode != pcMode) {
+            loggedMode = pcMode;
+            VCamLog(@"photo-color: still %zux%zu mode=%d (%@)",
+                    CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf), pcMode,
+                    pcMode == 0 ? @"709 baseline" : (pcMode == 2 ? @"gamut-map fix" : @"P3 tag only"));
         }
     }
 #endif
@@ -530,6 +656,17 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
                     VCamDescribeBuffer(cameraBuf), VCamCentreSample(cameraBuf));
         });
         VCamPhotoDiagOnce(srcForDiag);
+        // mode 2: remap the still's VALUES 709->P3 (the fix). Overwrites the baseline transfer above;
+        // on failure the baseline (red) result stays. Still-only, rare, fail-open.
+        if (pcMode == 2 && srcForDiag) {
+            BOOL fixed = VCamStillGamut709toP3(srcForDiag, cameraBuf);
+            static int loggedFix = -1;
+            if (loggedFix != (fixed ? 1 : 0)) {
+                loggedFix = fixed ? 1 : 0;
+                VCamLog(@"photo-fix: gamut-map %@",
+                        fixed ? @"applied (still now holds P3 values)" : @"FAILED -> kept baseline transfer");
+            }
+        }
     }
     if (srcForDiag) CVPixelBufferRelease(srcForDiag);
 #endif

@@ -56,9 +56,10 @@ endif
 ifdef VCAM_VIDEO_DEDUP
 OpenVCam_CFLAGS += -DVCAM_VIDEO_DEDUP=$(VCAM_VIDEO_DEDUP)
 endif
-# VCAM_PHOTO_COLOR (default 1) — saved-photo red-cast fix, scoped to the full-res still buffer only:
-#   0 = baseline (no colour handling), 1 = restore the still buffer's native (P3) colour tags over
-#   the transfer session's 709 stamp, 2 = strip the tags so the encoder infers from the format.
+# VCAM_PHOTO_COLOR (default 1) — saved-photo red-cast fix, scoped to the full-res still buffer only.
+#   Compile-time default for the runtime mode (hot-overridable via /var/mobile/Media/vcam_photocolor):
+#   0 = 709 baseline (pre-fix red), 1 = P3-dest transfer session (0.6.65 — re-tags only, still red),
+#   2 = 0.6.67 gamut-map fix (VT->vImage 709->DisplayP3->VT writes true P3 VALUES into the still).
 ifdef VCAM_PHOTO_COLOR
 OpenVCam_CFLAGS += -DVCAM_PHOTO_COLOR=$(VCAM_PHOTO_COLOR)
 endif
@@ -67,7 +68,7 @@ endif
 ifdef VCAM_STILL_MIN_DIM
 OpenVCam_CFLAGS += -DVCAM_STILL_MIN_DIM=$(VCAM_STILL_MIN_DIM)
 endif
-OpenVCam_FRAMEWORKS := Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox
+OpenVCam_FRAMEWORKS := Foundation UIKit AVFoundation CoreMedia CoreVideo VideoToolbox AudioToolbox CoreGraphics Accelerate
 
 after-install::
 	@echo "Installed OpenVCam. Restart the target camera app; no respring required."
