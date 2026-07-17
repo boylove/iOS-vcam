@@ -486,6 +486,30 @@ static int VCamPhotoColorMode(void) {
     return cached;
 }
 
+// Extra still-photo saturation percent (0..100; 100 = OFF/unchanged), hot via /var/tmp/vcam_photosat.
+// A straight colour-managed 709->P3 value map (mode 2) removes the primaries over-saturation, but the
+// saved photo's MIDTONES stay redder than the 709 preview/record because deferredmediad RE-SATURATES
+// the still it renders. This factor pulls the P3 chroma toward luma BEFORE the still is written, to
+// PRE-CANCEL that boost. Tuned on-device against a same-scene video (the correct reference): lower it
+// until the photo's midtone R-G matches the video's. Still-only; never touches preview/record.
+static int VCamPhotoSat(void) {
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int v = 100;
+        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photosat"
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (str.length > 0) {
+            int n = [str intValue];
+            if (n >= 0 && n <= 100) v = n;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
 // THE FIX (0.6.67): write TRUE Display-P3 pixel values into the full-res still, so the colour the
 // P3-tagged HEIC renders equals the OBS colour the (709) preview/record already show correctly.
 // Device-diagnosed chain: the still buffer is natively P3-tagged (prim=P3_D65) and 10-bit LOSSLESS
@@ -551,16 +575,35 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                 vImage_Buffer d = { CVPixelBufferGetBaseAddress(rgbP3),  sh, sw, CVPixelBufferGetBytesPerRow(rgbP3) };
                 vImage_Error e = vImageConvert_AnyToAny(gCvt, &s, &d, NULL, kvImageNoFlags);
                 wrote = (e == kvImageNoError);
-                // Sanity/A-B trace: a 709->P3 map preserves neutrals and PULLS saturated chroma inward,
-                // so for a red-ish sample the P3 R should not exceed the 709 R. Logged once.
+                // Extra desaturation to PRE-CANCEL deferredmediad's still-render saturation boost, so the
+                // saved photo's midtones match the 709 preview/record. Convex blend toward Rec709 luma
+                // (result stays in [0,255], no clamp needed). sat==100 -> skip (pure 709->P3). Still-only.
+                int sat = VCamPhotoSat();
+                if (wrote && sat < 100) {
+                    float k = sat / 100.0f;
+                    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
+                    size_t rb2 = CVPixelBufferGetBytesPerRow(rgbP3);
+                    for (size_t yy = 0; yy < sh; yy++) {
+                        uint8_t *row = base + yy * rb2;
+                        for (size_t xx = 0; xx < sw; xx++) {
+                            uint8_t *px = row + xx * 4;   // BGRA byte order
+                            float Bv = px[0], Gv = px[1], Rv = px[2];
+                            float L = 0.2126f * Rv + 0.7152f * Gv + 0.0722f * Bv;
+                            px[0] = (uint8_t)(L + k * (Bv - L) + 0.5f);
+                            px[1] = (uint8_t)(L + k * (Gv - L) + 0.5f);
+                            px[2] = (uint8_t)(L + k * (Rv - L) + 0.5f);
+                        }
+                    }
+                }
+                // Sanity/A-B trace (once): the values actually written to the still (post 709->P3, post-sat).
                 static BOOL tracedFix = NO;
                 if (!tracedFix) {
                     tracedFix = YES;
                     uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
                     uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
-                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld 709BGRA[%d %d %d] -> P3BGRA[%d %d %d]",
-                                        (long)e, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld sat=%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
+                                        (long)e, sat, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
                 }
                 CVPixelBufferUnlockBaseAddress(rgbP3, 0);
             }
