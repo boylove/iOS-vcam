@@ -342,6 +342,99 @@ static BOOL VCamIsStillBuffer(CVImageBufferRef buf) {
     size_t shortSide = (w < h) ? w : h;
     return shortSide >= (size_t)VCAM_STILL_MIN_DIM;
 }
+
+// ---------------------------------------------------------------------------
+// Photo-colour DIAGNOSTIC (0.6.66). The saved still reddens while preview/record are correct, and
+// BOTH prior fixes (0.6.64 buffer-tag restore, 0.6.65 P3-primaries transfer session) left it red on
+// device. Two facts follow: (a) deferredmediad ignores the mediaserverd buffer colour tag (the 709
+// main session already tags the still 709 and the photo is still P3-red), and (b) 0.6.64 and 0.6.65
+// produced the SAME red, implying VTPixelTransferSession did not gamut-convert the values. Before
+// writing a real (value-remapping) fix, this build proves both on device and reveals the still
+// buffer's true pixel format — all still-only, read-only, logged once, behaviour otherwise unchanged.
+static NSString *VCamDescribeBuffer(CVPixelBufferRef b) {
+    if (!b) return @"(null)";
+    OSType f = CVPixelBufferGetPixelFormatType(b);
+    char fcc[5] = { (char)((f >> 24) & 0xff), (char)((f >> 16) & 0xff),
+                    (char)((f >> 8) & 0xff), (char)(f & 0xff), 0 };
+    id prim = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferColorPrimariesKey, NULL);
+    id xfer = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferTransferFunctionKey, NULL);
+    id mat  = (__bridge id)CVBufferGetAttachment(b, kCVImageBufferYCbCrMatrixKey, NULL);
+    BOOL icc = CVBufferGetAttachment(b, kCVImageBufferICCProfileKey, NULL) != NULL;
+    return [NSString stringWithFormat:@"fmt=%s %zux%zu planar=%d prim=%@ xfer=%@ mat=%@ icc=%d",
+            fcc, CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b),
+            (int)CVPixelBufferIsPlanar(b), prim ?: @"-", xfer ?: @"-", mat ?: @"-", icc];
+}
+
+// Centre sample under a read-only lock (rare, still-only). Planar YCbCr -> Y and Cb/Cr; else 4 bytes.
+static NSString *VCamCentreSample(CVPixelBufferRef b) {
+    if (!b) return @"(null)";
+    if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return @"(lockfail)";
+    NSString *s = @"(?)";
+    @try {
+        if (CVPixelBufferIsPlanar(b)) {
+            uint8_t *y = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(b, 0);
+            size_t yr = CVPixelBufferGetBytesPerRowOfPlane(b, 0);
+            size_t yw = CVPixelBufferGetWidthOfPlane(b, 0), yh = CVPixelBufferGetHeightOfPlane(b, 0);
+            uint8_t *c = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(b, 1);
+            size_t cr = CVPixelBufferGetBytesPerRowOfPlane(b, 1);
+            size_t cw = CVPixelBufferGetWidthOfPlane(b, 1), ch = CVPixelBufferGetHeightOfPlane(b, 1);
+            int Y = y ? y[(yh / 2) * yr + (yw / 2)] : -1;
+            int Cb = -1, Cr = -1;
+            if (c) { size_t o = (ch / 2) * cr + (cw / 2) * 2; Cb = c[o]; Cr = c[o + 1]; }
+            s = [NSString stringWithFormat:@"Y=%d Cb=%d Cr=%d", Y, Cb, Cr];
+        } else {
+            uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(b);
+            size_t r = CVPixelBufferGetBytesPerRow(b);
+            size_t w = CVPixelBufferGetWidth(b), h = CVPixelBufferGetHeight(b);
+            if (p) { size_t o = (h / 2) * r + (w / 2) * 4; s = [NSString stringWithFormat:@"[%d %d %d %d]", p[o], p[o + 1], p[o + 2], p[o + 3]]; }
+            else s = @"(nobase)";
+        }
+    } @catch (__unused NSException *e) { s = @"(exc)"; }
+    CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
+    return s;
+}
+
+// One-time: transfer the OBS src into two 256x256 scratch buffers via a fresh 709-dest session and a
+// fresh P3-dest session, then log both centre samples. If the two centres are IDENTICAL, the dest
+// ColorPrimaries property does NOT gamut-convert (so 0.6.65's P3 session was a value no-op = the
+// still stayed 709-valued under deferredmediad's P3 tag = red). If they DIFFER, VT does convert and
+// the red is elsewhere. Fully self-contained (own sessions + scratch); safe to run in the emit path.
+static void VCamPhotoDiagOnce(CVPixelBufferRef src) {
+    if (!src) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        OSType fmt = CVPixelBufferGetPixelFormatType(src);
+        VCamLog(@"photo-diag: OBS src %@ centre[%@]", VCamDescribeBuffer(src), VCamCentreSample(src));
+        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
+        CVPixelBufferRef d709 = NULL, dP3 = NULL;
+        CVPixelBufferCreate(kCFAllocatorDefault, 256, 256, fmt, (__bridge CFDictionaryRef)attrs, &d709);
+        CVPixelBufferCreate(kCFAllocatorDefault, 256, 256, fmt, (__bridge CFDictionaryRef)attrs, &dP3);
+        VTPixelTransferSessionRef s709 = NULL, sP3 = NULL;
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &s709);
+        VTPixelTransferSessionCreate(kCFAllocatorDefault, &sP3);
+        if (s709) {
+            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+        }
+        if (sP3) {
+            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
+            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_P3_D65);
+            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+        }
+        OSStatus e1 = (s709 && d709) ? VTPixelTransferSessionTransferImage(s709, src, d709) : (OSStatus)-999;
+        OSStatus e2 = (sP3 && dP3) ? VTPixelTransferSessionTransferImage(sP3, src, dP3) : (OSStatus)-999;
+        if (d709) VCamLog(@"photo-diag: 709-sess err=%d dst %@ centre[%@]", (int)e1, VCamDescribeBuffer(d709), VCamCentreSample(d709));
+        if (dP3)  VCamLog(@"photo-diag: P3-sess  err=%d dst %@ centre[%@]", (int)e2, VCamDescribeBuffer(dP3), VCamCentreSample(dP3));
+        VCamLog(@"photo-diag: 709==P3 centre => VT does NOT gamut-convert (fix must remap values, not the dest tag)");
+        if (s709) { VTPixelTransferSessionInvalidate(s709); CFRelease(s709); }
+        if (sP3)  { VTPixelTransferSessionInvalidate(sP3);  CFRelease(sP3); }
+        if (d709) CVPixelBufferRelease(d709);
+        if (dP3)  CVPixelBufferRelease(dP3);
+    });
+}
 #endif
 
 static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
@@ -393,9 +486,13 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     VTPixelTransferSessionRef useXfer = xfer;
 #if VCAM_PHOTO_COLOR
     BOOL isStill = VCamIsStillBuffer(cameraBuf);
+    NSString *dstNative = nil;             // still dst's NATIVE colour attrs (before our transfer)
+    CVPixelBufferRef srcForDiag = NULL;    // +1 retained OBS src for the one-time VT gamut probe
     if (isStill) {
         VTPixelTransferSessionRef sxfer = [store stillTransferSession];
         if (sxfer) useXfer = sxfer;
+        dstNative = VCamDescribeBuffer(cameraBuf);
+        if (src) srcForDiag = (CVPixelBufferRef)CVPixelBufferRetain(src);
         static BOOL loggedStill = NO;
         if (!loggedStill) {
             loggedStill = YES;
@@ -411,6 +508,22 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     OSStatus ts = VTPixelTransferSessionTransferImage(useXfer, src, cameraBuf);
 
     [store endEmitAccess];
+
+#if VCAM_PHOTO_COLOR
+    // Still-only photo-colour DIAGNOSTIC (0.6.66), logged once, AFTER the lock is released. Reveals
+    // the still buffer's native format/colour, what our transfer stamped, and whether VT gamut-
+    // converts (709 vs P3 dest). Read-only; never touches preview/record (guarded by isStill).
+    if (isStill) {
+        static dispatch_once_t stillDstOnce;
+        dispatch_once(&stillDstOnce, ^{
+            VCamLog(@"photo-diag: still DST native[%@]", dstNative ?: @"-");
+            VCamLog(@"photo-diag: still DST after-xfer %@ centre[%@]",
+                    VCamDescribeBuffer(cameraBuf), VCamCentreSample(cameraBuf));
+        });
+        VCamPhotoDiagOnce(srcForDiag);
+    }
+    if (srcForDiag) CVPixelBufferRelease(srcForDiag);
+#endif
 
     // One-time geometry diagnostic (first few distinct dst sizes), logged AFTER unlock so
     // the lock is held only around the transfer.
