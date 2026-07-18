@@ -143,38 +143,15 @@
 #define VCAM_STILL_MIN_DIM 2200
 #endif
 
-// VCAM_PHOTO_REDKEEP — compiled default MIDTONE red-keep percent for the mode-2 still fix (0..100;
-// 100 = off). After the exact 709->P3 value map, this compresses ONLY the red EXCESS over green in the
-// SKIN/midtone luma range, cancelling deferredmediad's still-render re-saturation WITHOUT washing out
-// non-red colours and WITHOUT the hue shift a global desaturation causes. It is PROPORTIONAL to each
-// pixel's own red-over-green gap (so it auto-scales across lighting) AND luminance-ramped (see
-// VCAM_PHOTO_REDKEEP_HI) so skin keeps its blood-red while neutral highlights stay neutral.
+// VCAM_PHOTO_REDKEEP — compiled default red-keep percent for the mode-2 still fix (0..100; 100 = off).
+// After the exact 709->P3 value map, this compresses ONLY the red EXCESS over green (a FLAT pull: every
+// pixel where R>G is moved toward G by rk = redKeep/100), cancelling deferredmediad's still-render
+// re-saturation WITHOUT washing out non-red colours and WITHOUT the hue shift a global desaturation
+// causes. It is PROPORTIONAL to each pixel's own red-over-green gap, so it auto-scales across lighting
+// while green/blue/neutral/cool pixels stay untouched (skin keeps its blood-red).
 // Hot-overridable via /var/tmp/vcam_photored (no rebuild). Device-confirmed skin value = 85.
 #ifndef VCAM_PHOTO_REDKEEP
 #define VCAM_PHOTO_REDKEEP 85
-#endif
-
-// VCAM_PHOTO_REDKEEP_HI — highlight red-keep floor (0..100). The red compression is LUMINANCE-RAMPED:
-// midtone pixels (skin) keep VCAM_PHOTO_REDKEEP of their red (blood colour), but BRIGHT pixels ramp down
-// to this lower floor, so specular highlights on neutral objects (a clear glass / white cup) de-warm
-// back toward neutral instead of glaring pink. Hot-overridable via /var/tmp/vcam_photohl (no rebuild).
-// DEFAULT is now 85 (== VCAM_PHOTO_REDKEEP, i.e. de-warm OFF): device testing showed the luma de-warm
-// made the clear glass COLDER than the source reference and bit into lit skin, and that the real "fake
-// glare" is a TONE problem (deferredmediad over-brightening) handled by VCAM_PHOTO_EXPOSURE/CONTRAST.
-#ifndef VCAM_PHOTO_REDKEEP_HI
-#define VCAM_PHOTO_REDKEEP_HI 85
-#endif
-
-// VCAM_PHOTO_HITHRESH — where the highlight ramp STARTS, as a percent of THIS image's own white point
-// (its 98th-percentile luma), not an absolute luma. Relative-to-white-point is deliberate: the fix runs
-// on the pre-deferredmediad buffer, which deferredmediad then BRIGHTENS, so any absolute luma threshold
-// calibrated on the saved photo never engages on the darker buffer (0.6.73 lesson). A fraction of the
-// buffer's own white point self-calibrates and generalises across scenes/lighting. Below this fraction
-// -> full midtone red-keep (skin); from here up to ~0.94*whitePoint it ramps to the highlight floor.
-// Hot-overridable via /var/tmp/vcam_photolt: lower it if neutral highlights stay warm, raise it if skin
-// highlights lose their red.
-#ifndef VCAM_PHOTO_HITHRESH
-#define VCAM_PHOTO_HITHRESH 60
 #endif
 
 // VCAM_PHOTO_EXPOSURE / VCAM_PHOTO_CONTRAST — still-only TONE compensation (percent; 100 = off) that
@@ -183,13 +160,13 @@
 // CONTRAST is an S-curve on LUMA, applied by scaling RGB by L'/L so it changes brightness/contrast only,
 // never hue or saturation (a saturation boost was tried on-device and re-pinked the glass). Runs on the
 // pre-deferredmediad buffer, so effective values are stronger than a post-hoc grade (deferredmediad
-// re-brightens). Hot via /var/tmp/vcam_expo and /var/tmp/vcam_contrast. Defaults 100/100 (off) until the
-// on-device tuning against the source settles, then the winners become the compiled defaults.
+// re-brightens). Hot via /var/tmp/vcam_expo and /var/tmp/vcam_contrast. Compiled defaults 72/138 are the
+// device-accepted REAR-camera values (the front camera may need its own set — tracked separately).
 #ifndef VCAM_PHOTO_EXPOSURE
-#define VCAM_PHOTO_EXPOSURE 100
+#define VCAM_PHOTO_EXPOSURE 72
 #endif
 #ifndef VCAM_PHOTO_CONTRAST
-#define VCAM_PHOTO_CONTRAST 100
+#define VCAM_PHOTO_CONTRAST 138
 #endif
 
 
@@ -396,118 +373,6 @@ static BOOL VCamIsStillBuffer(CVImageBufferRef buf) {
     return shortSide >= (size_t)VCAM_STILL_MIN_DIM;
 }
 
-// ---------------------------------------------------------------------------
-// Photo-colour DIAGNOSTIC (0.6.66). The saved still reddens while preview/record are correct, and
-// BOTH prior fixes (0.6.64 buffer-tag restore, 0.6.65 P3-primaries transfer session) left it red on
-// device. Two facts follow: (a) deferredmediad ignores the mediaserverd buffer colour tag (the 709
-// main session already tags the still 709 and the photo is still P3-red), and (b) 0.6.64 and 0.6.65
-// produced the SAME red, implying VTPixelTransferSession did not gamut-convert the values. Before
-// writing a real (value-remapping) fix, this build proves both on device and reveals the still
-// buffer's true pixel format — all still-only, read-only, logged once, behaviour otherwise unchanged.
-static NSString *VCamDescribeBuffer(CVPixelBufferRef b) {
-    if (!b) return @"(null)";
-    OSType f = CVPixelBufferGetPixelFormatType(b);
-    char fcc[5] = { (char)((f >> 24) & 0xff), (char)((f >> 16) & 0xff),
-                    (char)((f >> 8) & 0xff), (char)(f & 0xff), 0 };
-    // CVBufferCopyAttachment (iOS 15+, returns +1) — the non-deprecated replacement for
-    // CVBufferGetAttachment (the build treats the deprecation warning as an error).
-    CFTypeRef primR = CVBufferCopyAttachment(b, kCVImageBufferColorPrimariesKey, NULL);
-    CFTypeRef xferR = CVBufferCopyAttachment(b, kCVImageBufferTransferFunctionKey, NULL);
-    CFTypeRef matR  = CVBufferCopyAttachment(b, kCVImageBufferYCbCrMatrixKey, NULL);
-    CFTypeRef iccR  = CVBufferCopyAttachment(b, kCVImageBufferICCProfileKey, NULL);
-    NSString *out = [NSString stringWithFormat:@"fmt=%s %zux%zu planar=%d prim=%@ xfer=%@ mat=%@ icc=%d",
-            fcc, CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b),
-            (int)CVPixelBufferIsPlanar(b),
-            primR ? (__bridge id)primR : @"-", xferR ? (__bridge id)xferR : @"-",
-            matR ? (__bridge id)matR : @"-", (int)(iccR != NULL)];
-    if (primR) CFRelease(primR);
-    if (xferR) CFRelease(xferR);
-    if (matR)  CFRelease(matR);
-    if (iccR)  CFRelease(iccR);
-    return out;
-}
-
-// Centre sample under a read-only lock (rare, still-only). Planar YCbCr -> Y and Cb/Cr; else 4 bytes.
-static NSString *VCamCentreSample(CVPixelBufferRef b) {
-    if (!b) return @"(null)";
-    // CPU-read ONLY known linear pixel formats. The full-res still is &xf0 (10-bit PACKED LOSSLESS,
-    // AGX-compressed): after a lock its base address is NOT linearly addressable, so the centre read
-    // below indexes past the mapped region and SIGSEGVs mediaserverd — this is the 0.6.68 crash that
-    // fired on every still (killed capture -> photo never saved). Attachment reads (VCamDescribeBuffer)
-    // stay safe; only the raw pixel fetch is gated here. Anything not on this allow-list is skipped.
-    OSType f = CVPixelBufferGetPixelFormatType(b);
-    if (f != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange &&
-        f != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
-        f != kCVPixelFormatType_32BGRA)
-        return @"(fmt-skip)";
-    if (CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return @"(lockfail)";
-    NSString *s = @"(?)";
-    @try {
-        if (CVPixelBufferIsPlanar(b)) {
-            uint8_t *y = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(b, 0);
-            size_t yr = CVPixelBufferGetBytesPerRowOfPlane(b, 0);
-            size_t yw = CVPixelBufferGetWidthOfPlane(b, 0), yh = CVPixelBufferGetHeightOfPlane(b, 0);
-            uint8_t *c = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(b, 1);
-            size_t cr = CVPixelBufferGetBytesPerRowOfPlane(b, 1);
-            size_t cw = CVPixelBufferGetWidthOfPlane(b, 1), ch = CVPixelBufferGetHeightOfPlane(b, 1);
-            int Y = y ? y[(yh / 2) * yr + (yw / 2)] : -1;
-            int Cb = -1, Cr = -1;
-            if (c) { size_t o = (ch / 2) * cr + (cw / 2) * 2; Cb = c[o]; Cr = c[o + 1]; }
-            s = [NSString stringWithFormat:@"Y=%d Cb=%d Cr=%d", Y, Cb, Cr];
-        } else {
-            uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(b);
-            size_t r = CVPixelBufferGetBytesPerRow(b);
-            size_t w = CVPixelBufferGetWidth(b), h = CVPixelBufferGetHeight(b);
-            if (p) { size_t o = (h / 2) * r + (w / 2) * 4; s = [NSString stringWithFormat:@"[%d %d %d %d]", p[o], p[o + 1], p[o + 2], p[o + 3]]; }
-            else s = @"(nobase)";
-        }
-    } @catch (__unused NSException *e) { s = @"(exc)"; }
-    CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
-    return s;
-}
-
-// One-time: transfer the OBS src into two 256x256 scratch buffers via a fresh 709-dest session and a
-// fresh P3-dest session, then log both centre samples. If the two centres are IDENTICAL, the dest
-// ColorPrimaries property does NOT gamut-convert (so 0.6.65's P3 session was a value no-op = the
-// still stayed 709-valued under deferredmediad's P3 tag = red). If they DIFFER, VT does convert and
-// the red is elsewhere. Fully self-contained (own sessions + scratch); safe to run in the emit path.
-static void VCamPhotoDiagOnce(CVPixelBufferRef src) {
-    if (!src) return;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        OSType fmt = CVPixelBufferGetPixelFormatType(src);
-        VCamLog(@"photo-diag: OBS src %@ centre[%@]", VCamDescribeBuffer(src), VCamCentreSample(src));
-        NSDictionary *attrs = @{ (id)kCVPixelBufferIOSurfacePropertiesKey : @{} };
-        CVPixelBufferRef d709 = NULL, dP3 = NULL;
-        CVPixelBufferCreate(kCFAllocatorDefault, 256, 256, fmt, (__bridge CFDictionaryRef)attrs, &d709);
-        CVPixelBufferCreate(kCFAllocatorDefault, 256, 256, fmt, (__bridge CFDictionaryRef)attrs, &dP3);
-        VTPixelTransferSessionRef s709 = NULL, sP3 = NULL;
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &s709);
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &sP3);
-        if (s709) {
-            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
-            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
-            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
-            VTSessionSetProperty(s709, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
-        }
-        if (sP3) {
-            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Trim);
-            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_P3_D65);
-            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
-            VTSessionSetProperty(sP3, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
-        }
-        OSStatus e1 = (s709 && d709) ? VTPixelTransferSessionTransferImage(s709, src, d709) : (OSStatus)-999;
-        OSStatus e2 = (sP3 && dP3) ? VTPixelTransferSessionTransferImage(sP3, src, dP3) : (OSStatus)-999;
-        if (d709) VCamLog(@"photo-diag: 709-sess err=%d dst %@ centre[%@]", (int)e1, VCamDescribeBuffer(d709), VCamCentreSample(d709));
-        if (dP3)  VCamLog(@"photo-diag: P3-sess  err=%d dst %@ centre[%@]", (int)e2, VCamDescribeBuffer(dP3), VCamCentreSample(dP3));
-        VCamLog(@"photo-diag: 709==P3 centre => VT does NOT gamut-convert (fix must remap values, not the dest tag)");
-        if (s709) { VTPixelTransferSessionInvalidate(s709); CFRelease(s709); }
-        if (sP3)  { VTPixelTransferSessionInvalidate(sP3);  CFRelease(sP3); }
-        if (d709) CVPixelBufferRelease(d709);
-        if (dP3)  CVPixelBufferRelease(dP3);
-    });
-}
-
 // Runtime photo-colour mode, hot-overridable via a one-byte flag file ('0'..'2'); falls back to the
 // compiled VCAM_PHOTO_COLOR default. Re-read at most ~every 2s (stills are rare, so negligible).
 //   0 = still uses the 709 main session (pre-fix red baseline)
@@ -553,47 +418,6 @@ static int VCamPhotoRedKeep(void) {
         last = now;
         int v = VCAM_PHOTO_REDKEEP;
         NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photored"
-                                                  encoding:NSUTF8StringEncoding error:NULL];
-        if (str.length > 0) {
-            int n = [str intValue];
-            if (n >= 0 && n <= 100) v = n;
-        }
-        cached = v;
-    }
-    return cached;
-}
-
-// Still-photo HIGHLIGHT red-keep floor percent (0..100; 100 = OFF), hot via /var/tmp/vcam_photohl.
-// This is the low end of the luminance ramp: bright specular highlights on neutral objects (a clear
-// glass, a white cup) are compressed toward this floor so they de-warm back to neutral instead of
-// glaring pink, while the SKIN midtones stay at VCamPhotoRedKeep(). Still-only; never touches preview.
-static int VCamPhotoRedKeepHi(void) {
-    static int cached = -1;
-    static NSTimeInterval last = 0;
-    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (cached < 0 || now - last >= 2.0) {
-        last = now;
-        int v = VCAM_PHOTO_REDKEEP_HI;
-        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photohl"
-                                                  encoding:NSUTF8StringEncoding error:NULL];
-        if (str.length > 0) {
-            int n = [str intValue];
-            if (n >= 0 && n <= 100) v = n;
-        }
-        cached = v;
-    }
-    return cached;
-}
-
-// Highlight-ramp START threshold, percent of the still's own white point (0..100). See VCAM_PHOTO_HITHRESH.
-static int VCamPhotoHiThreshold(void) {
-    static int cached = -1;
-    static NSTimeInterval last = 0;
-    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (cached < 0 || now - last >= 2.0) {
-        last = now;
-        int v = VCAM_PHOTO_HITHRESH;
-        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_photolt"
                                                   encoding:NSUTF8StringEncoding error:NULL];
         if (str.length > 0) {
             int n = [str intValue];
@@ -700,54 +524,20 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                 vImage_Error e = vImageConvert_AnyToAny(gCvt, &s, &d, NULL, kvImageNoFlags);
                 wrote = (e == kvImageNoError);
                 // Compress ONLY the red EXCESS over green (where R>G, pull R toward G by (1-rk); G, B and
-                // every cool/neutral pixel are untouched, so nothing washes out) to cancel deferredmediad's
-                // still-render red boost. rk is LUMINANCE-RAMPED so one image serves two subjects a single
-                // global value cannot: SKIN (midtone) keeps rkMid of its red = blood colour, while BRIGHT
-                // specular highlights ramp to rkHi so a clear glass / white cup de-warms to neutral instead
-                // of glaring pink. The ramp is placed RELATIVE to this image's OWN white point (98th-pct
-                // luma), NOT an absolute luma: the fix runs on the pre-deferredmediad buffer, which
-                // deferredmediad then brightens, so an absolute threshold (0.6.73) never engaged. Result
-                // stays in [0,255] (G <= R' <= R). Still-only.
-                int redKeep = VCamPhotoRedKeep();       // midtone/skin red-keep %
-                int redKeepHi = VCamPhotoRedKeepHi();   // highlight red-keep floor %
-                int loPct = VCamPhotoHiThreshold();     // ramp start, % of the image's own white point
-                int Lw = 0;                             // buffer white point (98th-pct luma), for the trace
-                if (wrote && (redKeep < 100 || redKeepHi < 100)) {
-                    float rkMid = redKeep / 100.0f;
-                    float rkHi  = redKeepHi / 100.0f;
+                // every cool/neutral pixel are untouched, so nothing washes out) to trim deferredmediad's
+                // still-render red boost. Flat rk = redKeep/100; result stays in [0,255] (G <= R' <= R).
+                // redKeep == 100 -> skip. Still-only.
+                int redKeep = VCamPhotoRedKeep();       // red-keep % (100 = off)
+                if (wrote && redKeep < 100) {
+                    float rk = redKeep / 100.0f;
                     uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t rb2 = CVPixelBufferGetBytesPerRow(rgbP3);
-                    // Pass 1: luma histogram -> the buffer's own white point (98th percentile).
-                    uint32_t hist[256]; memset(hist, 0, sizeof(hist));
-                    for (size_t yy = 0; yy < sh; yy++) {
-                        uint8_t *row = base + yy * rb2;
-                        for (size_t xx = 0; xx < sw; xx++) {
-                            uint8_t *px = row + xx * 4;   // BGRA
-                            int L = (int)(0.2126f * px[2] + 0.7152f * px[1] + 0.0722f * px[0] + 0.5f);
-                            if (L > 255) L = 255;
-                            hist[L]++;
-                        }
-                    }
-                    size_t total = sw * sh, acc = 0, thr = (total * 98) / 100;
-                    Lw = 255;
-                    for (int i = 0; i < 256; i++) { acc += hist[i]; if (acc >= thr) { Lw = i; break; } }
-                    // Ramp window [lo, hi] as fractions of the white point.
-                    float lo = (loPct / 100.0f) * (float)Lw;
-                    float hi = 0.94f * (float)Lw;
-                    float span = hi - lo; if (span < 1.0f) span = 1.0f;
-                    // Pass 2: luminance-ramped red-excess compression.
                     for (size_t yy = 0; yy < sh; yy++) {
                         uint8_t *row = base + yy * rb2;
                         for (size_t xx = 0; xx < sw; xx++) {
                             uint8_t *px = row + xx * 4;   // BGRA byte order
                             float Gv = px[1], Rv = px[2];
-                            if (Rv > Gv) {
-                                float L = 0.2126f * Rv + 0.7152f * Gv + 0.0722f * (float)px[0];
-                                float t = (L - lo) / span;
-                                if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-                                float rk = rkMid + t * (rkHi - rkMid);
-                                px[2] = (uint8_t)(Gv + rk * (Rv - Gv) + 0.5f);
-                            }
+                            if (Rv > Gv) px[2] = (uint8_t)(Gv + rk * (Rv - Gv) + 0.5f);
                         }
                     }
                 }
@@ -789,8 +579,8 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                     uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
                     uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
-                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d lw=%d lo=%d%% expo=%d con=%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
-                                        (long)e, redKeep, redKeepHi, Lw, loPct, expo, contrast, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d expo=%d con=%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
+                                        (long)e, redKeep, expo, contrast, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
                 }
                 CVPixelBufferUnlockBaseAddress(rgbP3, 0);
             }
@@ -866,16 +656,14 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 #if VCAM_PHOTO_COLOR
     BOOL isStill = VCamIsStillBuffer(cameraBuf);
     int pcMode = 0;                        // 0=709 baseline, 1=P3-tag session, 2=gamut-map fix
-    NSString *dstNative = nil;             // still dst's NATIVE colour attrs (before our transfer)
-    CVPixelBufferRef srcForDiag = NULL;    // +1 retained OBS src for the one-time VT gamut probe + fix
+    CVPixelBufferRef stillSrc = NULL;      // +1 retained OBS src for the mode-2 gamut fix
     if (isStill) {
         pcMode = VCamPhotoColorMode();
         VTPixelTransferSessionRef sxfer = [store stillTransferSession];
         // mode 0 keeps the 709 main session; modes 1 & 2 use the P3-dest session as the base transfer
         // (mode 2 then remaps the VALUES afterwards, which is the part that actually fixes the red).
         if (pcMode >= 1 && sxfer) useXfer = sxfer;
-        dstNative = VCamDescribeBuffer(cameraBuf);
-        if (src) srcForDiag = (CVPixelBufferRef)CVPixelBufferRetain(src);
+        if (src) stillSrc = (CVPixelBufferRef)CVPixelBufferRetain(src);
         static int loggedMode = -1;
         if (loggedMode != pcMode) {
             loggedMode = pcMode;
@@ -893,30 +681,20 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     [store endEmitAccess];
 
 #if VCAM_PHOTO_COLOR
-    // Still-only photo-colour DIAGNOSTIC (0.6.66), logged once, AFTER the lock is released. Reveals
-    // the still buffer's native format/colour, what our transfer stamped, and whether VT gamut-
-    // converts (709 vs P3 dest). Read-only; never touches preview/record (guarded by isStill).
-    if (isStill) {
-        static dispatch_once_t stillDstOnce;
-        dispatch_once(&stillDstOnce, ^{
-            VCamLog(@"photo-diag: still DST native[%@]", dstNative ?: @"-");
-            VCamLog(@"photo-diag: still DST after-xfer %@ centre[%@]",
-                    VCamDescribeBuffer(cameraBuf), VCamCentreSample(cameraBuf));
-        });
-        VCamPhotoDiagOnce(srcForDiag);
-        // mode 2: remap the still's VALUES 709->P3 (the fix). Overwrites the baseline transfer above;
-        // on failure the baseline (red) result stays. Still-only, rare, fail-open.
-        if (pcMode == 2 && srcForDiag) {
-            BOOL fixed = VCamStillGamut709toP3(srcForDiag, cameraBuf);
-            static int loggedFix = -1;
-            if (loggedFix != (fixed ? 1 : 0)) {
-                loggedFix = fixed ? 1 : 0;
-                VCamLog(@"photo-fix: gamut-map %@",
-                        fixed ? @"applied (still now holds P3 values)" : @"FAILED -> kept baseline transfer");
-            }
+    // Still-only mode-2 COLOUR FIX, applied AFTER the lock is released. Remaps the still's pixel
+    // VALUES 709->P3 (VCamStillGamut709toP3) so they match deferredmediad's P3 tag, then applies the
+    // red-keep + tone compensation. Overwrites the baseline transfer above; on failure the baseline
+    // (red) result stays. Still-only (guarded by isStill), rare, fail-open; never touches preview/record.
+    if (isStill && pcMode == 2 && stillSrc) {
+        BOOL fixed = VCamStillGamut709toP3(stillSrc, cameraBuf);
+        static int loggedFix = -1;
+        if (loggedFix != (fixed ? 1 : 0)) {
+            loggedFix = fixed ? 1 : 0;
+            VCamLog(@"photo-fix: gamut-map %@",
+                    fixed ? @"applied (still now holds P3 values)" : @"FAILED -> kept baseline transfer");
         }
     }
-    if (srcForDiag) CVPixelBufferRelease(srcForDiag);
+    if (stillSrc) CVPixelBufferRelease(stillSrc);
 #endif
 
     // One-time geometry diagnostic (first few distinct dst sizes), logged AFTER unlock so
