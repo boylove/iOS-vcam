@@ -160,13 +160,14 @@
 // CONTRAST is an S-curve on LUMA, applied by scaling RGB by L'/L so it changes brightness/contrast only,
 // never hue or saturation (a saturation boost was tried on-device and re-pinked the glass). Runs on the
 // pre-deferredmediad buffer, so effective values are stronger than a post-hoc grade (deferredmediad
-// re-brightens). Hot via /var/tmp/vcam_expo and /var/tmp/vcam_contrast. Compiled defaults 72/138 are the
-// device-accepted REAR-camera values (the front camera may need its own set — tracked separately).
+// re-brightens). Hot via /var/tmp/vcam_expo and /var/tmp/vcam_contrast. Compiled defaults are 100/100
+// (tone OFF): on device the REAR photo looked right from the gamut + flat red-keep alone, and a darkening
+// tone (72/138) came out too dark; the knobs stay hot-tunable for the front camera / future scenes.
 #ifndef VCAM_PHOTO_EXPOSURE
-#define VCAM_PHOTO_EXPOSURE 72
+#define VCAM_PHOTO_EXPOSURE 100
 #endif
 #ifndef VCAM_PHOTO_CONTRAST
-#define VCAM_PHOTO_CONTRAST 138
+#define VCAM_PHOTO_CONTRAST 100
 #endif
 
 
