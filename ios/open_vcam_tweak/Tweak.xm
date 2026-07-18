@@ -158,8 +158,11 @@
 // midtone pixels (skin) keep VCAM_PHOTO_REDKEEP of their red (blood colour), but BRIGHT pixels ramp down
 // to this lower floor, so specular highlights on neutral objects (a clear glass / white cup) de-warm
 // back toward neutral instead of glaring pink. Hot-overridable via /var/tmp/vcam_photohl (no rebuild).
+// DEFAULT is now 85 (== VCAM_PHOTO_REDKEEP, i.e. de-warm OFF): device testing showed the luma de-warm
+// made the clear glass COLDER than the source reference and bit into lit skin, and that the real "fake
+// glare" is a TONE problem (deferredmediad over-brightening) handled by VCAM_PHOTO_EXPOSURE/CONTRAST.
 #ifndef VCAM_PHOTO_REDKEEP_HI
-#define VCAM_PHOTO_REDKEEP_HI 35
+#define VCAM_PHOTO_REDKEEP_HI 85
 #endif
 
 // VCAM_PHOTO_HITHRESH — where the highlight ramp STARTS, as a percent of THIS image's own white point
@@ -172,6 +175,21 @@
 // highlights lose their red.
 #ifndef VCAM_PHOTO_HITHRESH
 #define VCAM_PHOTO_HITHRESH 60
+#endif
+
+// VCAM_PHOTO_EXPOSURE / VCAM_PHOTO_CONTRAST — still-only TONE compensation (percent; 100 = off) that
+// counters deferredmediad's Smart-HDR brighten/flatten so the saved photo keeps the OBS source's natural,
+// moody tone instead of a washed, glary, "fake/over-processed" look. EXPOSURE is a gain (<100 darkens);
+// CONTRAST is an S-curve on LUMA, applied by scaling RGB by L'/L so it changes brightness/contrast only,
+// never hue or saturation (a saturation boost was tried on-device and re-pinked the glass). Runs on the
+// pre-deferredmediad buffer, so effective values are stronger than a post-hoc grade (deferredmediad
+// re-brightens). Hot via /var/tmp/vcam_expo and /var/tmp/vcam_contrast. Defaults 100/100 (off) until the
+// on-device tuning against the source settles, then the winners become the compiled defaults.
+#ifndef VCAM_PHOTO_EXPOSURE
+#define VCAM_PHOTO_EXPOSURE 100
+#endif
+#ifndef VCAM_PHOTO_CONTRAST
+#define VCAM_PHOTO_CONTRAST 100
 #endif
 
 
@@ -586,6 +604,36 @@ static int VCamPhotoHiThreshold(void) {
     return cached;
 }
 
+// Still-only TONE compensation knobs (percent, 100 = off) — counter deferredmediad's HDR brighten/flatten.
+static int VCamPhotoExposure(void) {   // gain; <100 darkens. Hot via /var/tmp/vcam_expo.
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int v = VCAM_PHOTO_EXPOSURE;
+        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_expo"
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (str.length > 0) { int n = [str intValue]; if (n >= 10 && n <= 200) v = n; }
+        cached = v;
+    }
+    return cached;
+}
+static int VCamPhotoContrast(void) {   // luma S-curve strength. Hot via /var/tmp/vcam_contrast.
+    static int cached = -1;
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (cached < 0 || now - last >= 2.0) {
+        last = now;
+        int v = VCAM_PHOTO_CONTRAST;
+        NSString *str = [NSString stringWithContentsOfFile:@"/var/tmp/vcam_contrast"
+                                                  encoding:NSUTF8StringEncoding error:NULL];
+        if (str.length > 0) { int n = [str intValue]; if (n >= 50 && n <= 300) v = n; }
+        cached = v;
+    }
+    return cached;
+}
+
 // THE FIX (0.6.67): write TRUE Display-P3 pixel values into the full-res still, so the colour the
 // P3-tagged HEIC renders equals the OBS colour the (709) preview/record already show correctly.
 // Device-diagnosed chain: the still buffer is natively P3-tagged (prim=P3_D65) and 10-bit LOSSLESS
@@ -703,6 +751,37 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                         }
                     }
                 }
+                // Still-only TONE compensation: counter deferredmediad's Smart-HDR brighten/flatten (the
+                // washed, glary, "fake" look) so the saved photo keeps the natural, moody tone of the OBS
+                // source. Exposure = gain; contrast = an S-curve on LUMA with RGB scaled by L'/L, i.e.
+                // brightness/contrast only, never hue or saturation (a saturation boost re-pinked the glass
+                // on-device). Runs on the pre-deferredmediad buffer, so values are stronger than a post-hoc
+                // grade. Hot-tunable; skipped when both neutral (100). Values clamped to [0,255].
+                int expo = VCamPhotoExposure();     // gain %, 100 = off
+                int contrast = VCamPhotoContrast(); // luma S-curve %, 100 = off
+                if (wrote && (expo != 100 || contrast != 100)) {
+                    float gain = expo / 100.0f, con = contrast / 100.0f;
+                    uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
+                    size_t rb2 = CVPixelBufferGetBytesPerRow(rgbP3);
+                    for (size_t yy = 0; yy < sh; yy++) {
+                        uint8_t *row = base + yy * rb2;
+                        for (size_t xx = 0; xx < sw; xx++) {
+                            uint8_t *px = row + xx * 4;   // BGRA
+                            float bb = px[0] * gain, gg = px[1] * gain, rr = px[2] * gain;
+                            float L = 0.2126f * rr + 0.7152f * gg + 0.0722f * bb;
+                            if (L > 0.5f) {
+                                float Ln2 = (L / 255.0f - 0.5f) * con + 0.5f;
+                                if (Ln2 < 0.0f) Ln2 = 0.0f; else if (Ln2 > 1.0f) Ln2 = 1.0f;
+                                float scale = (Ln2 * 255.0f) / L;
+                                rr *= scale; gg *= scale; bb *= scale;
+                            }
+                            if (rr < 0.0f) rr = 0.0f; else if (rr > 255.0f) rr = 255.0f;
+                            if (gg < 0.0f) gg = 0.0f; else if (gg > 255.0f) gg = 255.0f;
+                            if (bb < 0.0f) bb = 0.0f; else if (bb > 255.0f) bb = 255.0f;
+                            px[0] = (uint8_t)(bb + 0.5f); px[1] = (uint8_t)(gg + 0.5f); px[2] = (uint8_t)(rr + 0.5f);
+                        }
+                    }
+                }
                 // Sanity/A-B trace (once): the values actually written to the still (post 709->P3, post red-keep).
                 static BOOL tracedFix = NO;
                 if (!tracedFix) {
@@ -710,8 +789,8 @@ static BOOL VCamStillGamut709toP3(CVPixelBufferRef src, CVImageBufferRef still) 
                     uint8_t *p = (uint8_t *)CVPixelBufferGetBaseAddress(rgb709);
                     uint8_t *q = (uint8_t *)CVPixelBufferGetBaseAddress(rgbP3);
                     size_t br = CVPixelBufferGetBytesPerRow(rgb709), o = (sh/2)*br + (sw/2)*4;
-                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d lw=%d lo=%d%% 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
-                                        (long)e, redKeep, redKeepHi, Lw, loPct, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
+                    if (p && q) VCamLog(@"photo-fix: gamut e=%ld redkeep=%d/%d lw=%d lo=%d%% expo=%d con=%d 709BGRA[%d %d %d] -> outBGRA[%d %d %d]",
+                                        (long)e, redKeep, redKeepHi, Lw, loPct, expo, contrast, p[o],p[o+1],p[o+2], q[o],q[o+1],q[o+2]);
                 }
                 CVPixelBufferUnlockBaseAddress(rgbP3, 0);
             }
