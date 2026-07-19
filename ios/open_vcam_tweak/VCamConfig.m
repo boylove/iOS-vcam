@@ -29,6 +29,7 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
 @property (atomic, copy, readwrite) NSString *rtmpURL;
 @property (atomic, readwrite) BOOL replaceVideo;
 @property (atomic, readwrite) BOOL replaceAudio;
+@property (atomic, readwrite) BOOL zoomFollow;
 @property (nonatomic, strong) dispatch_source_t timer;
 @property (nonatomic, copy) NSString *lastSignature;
 @end
@@ -49,6 +50,7 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
         _rtmpURL = VCAM_DEFAULT_RTMP;
         _replaceVideo = YES;
         _replaceAudio = YES;
+        _zoomFollow = NO;          // opt-in: default off keeps the current (Trim-fill) behaviour
         [self reloadNow];
         [self startTimer];
         // Instant apply: re-read the moment the floating panel publishes a change,
@@ -124,16 +126,19 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
     id audioValue = plist[@"replaceAudio"] ?: plist[@"ReplaceAudio"];
     BOOL replaceAudio = [audioValue respondsToSelector:@selector(boolValue)]
                             ? [audioValue boolValue] : YES;
+    id zoomValue = plist[@"zoomFollow"] ?: plist[@"ZoomFollow"];
+    BOOL zoomFollow = [zoomValue respondsToSelector:@selector(boolValue)]
+                          ? [zoomValue boolValue] : NO;   // opt-in, default off
 
     // The live Darwin-notify state wins for the TOGGLES when the panel has published
     // this boot: it reaches sandboxes the file can't (TikTok) and applies instantly,
     // and is what makes the switches hot even where the file write is blocked. The URL
     // stays file-only (a 64-bit state can't carry a string), so mediaserverd keeps
     // reading it here. When no state was published, keep the file/compiled values.
-    BOOL sEnabled = enabled, sVideo = replaceVideo, sAudio = replaceAudio;
+    BOOL sEnabled = enabled, sVideo = replaceVideo, sAudio = replaceAudio, sZoom = zoomFollow;
     NSString *toggleSrc = @"file";
-    if (VCamControlReadState(&sEnabled, &sVideo, &sAudio)) {
-        enabled = sEnabled; replaceVideo = sVideo; replaceAudio = sAudio;
+    if (VCamControlReadState(&sEnabled, &sVideo, &sAudio, &sZoom)) {
+        enabled = sEnabled; replaceVideo = sVideo; replaceAudio = sAudio; zoomFollow = sZoom;
         toggleSrc = @"notify";
     }
 
@@ -141,19 +146,20 @@ static NSArray<NSString *> *VCamDisablePaths(void) {
     self.rtmpURL = rtmpURL;
     self.replaceVideo = replaceVideo;
     self.replaceAudio = replaceAudio;
+    self.zoomFollow = zoomFollow;
 
     // Log only when something changes, so it never spams. NO mirror/rotation knobs: the
     // camera-overwrite path rotates a fixed CCW90 (== create90ImageBuffer: 0x82b48) and never
     // flips (the front selfie mirror is the downstream pipeline's job), exactly like the closed
     // vcamera — there is nothing for a user rotation/mirror setting to drive on that path.
-    NSString *sig = [NSString stringWithFormat:@"%@|%d|%@|v%d|a%d|%@",
+    NSString *sig = [NSString stringWithFormat:@"%@|%d|%@|v%d|a%d|z%d|%@",
                      source ?: @"defaults", enabled, rtmpURL,
-                     replaceVideo, replaceAudio, toggleSrc];
+                     replaceVideo, replaceAudio, zoomFollow, toggleSrc];
     if (![sig isEqualToString:self.lastSignature]) {
         self.lastSignature = sig;
-        VCamLog(@"config source=%@ enabled=%d url=%@ replaceVideo=%d replaceAudio=%d toggles=%@",
+        VCamLog(@"config source=%@ enabled=%d url=%@ replaceVideo=%d replaceAudio=%d zoomFollow=%d toggles=%@",
                 source ?: @"defaults", enabled, rtmpURL,
-                replaceVideo, replaceAudio, toggleSrc);
+                replaceVideo, replaceAudio, zoomFollow, toggleSrc);
     }
 }
 

@@ -27,6 +27,10 @@
                                              // pixels written into the full-res still buffer are
                                              // gamut-mapped 709->P3 to match the P3 tag deferredmediad
                                              // stamps on the saved HEIC (fixes the red cast + small file).
+    VTPixelTransferSessionRef _zoomTransferSession;  // ZOOM-FOLLOW session: colour == main session but
+                                             // ScalingMode = CropSourceToCleanAperture, so the source's
+                                             // per-frame clean-aperture sub-rect is scaled to fill the dst
+                                             // (centre-crop 1/factor -> the OBS frame follows the app zoom).
     BOOL _live;                              // overwrite gate           (== engine ivar 9 / _bLive)
     NSRecursiveLock *_lock;                  // THE single engine lock   (== engine ivar 0x18)
     CVPixelBufferPoolRef _rotPool;           // RECYCLES rotated dst buffers (bounds IOSurface churn)
@@ -108,6 +112,31 @@
                                  kCVImageBufferYCbCrMatrix_ITU_R_601_4);
             _stillTransferSession = sts;
         }
+
+        // ZOOM-FOLLOW transfer session (跟随变焦). Colour config IDENTICAL to the main session, so a
+        // zoomed frame is byte-for-byte the same as an un-zoomed one except for the crop; the ONLY
+        // difference is ScalingMode = CropSourceToCleanAperture. With that mode VT reads the source's
+        // kCVImageBufferCleanApertureKey attachment (set per-frame by -setCenterCropOnSource:factor:)
+        // and scales just that sub-rect to fill the destination — a centred 1/factor crop = optical-style
+        // zoom, in the SAME single GPU pass as the normal transfer (no extra buffer, no rotation change).
+        // Created eagerly; NULL -> Tweak.xm falls back to the main session (no crop, fail-open).
+        VTPixelTransferSessionRef zts = NULL;
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &zts) == noErr && zts) {
+            VTSessionSetProperty(zts, kVTPixelTransferPropertyKey_ScalingMode,
+                                 kVTScalingMode_CropSourceToCleanAperture);
+            VTSessionSetProperty(zts, (__bridge CFStringRef)@"EnableGPUAcceleratedTransfer",
+                                 VCAM_GPU_ACCEL ? kCFBooleanTrue : kCFBooleanFalse);
+#if VCAM_DEST_COLOR
+            VTSessionSetProperty(zts, kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 kCVImageBufferColorPrimaries_ITU_R_709_2);
+            VTSessionSetProperty(zts, kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 kCVImageBufferTransferFunction_ITU_R_709_2);
+            VTSessionSetProperty(zts, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 VCAM_DEST_MATRIX_709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                                                      : kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+#endif
+            _zoomTransferSession = zts;
+        }
     }
     return self;
 }
@@ -132,10 +161,41 @@
         VTPixelTransferSessionInvalidate(_stillTransferSession);
         CFRelease(_stillTransferSession);
     }
+    if (_zoomTransferSession) {
+        VTPixelTransferSessionInvalidate(_zoomTransferSession);
+        CFRelease(_zoomTransferSession);
+    }
 }
 
 - (VTPixelTransferSessionRef)transferSession { return _transferSession; }
 - (VTPixelTransferSessionRef)stillTransferSession { return _stillTransferSession; }
+- (VTPixelTransferSessionRef)zoomTransferSession { return _zoomTransferSession; }
+
+// Attach (or clear) a CENTERED clean-aperture rect of 1/factor on the OBS source, so a transfer
+// through -zoomTransferSession (CropSourceToCleanAperture) scales just that sub-rect to fill the
+// destination — an optical-style centre zoom. kCVImageBufferCleanApertureKey is expressed as
+// {Width,Height,HorizontalOffset,VerticalOffset}; offsets are the crop-CENTER relative to the
+// image center (0 = centred), so a pure centre crop needs only the smaller Width/Height. Fail-open:
+// a NULL/degenerate buffer or factor<=1 removes the attachment (VT then transfers the full frame).
+- (BOOL)setCenterCropOnSource:(CVPixelBufferRef)src factor:(double)factor {
+    if (!src) return NO;
+    if (!(factor > 1.0)) {
+        CVBufferRemoveAttachment(src, kCVImageBufferCleanApertureKey);
+        return NO;
+    }
+    size_t w = CVPixelBufferGetWidth(src), h = CVPixelBufferGetHeight(src);
+    if (w == 0 || h == 0) return NO;
+    double cw = (double)w / factor, ch = (double)h / factor;
+    NSDictionary *ca = @{
+        (id)kCVImageBufferCleanApertureWidthKey            : @(cw),
+        (id)kCVImageBufferCleanApertureHeightKey           : @(ch),
+        (id)kCVImageBufferCleanApertureHorizontalOffsetKey : @0,   // centred
+        (id)kCVImageBufferCleanApertureVerticalOffsetKey   : @0,
+    };
+    CVBufferSetAttachment(src, kCVImageBufferCleanApertureKey,
+                          (__bridge CFDictionaryRef)ca, kCVAttachmentMode_ShouldPropagate);
+    return YES;
+}
 
 // Faithful port of the closed vcamera's `create90ImageBuffer:` (0x829e0): CCW90-rotate
 // `src` into a FRESH buffer with swapped W/H, whose IOSurface uses exactly

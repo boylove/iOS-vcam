@@ -29,6 +29,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// floating panel's "替换音频" switch (vc.plist `replaceAudio` / notify state).
 @property (atomic, readonly) BOOL replaceAudio;
 
+/// Follow the app's live camera zoom: centre-crop the OBS frame by 1/zoomFactor so a
+/// pinch-zoom in the capture app zooms the injected image too (keeping the picture
+/// consistent with the reported focal length). Default NO. Gated by the floating
+/// panel's "跟随变焦" switch (vc.plist `zoomFollow`, or the live Darwin-notify state
+/// when the panel has published this boot). The live factor itself comes from
+/// VCamZoomCurrentFactor() (VCamZoomProbe); this flag only enables the behaviour.
+@property (atomic, readonly) BOOL zoomFollow;
+
 /// Force an immediate reload (also happens automatically on a 1.5s timer and on
 /// every control-channel publish).
 - (void)reloadNow;

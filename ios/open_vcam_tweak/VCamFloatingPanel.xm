@@ -7,6 +7,7 @@
 //   * RTMP pull URL      (default rtmp://127.10.10.10:1935/live/srs)
 //   * 替换视频 switch     (replace the camera video with the OBS frame)
 //   * 替换音频 switch     (replace the microphone with the OBS audio)
+//   * 跟随变焦 switch     (centre-crop the OBS frame to follow the app's pinch-zoom)
 //   * 保存 button         (apply — everything is HOT, no respring)
 //
 // Hot control across sandboxes (see VCamControlChannel.h): Save writes the RTMP
@@ -69,6 +70,7 @@ static BOOL VCamPathReachesMediaserverd(NSString *path) {
 @property (nonatomic, strong) UITextField *urlField;
 @property (nonatomic, strong) UISwitch *videoSwitch;
 @property (nonatomic, strong) UISwitch *audioSwitch;
+@property (nonatomic, strong) UISwitch *zoomSwitch;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, assign) BOOL open;
 @property (nonatomic, assign) int retries;
@@ -199,6 +201,7 @@ static BOOL VCamPathReachesMediaserverd(NSString *path) {
 
     self.videoSwitch = [self addRowIn:card y:&y label:@"替换视频"];
     self.audioSwitch = [self addRowIn:card y:&y label:@"替换音频"];
+    self.zoomSwitch  = [self addRowIn:card y:&y label:@"跟随变焦"];
     y += 4;
 
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(pad, y, iw, 16)];
@@ -301,15 +304,18 @@ static BOOL VCamPathReachesMediaserverd(NSString *path) {
     NSString *url = plist[@"rtmp"] ?: plist[@"Rtmp"] ?: plist[@"link"];
     self.urlField.text = (url.length > 0) ? url : VCAM_PANEL_DEFAULT_RTMP;
 
-    BOOL video = YES, audio = YES;
+    BOOL video = YES, audio = YES, zoom = NO;   // zoom-follow is opt-in (default off)
     id v = plist[@"replaceVideo"] ?: plist[@"ReplaceVideo"];
     id a = plist[@"replaceAudio"] ?: plist[@"ReplaceAudio"];
+    id z = plist[@"zoomFollow"] ?: plist[@"ZoomFollow"];
     if ([v respondsToSelector:@selector(boolValue)]) video = [v boolValue];
     if ([a respondsToSelector:@selector(boolValue)]) audio = [a boolValue];
-    BOOL e, sv, sa;                              // live notify state wins if published this boot
-    if (VCamControlReadState(&e, &sv, &sa)) { video = sv; audio = sa; }
+    if ([z respondsToSelector:@selector(boolValue)]) zoom = [z boolValue];
+    BOOL e, sv, sa, sz;                          // live notify state wins if published this boot
+    if (VCamControlReadState(&e, &sv, &sa, &sz)) { video = sv; audio = sa; zoom = sz; }
     self.videoSwitch.on = video;
     self.audioSwitch.on = audio;
+    self.zoomSwitch.on  = zoom;
 }
 
 #pragma mark - Save
@@ -320,11 +326,13 @@ static BOOL VCamPathReachesMediaserverd(NSString *path) {
     if (url.length == 0) url = VCAM_PANEL_DEFAULT_RTMP;
     BOOL video = self.videoSwitch.on;
     BOOL audio = self.audioSwitch.on;
+    BOOL zoom  = self.zoomSwitch.on;
 
     NSDictionary *cfg = @{ @"enabled": @YES,
                            @"rtmp": url,
                            @"replaceVideo": @(video),
-                           @"replaceAudio": @(audio) };
+                           @"replaceAudio": @(audio),
+                           @"zoomFollow": @(zoom) };
 
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL anyWritten = NO, mediaWritten = NO;
@@ -342,9 +350,9 @@ static BOOL VCamPathReachesMediaserverd(NSString *path) {
 
     // Always publish the toggles on the notify bus — instant, and the only channel that
     // reaches TikTok. This makes the switches work even if every file write was blocked.
-    VCamControlPublish(YES, video, audio);
-    VCamLog(@"panel: saved url=%@ video=%d audio=%d fileWritten=%d mediaWritten=%d",
-            url, video, audio, anyWritten, mediaWritten);
+    VCamControlPublish(YES, video, audio, zoom);
+    VCamLog(@"panel: saved url=%@ video=%d audio=%d zoom=%d fileWritten=%d mediaWritten=%d",
+            url, video, audio, zoom, anyWritten, mediaWritten);
 
     if (mediaWritten)      self.statusLabel.text = @"✓ 已保存并热更新（视频/音频/地址）";
     else if (anyWritten)   self.statusLabel.text = @"✓ 开关已更新；地址写入受限";

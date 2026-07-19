@@ -52,6 +52,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// -transferSession (fail-open). Used only for the full-res still (Tweak.xm isStill gate).
 - (nullable VTPixelTransferSessionRef)stillTransferSession;
 
+/// ZOOM-FOLLOW transfer session — identical colour config to -transferSession but its
+/// ScalingMode is CropSourceToCleanAperture, so it scales the source's clean-aperture sub-rect
+/// (set per-frame by -setCenterCropOnSource:factor:) to fill the destination. That makes the
+/// injected OBS frame follow the app's pinch-zoom (see VCamZoom.h). Created eagerly at init;
+/// NULL -> caller falls back to -transferSession (no crop, fail-open).
+- (nullable VTPixelTransferSessionRef)zoomTransferSession;
+
+/// Attach a CENTERED clean-aperture crop of 1/factor to `src` (the OBS frame), so a subsequent
+/// transfer through -zoomTransferSession scales that sub-rect to fill the destination. factor
+/// <= 1 removes any crop attachment (full frame). Caller must hold the engine lock (the src is
+/// the shared frame). No-op returning NO on a NULL/degenerate buffer (fail-open -> no crop).
+- (BOOL)setCenterCropOnSource:(nullable CVPixelBufferRef)src factor:(double)factor;
+
 /// Set the engine "live" flag (== _bLive / -setLive:, ivar 9). The emit overwrites ONLY when
 /// live AND a frame exists. The RTMP layer sets YES on connect and NO on disconnect WITHOUT
 /// clearing the frame — so a disconnected stream falls open to the real camera via this gate

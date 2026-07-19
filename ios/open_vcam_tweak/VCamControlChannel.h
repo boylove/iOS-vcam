@@ -31,6 +31,7 @@
 #define VCAM_STATE_ENABLED  (1ULL << 1)   // master enable
 #define VCAM_STATE_VIDEO    (1ULL << 2)   // replace video
 #define VCAM_STATE_AUDIO    (1ULL << 3)   // replace audio
+#define VCAM_STATE_ZOOM     (1ULL << 4)   // follow the app's live camera zoom
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,11 +40,11 @@ extern "C" {
 /// Reader side. Fills the out params from the published notify state and returns
 /// YES iff a valid state exists (panel published this boot). When it returns NO,
 /// the caller keeps its file/compiled values. Any out pointer may be NULL.
-BOOL VCamControlReadState(BOOL *enabled, BOOL *video, BOOL *audio);
+BOOL VCamControlReadState(BOOL *enabled, BOOL *video, BOOL *audio, BOOL *zoomFollow);
 
 /// Publisher side (SpringBoard panel). Encodes the toggles into the 64-bit state
 /// (VALID set) and posts the notification so observers re-read immediately.
-void VCamControlPublish(BOOL enabled, BOOL video, BOOL audio);
+void VCamControlPublish(BOOL enabled, BOOL video, BOOL audio, BOOL zoomFollow);
 
 /// Reader side. Invoke `onChange` on `queue` (main queue if NULL) whenever the
 /// state is republished. Register once per process; the block reads the fresh

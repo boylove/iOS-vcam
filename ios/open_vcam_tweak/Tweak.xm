@@ -15,6 +15,7 @@
 #import "VCamFrameStore.h"
 #import "VCamRTMPSource.h"
 #import "VCamAudioSink.h"
+#import "VCamZoom.h"
 #import "VCamLog.h"
 
 // ---------------------------------------------------------------------------
@@ -675,8 +676,35 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     }
 #endif
 
-    // ONE transfer. Preview/video use the 709 main session; the full-res still uses the P3 session
-    // (VCAM_PHOTO_COLOR) so the saved photo's pixel values match its P3 tag. ScalingMode=Trim aspect-fills.
+    // ZOOM-FOLLOW (跟随变焦). When the switch is on and the app has zoomed (factor>1), centre-crop
+    // the OBS src by 1/factor and transfer it through the crop session so the injected image tracks
+    // the pinch-zoom — keeping the picture consistent with the reported focal length. Scoped to
+    // preview/record (NOT the full-res still: that keeps its P3 colour session, and a stills-zoom is
+    // rare + would fight the colour fix). We ALWAYS set the crop state on the chosen src (factor 1.0
+    // clears it) so a recycled buffer never carries a stale crop when zoom is off. Fail-open: if the
+    // zoom session is missing or the crop can't be set, fall back to the normal session (no crop).
+    double zoomFactor = 1.0;
+    BOOL zoomApplied = NO;
+#if VCAM_PHOTO_COLOR
+    BOOL zoomEligible = !isStill;
+#else
+    BOOL zoomEligible = YES;
+#endif
+    if (cfg.zoomFollow && zoomEligible) {
+        zoomFactor = VCamZoomCurrentFactor();     // >=1.0, clamped by the probe
+        VTPixelTransferSessionRef zxfer = [store zoomTransferSession];
+        if (zxfer && [store setCenterCropOnSource:src factor:zoomFactor]) {
+            useXfer = zxfer;
+            zoomApplied = YES;
+        }
+    }
+    if (!zoomApplied) {
+        [store setCenterCropOnSource:src factor:1.0];   // clear any stale crop on a recycled buffer
+    }
+
+    // ONE transfer. Preview/video use the 709 main session (or the crop session when following zoom);
+    // the full-res still uses the P3 session (VCAM_PHOTO_COLOR) so the saved photo's pixel values match
+    // its P3 tag. ScalingMode=Trim aspect-fills (CropSourceToCleanAperture when zooming).
     OSStatus ts = VTPixelTransferSessionTransferImage(useXfer, src, cameraBuf);
 
     [store endEmitAccess];
@@ -707,10 +735,10 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
         for (int i = 0; i < nLogged; i++) if (loggedDst[i] == key) { seen = YES; break; }
         if (!seen && nLogged < 6) {
             loggedDst[nLogged++] = key;
-            VCamLog(@"geom: src=%zux%zu dst=%zux%zu rotated=%d",
+            VCamLog(@"geom: src=%zux%zu dst=%zux%zu rotated=%d zoomFollow=%d zoom=%.2f",
                     srcW, srcH,
                     CVPixelBufferGetWidth(cameraBuf), CVPixelBufferGetHeight(cameraBuf),
-                    usedRotated);
+                    usedRotated, (int)cfg.zoomFollow, zoomFactor);
         }
     }
 

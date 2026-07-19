@@ -17,25 +17,27 @@ static int VCamControlToken(void) {
     return gToken;
 }
 
-BOOL VCamControlReadState(BOOL *enabled, BOOL *video, BOOL *audio) {
+BOOL VCamControlReadState(BOOL *enabled, BOOL *video, BOOL *audio, BOOL *zoomFollow) {
     int t = VCamControlToken();
     if (t < 0) return NO;
     uint64_t s = 0;
     if (notify_get_state(t, &s) != NOTIFY_STATUS_OK) return NO;
     if (!(s & VCAM_STATE_VALID)) return NO;            // nothing published this boot
-    if (enabled) *enabled = (s & VCAM_STATE_ENABLED) ? YES : NO;
-    if (video)   *video   = (s & VCAM_STATE_VIDEO)   ? YES : NO;
-    if (audio)   *audio   = (s & VCAM_STATE_AUDIO)   ? YES : NO;
+    if (enabled)    *enabled    = (s & VCAM_STATE_ENABLED) ? YES : NO;
+    if (video)      *video      = (s & VCAM_STATE_VIDEO)   ? YES : NO;
+    if (audio)      *audio      = (s & VCAM_STATE_AUDIO)   ? YES : NO;
+    if (zoomFollow) *zoomFollow = (s & VCAM_STATE_ZOOM)    ? YES : NO;
     return YES;
 }
 
-void VCamControlPublish(BOOL enabled, BOOL video, BOOL audio) {
+void VCamControlPublish(BOOL enabled, BOOL video, BOOL audio, BOOL zoomFollow) {
     int t = VCamControlToken();
     if (t < 0) return;
     uint64_t s = VCAM_STATE_VALID
-               | (enabled ? VCAM_STATE_ENABLED : 0)
-               | (video   ? VCAM_STATE_VIDEO   : 0)
-               | (audio   ? VCAM_STATE_AUDIO   : 0);
+               | (enabled    ? VCAM_STATE_ENABLED : 0)
+               | (video      ? VCAM_STATE_VIDEO   : 0)
+               | (audio      ? VCAM_STATE_AUDIO   : 0)
+               | (zoomFollow ? VCAM_STATE_ZOOM    : 0);
     notify_set_state(t, s);
     notify_post(VCAM_NOTIFY_NAME);   // wake observers so they re-read immediately
 }

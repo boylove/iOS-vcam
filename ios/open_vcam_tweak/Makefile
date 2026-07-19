@@ -26,7 +26,13 @@ TWEAK_NAME := OpenVCam
 # audio (PTS-dynamically aligned, 0.6.62), gated on 替换音频 + a live capture. This is the
 # system-side mic path that covers every app whose mic mediaserverd processes (TikTok, Shopee,
 # ...), which is why no per-app in-process audio hook is needed.
-OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamFloatingPanel.xm VCamControlChannel.m VCamAudioProbe.x vendor/rtmp/vcam_rtmp.c
+# VCamZoomProbe.x (mediaserverd-only) backs the "跟随变焦" switch: it discovers the Fig capture
+# zoom SETTER by runtime reflection and records the live factor (VCamZoom.h / VCamZoomCurrentFactor),
+# so the emit path can centre-crop the OBS frame by 1/factor and follow the app's pinch-zoom. It only
+# OBSERVES the value (never changes the real camera's zoom); the crop is applied by a dedicated
+# CropSourceToCleanAperture transfer session in VCamFrameStore. Fail-open (no crop) until a setter is
+# observed; gated on the switch. Silence discovery with /var/mobile/Media/vcam_nozoomprobe.
+OpenVCam_FILES := Tweak.xm VCamConfig.m VCamFrameStore.m VCamH264Decoder.mm VCamRTMPSource.mm VCamAACDecoder.mm VCamAudioMS.x VCamFloatingPanel.xm VCamControlChannel.m VCamAudioProbe.x VCamZoomProbe.x vendor/rtmp/vcam_rtmp.c
 OpenVCam_CFLAGS := -fobjc-arc -Wall -Wextra -Ivendor/rtmp
 
 # Feature toggles, passthrough from the command line or CI. Using := on OpenVCam_CFLAGS
