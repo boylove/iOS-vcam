@@ -37,6 +37,7 @@
 #import <stdatomic.h>
 #import <math.h>
 #import <string.h>
+#import <time.h>
 
 #import "VCamZoom.h"
 #import "VCamLog.h"
@@ -71,15 +72,28 @@ static const VCamZoomSel kZoomSels[] = {
     { "setCameraZoomFactor:",    20 },
     { "setBaseZoomFactor:",      10 },  // base zoom before GDC (lowest — often just 1.0)
 };
-static const int kZoomSelCount = (int)(sizeof(kZoomSels) / sizeof(kZoomSels[0]));
+#define kZoomSelCount ((int)(sizeof(kZoomSels) / sizeof(kZoomSels[0])))
 
 // The single shared value store (read lock-free by the emit path via VCamZoomCurrentFactor).
 static _Atomic double   gZoomFactor       = 1.0;
-static _Atomic uint64_t gZoomObservations = 0;
-// Priority of the setter that currently OWNS the factor value. The value is only updated by a
-// setter whose priority is >= this; the first time a higher-priority setter fires it takes over.
-// (Capture zoom setters fire on every change, so the owner never starves on a stale value.)
+// Priority of the setter that currently OWNS the factor value, plus the monotonic time (ms) it
+// last fired. A setter updates the value only if its priority >= the owner's — EXCEPT the owner's
+// claim DECAYS: if the owner hasn't fired for VCAM_ZOOM_OWNER_TTL_MS, a live lower-priority setter
+// takes over. This handles setup-only setters (e.g. a config object that sets videoZoom=1.0 ONCE
+// at session start, grabs the top priority, then never fires again) without letting them
+// permanently block the setter that actually tracks the live pinch. A setter that genuinely tracks
+// the pinch keeps firing and so keeps its claim fresh. Device-confirmed need: on iPhone13,2 the
+// prio-50 setVideoZoomFactor: fired once at 1.0 while the live pinch flowed through prio-30
+// setRequestedZoomFactor: and was rejected.
 static _Atomic int      gZoomOwnerPrio    = 0;
+static _Atomic uint64_t gZoomOwnerAtMs    = 0;   // monotonic ms of the owner's last write
+#define VCAM_ZOOM_OWNER_TTL_MS 500ULL
+
+static uint64_t VCamZoomNowMs(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
 
 double VCamZoomCurrentFactor(void) {
     double f = atomic_load_explicit(&gZoomFactor, memory_order_relaxed);
@@ -88,35 +102,56 @@ double VCamZoomCurrentFactor(void) {
     return f;
 }
 
-// Record an observed factor from a setter of the given priority + name. The value is only adopted
-// if prio >= the current owner's prio, so a low-priority setter (e.g. base=1.0) can never stomp the
-// authoritative ISP/video factor. `name` is a stable C string literal (for logging only).
-static void VCamZoomObserve(double factor, int prio, const char *name) {
+// Per-setter last-LOGGED value, indexed by allowlist slot (see kZoomSels). Lets each setter log
+// independently when ITS OWN value moves meaningfully — so the syslog shows every setter that
+// tracks the pinch (not just whichever one wins a shared counter), and always shows what the
+// current owner actually stored. Index kZoomSelCount is the reserved slot for explicit callers.
+static _Atomic double gZoomLastLogged[kZoomSelCount + 1];   // C99 array of atomics, zero-init
+
+// Log when a setter's value changes by more than this (absolute). Small enough to catch a slow
+// pinch ramp, large enough that steady-state jitter doesn't spam the log.
+#define VCAM_ZOOM_LOG_DELTA 0.02
+
+// Record an observed factor from the allowlist setter at `slot` (or kZoomSelCount for an explicit
+// caller). The value is only adopted if its priority >= the current owner's, so a low-priority
+// setter (e.g. base=1.0) can never stomp the authoritative video factor. `name` is a stable C
+// string literal (logging only).
+static void VCamZoomObserve(double factor, int slot, const char *name) {
     if (!(factor > 0.0) || isnan(factor)) return;    // ignore garbage
     if (factor < 1.0) factor = 1.0;
     if (factor > VCAM_ZOOM_MAX) factor = VCAM_ZOOM_MAX;
 
+    int prio = (slot >= 0 && slot < kZoomSelCount) ? kZoomSels[slot].prio : 1000;   // explicit=1000
+    uint64_t now = VCamZoomNowMs();
     int owner = atomic_load_explicit(&gZoomOwnerPrio, memory_order_relaxed);
-    BOOL authoritative = (prio >= owner);
+    uint64_t ownerAt = atomic_load_explicit(&gZoomOwnerAtMs, memory_order_relaxed);
+    // The owner's claim expires if it hasn't fired within the TTL, so a live lower-priority setter
+    // can take over from a setup-only high-priority setter (see gZoomOwnerPrio comment).
+    BOOL ownerStale = (now && ownerAt && (now - ownerAt) > VCAM_ZOOM_OWNER_TTL_MS);
+    BOOL authoritative = (prio >= owner) || ownerStale;
     if (authoritative) {
-        if (prio > owner) atomic_store_explicit(&gZoomOwnerPrio, prio, memory_order_relaxed);
+        atomic_store_explicit(&gZoomOwnerPrio, prio, memory_order_relaxed);
+        atomic_store_explicit(&gZoomOwnerAtMs, now, memory_order_relaxed);
         atomic_store_explicit(&gZoomFactor, factor, memory_order_relaxed);
     }
-    uint64_t n = atomic_fetch_add_explicit(&gZoomObservations, 1, memory_order_relaxed) + 1;
-    // Log the first few observations and then sparsely — enough to prove WHICH setter tracks the
-    // pinch (and whether the ranking is right) without spamming at zoom-ramp rate.
-    if (n <= (uint64_t)(kZoomSelCount * 2) || (n % 120) == 0) {
+    // Log this setter iff ITS value moved by >= the delta since we last logged it (change-based, per
+    // setter). This surfaces the owner's adopted ramp AND every other setter that tracks the pinch,
+    // so one gesture is enough to confirm which selector is live and whether the ranking is right.
+    int idx = (slot >= 0 && slot <= kZoomSelCount) ? slot : kZoomSelCount;
+    double last = atomic_load_explicit(&gZoomLastLogged[idx], memory_order_relaxed);
+    if (fabs(factor - last) >= VCAM_ZOOM_LOG_DELTA) {
+        atomic_store_explicit(&gZoomLastLogged[idx], factor, memory_order_relaxed);
         double f = factor; int p = prio, ow = authoritative ? prio : owner;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            VCamLog(@"zoom: %s=%.3f prio=%d %@ (owner=%d n=%llu)",
-                    name, f, p, authoritative ? @"ADOPTED" : @"ignored", ow, n);
+            VCamLog(@"zoom: %s=%.3f prio=%d %@ (owner=%d)",
+                    name, f, p, authoritative ? @"ADOPTED" : @"ignored", ow);
         });
     }
 }
 
 // Public entry (VCamZoom.h): explicit callers are treated as the top-priority source.
 void VCamZoomSetFactor(double factor) {
-    VCamZoomObserve(factor, 1000, "explicit");
+    VCamZoomObserve(factor, kZoomSelCount, "explicit");
 }
 
 // --- Generic setter trampolines -------------------------------------------------
@@ -126,11 +161,12 @@ void VCamZoomSetFactor(double factor) {
 // every hooked selector without per-selector codegen).
 static NSMutableDictionary<NSString *, NSValue *> *gZoomOrigs;
 
-// Priority for a selector name, or 0 if not on the allowlist.
-static int VCamZoomSelPriority(const char *n) {
+// Allowlist slot index for a selector name, or -1 if not on the allowlist. The slot carries both
+// the priority (kZoomSels[slot].prio) and the per-setter last-logged store index.
+static int VCamZoomSelSlot(const char *n) {
     for (int i = 0; i < kZoomSelCount; i++)
-        if (strcmp(n, kZoomSels[i].sel) == 0) return kZoomSels[i].prio;
-    return 0;
+        if (strcmp(n, kZoomSels[i].sel) == 0) return i;
+    return -1;
 }
 
 static IMP VCamZoomOrig(id self, SEL _cmd) {
@@ -147,14 +183,14 @@ static IMP VCamZoomOrig(id self, SEL _cmd) {
 
 // CGFloat/double-arg setter (arm64: the double is in d0, so this reads it correctly).
 static void VCamZoomTrampD(id self, SEL _cmd, double factor) {
-    VCamZoomObserve(factor, VCamZoomSelPriority(sel_getName(_cmd)), sel_getName(_cmd));
+    VCamZoomObserve(factor, VCamZoomSelSlot(sel_getName(_cmd)), sel_getName(_cmd));
     IMP orig = VCamZoomOrig(self, _cmd);
     if (orig) ((void (*)(id, SEL, double))orig)(self, _cmd, factor);
 }
 
 // float-arg setter (arm64: the float is in s0; a distinct trampoline so the ABI matches).
 static void VCamZoomTrampF(id self, SEL _cmd, float factor) {
-    VCamZoomObserve((double)factor, VCamZoomSelPriority(sel_getName(_cmd)), sel_getName(_cmd));
+    VCamZoomObserve((double)factor, VCamZoomSelSlot(sel_getName(_cmd)), sel_getName(_cmd));
     IMP orig = VCamZoomOrig(self, _cmd);
     if (orig) ((void (*)(id, SEL, float))orig)(self, _cmd, factor);
 }
@@ -181,9 +217,10 @@ static void VCamHookZoomSetter(Class c, SEL sel) {
         NSString *key = [NSString stringWithFormat:@"%s#%@",
                          class_getName(c), NSStringFromSelector(sel)];
         gZoomOrigs[key] = [NSValue valueWithPointer:(const void *)orig];
+        int slot = VCamZoomSelSlot(sel_getName(sel));
         VCamLog(@"zoom: hooked setter %s %@ (arg '%s', prio %d)",
                 class_getName(c), NSStringFromSelector(sel), argType,
-                VCamZoomSelPriority(sel_getName(sel)));
+                slot >= 0 ? kZoomSels[slot].prio : 0);
     }
 }
 
