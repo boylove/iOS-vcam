@@ -690,32 +690,16 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
 #else
     BOOL zoomEligible = YES;
 #endif
-    BOOL zoomHaveSession = NO, zoomCropSet = NO;
     if (cfg.zoomFollow && zoomEligible) {
         zoomFactor = VCamZoomCurrentFactor();     // >=1.0, clamped by the probe
         VTPixelTransferSessionRef zxfer = [store zoomTransferSession];
-        zoomHaveSession = (zxfer != NULL);
-        zoomCropSet = [store setCenterCropOnSource:src factor:zoomFactor];
-        if (zxfer && zoomCropSet) {
+        if (zxfer && [store setCenterCropOnSource:src factor:zoomFactor]) {
             useXfer = zxfer;
             zoomApplied = YES;
         }
     }
     if (!zoomApplied) {
         [store setCenterCropOnSource:src factor:1.0];   // clear any stale crop on a recycled buffer
-    }
-    // ZOOM diagnostic: log when the factor the emit path actually READS changes (change-based, not
-    // per-frame spam). Distinguishes "emit sees stale 1.0" from "factor ok but crop/session missing".
-    // Reports the src the crop attaches to (rotated buffers are a separate CVPixelBuffer from raw).
-    if (cfg.zoomFollow) {
-        static double lastZ = -1.0;
-        if (fabs(zoomFactor - lastZ) >= 0.05) {
-            lastZ = zoomFactor;
-            double zf = zoomFactor; BOOL hs = zoomHaveSession, cs = zoomCropSet, ap = zoomApplied;
-            BOOL rotd = usedRotated; size_t sw = srcW, sh = srcH;
-            VCamLog(@"zoom-emit: read=%.3f haveSession=%d cropSet=%d applied=%d src=%zux%zu rotated=%d",
-                    zf, (int)hs, (int)cs, (int)ap, sw, sh, (int)rotd);
-        }
     }
 
     // ONE transfer. Preview/video use the 709 main session (or the crop session when following zoom);

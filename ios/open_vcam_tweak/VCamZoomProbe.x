@@ -121,16 +121,6 @@ double VCamZoomCurrentFactor(void) {
     return f;
 }
 
-// Per-setter last-LOGGED value, indexed by allowlist slot (see kZoomSels). Lets each setter log
-// independently when ITS OWN value moves meaningfully — so the syslog shows every setter that
-// tracks the pinch (not just whichever one wins a shared counter), and always shows what the
-// current owner actually stored. Index kZoomSelCount is the reserved slot for explicit callers.
-static _Atomic double gZoomLastLogged[kZoomSelCount + 1];   // C99 array of atomics, zero-init
-
-// Log when a setter's value changes by more than this (absolute). Small enough to catch a slow
-// pinch ramp, large enough that steady-state jitter doesn't spam the log.
-#define VCAM_ZOOM_LOG_DELTA 0.02
-
 // Record an observed factor from the allowlist setter at `slot` (or kZoomSelCount for an explicit
 // caller). The value is only adopted if its priority >= the current owner's, so a low-priority
 // setter (e.g. base=1.0) can never stomp the authoritative video factor. `name` is a stable C
@@ -145,14 +135,7 @@ static void VCamZoomObserve(double factor, int slot, const char *name) {
     // re-enable cropping at UI 1x. Single-lens devices never send >1, so the base stays 1.0 (no-op).
     if (isBase) {
         if (factor > 1.0 && factor <= VCAM_ZOOM_MAX) {
-            double prevBase = atomic_load_explicit(&gZoomBase, memory_order_relaxed);
             atomic_store_explicit(&gZoomBase, factor, memory_order_relaxed);
-            if (fabs(factor - prevBase) >= VCAM_ZOOM_LOG_DELTA) {
-                double b = factor;
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                    VCamLog(@"zoom: base=%.3f (crop denominator)", b);
-                });
-            }
         }
         return;
     }
@@ -173,19 +156,7 @@ static void VCamZoomObserve(double factor, int slot, const char *name) {
         atomic_store_explicit(&gZoomOwnerAtMs, now, memory_order_relaxed);
         atomic_store_explicit(&gZoomFactor, factor, memory_order_relaxed);
     }
-    // Log this setter iff ITS value moved by >= the delta since we last logged it (change-based, per
-    // setter). This surfaces the owner's adopted ramp AND every other setter that tracks the pinch,
-    // so one gesture is enough to confirm which selector is live and whether the ranking is right.
-    int idx = (slot >= 0 && slot <= kZoomSelCount) ? slot : kZoomSelCount;
-    double last = atomic_load_explicit(&gZoomLastLogged[idx], memory_order_relaxed);
-    if (fabs(factor - last) >= VCAM_ZOOM_LOG_DELTA) {
-        atomic_store_explicit(&gZoomLastLogged[idx], factor, memory_order_relaxed);
-        double f = factor; int p = prio, ow = authoritative ? prio : owner;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            VCamLog(@"zoom: %s=%.3f prio=%d %@ (owner=%d)",
-                    name, f, p, authoritative ? @"ADOPTED" : @"ignored", ow);
-        });
-    }
+    (void)name;   // was used by the (now-removed) per-setter change log; kept for the discovery log
 }
 
 // Public entry (VCamZoom.h): explicit callers are treated as the top-priority source.
