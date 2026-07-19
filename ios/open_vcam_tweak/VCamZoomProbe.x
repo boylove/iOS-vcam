@@ -63,14 +63,21 @@
 // video-zoom setters are the next-best proxy for the app's requested factor. NOTE (device TODO):
 // on this dual-camera device a wide<->ultrawide lens switch re-bases the per-sensor ISP factor;
 // the common wide-sensor pinch (1x->5x) is covered, cross-lens re-basing is a pinch-test item.
-typedef struct { const char *sel; int prio; } VCamZoomSel;
+// isBase: this setter reports the LENS-SWITCHOVER BASE, not a user zoom. On a multi-lens device the
+// video/requested factors are expressed relative to the WIDEST lens (ultrawide = 0.5x on iPhone12),
+// so UI "1x" arrives as videoZoomFactor≈2.0 and the switchover base (setBaseZoomFactor) is ≈2.0 too.
+// DISPLAY zoom = videoZoomFactor / base, so base is tracked separately as the crop DENOMINATOR
+// (VCamZoomBase) rather than fed into the authoritative zoom store. On a single-lens device base
+// stays 1.0 and the division is a no-op. DEVICE-CONFIRMED (iPhone13,2): at UI 1x the log showed
+// setVideoZoomFactor:=2.000 with setBaseZoomFactor:=1.959 — 2.0/1.96 ≈ 1.0 = no crop, as wanted.
+typedef struct { const char *sel; int prio; BOOL isBase; } VCamZoomSel;
 static const VCamZoomSel kZoomSels[] = {
-    { "setISPZoomFactor:",       60 },  // hardware ISP sensor crop (ground truth of the applied crop)
-    { "setVideoZoomFactor:",     50 },  // Fig/AVF capture-stream video zoom (app's requested factor)
-    { "setTotalZoomFactor:",     40 },
-    { "setRequestedZoomFactor:", 30 },
-    { "setCameraZoomFactor:",    20 },
-    { "setBaseZoomFactor:",      10 },  // base zoom before GDC (lowest — often just 1.0)
+    { "setISPZoomFactor:",       60, NO  },  // hardware ISP sensor crop (ground truth of the applied crop)
+    { "setVideoZoomFactor:",     50, NO  },  // Fig/AVF capture-stream video zoom (app's requested factor)
+    { "setTotalZoomFactor:",     40, NO  },
+    { "setRequestedZoomFactor:", 30, NO  },
+    { "setCameraZoomFactor:",    20, NO  },
+    { "setBaseZoomFactor:",      10, YES },  // lens-switchover base (crop denominator; see isBase above)
 };
 #define kZoomSelCount ((int)(sizeof(kZoomSels) / sizeof(kZoomSels[0])))
 
@@ -89,6 +96,11 @@ static _Atomic int      gZoomOwnerPrio    = 0;
 static _Atomic uint64_t gZoomOwnerAtMs    = 0;   // monotonic ms of the owner's last write
 #define VCAM_ZOOM_OWNER_TTL_MS 500ULL
 
+// Lens-switchover base (the crop DENOMINATOR): on a multi-lens device UI "1x" == raw videoZoom ≈ 2.0
+// and this base ≈ 2.0, so DISPLAY zoom = rawVideoZoom / base ≈ 1.0. Single-lens: stays 1.0 (no-op).
+// Tracked separately from the authoritative zoom store; see the kZoomSels isBase comment.
+static _Atomic double   gZoomBase         = 1.0;
+
 static uint64_t VCamZoomNowMs(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -96,8 +108,15 @@ static uint64_t VCamZoomNowMs(void) {
 }
 
 double VCamZoomCurrentFactor(void) {
-    double f = atomic_load_explicit(&gZoomFactor, memory_order_relaxed);
-    if (!(f >= 1.0)) return 1.0;                 // NaN / <1 -> no crop (fail-open)
+    double raw  = atomic_load_explicit(&gZoomFactor, memory_order_relaxed);
+    double base = atomic_load_explicit(&gZoomBase,   memory_order_relaxed);
+    // DISPLAY zoom = raw video/requested factor / lens-switchover base. On a multi-lens device the
+    // raw factor is relative to the widest lens, so dividing by the base rebases it to the UI's "1x"
+    // (see kZoomSels isBase). Guard a bad/absent base so we never amplify or divide by ~0.
+    double f = (base >= 1.0) ? (raw / base) : raw;
+    // Deadzone near 1.0: raw/base won't land exactly on 1.0 at UI "1x" (e.g. 2.000/1.959 = 1.021),
+    // so treat anything below the threshold as no-crop to keep 1x pixel-identical to the OBS source.
+    if (!(f >= 1.03)) return 1.0;                 // NaN / <1 (ultrawide 0.5x) / ~1x -> no crop (fail-open)
     if (f > VCAM_ZOOM_MAX) f = VCAM_ZOOM_MAX;
     return f;
 }
@@ -118,6 +137,26 @@ static _Atomic double gZoomLastLogged[kZoomSelCount + 1];   // C99 array of atom
 // string literal (logging only).
 static void VCamZoomObserve(double factor, int slot, const char *name) {
     if (!(factor > 0.0) || isnan(factor)) return;    // ignore garbage
+
+    BOOL isBase = (slot >= 0 && slot < kZoomSelCount) ? kZoomSels[slot].isBase : NO;
+    // BASE (crop denominator): record it separately, NEVER into the authoritative zoom store. Only
+    // adopt a base > 1.0 — on this device setBaseZoomFactor fires as a pair (1.959 then a spurious
+    // 1.000 reset); the meaningful lens-switchover ratio is the >1 value, and a 1.0 would wrongly
+    // re-enable cropping at UI 1x. Single-lens devices never send >1, so the base stays 1.0 (no-op).
+    if (isBase) {
+        if (factor > 1.0 && factor <= VCAM_ZOOM_MAX) {
+            double prevBase = atomic_load_explicit(&gZoomBase, memory_order_relaxed);
+            atomic_store_explicit(&gZoomBase, factor, memory_order_relaxed);
+            if (fabs(factor - prevBase) >= VCAM_ZOOM_LOG_DELTA) {
+                double b = factor;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    VCamLog(@"zoom: base=%.3f (crop denominator)", b);
+                });
+            }
+        }
+        return;
+    }
+
     if (factor < 1.0) factor = 1.0;
     if (factor > VCAM_ZOOM_MAX) factor = VCAM_ZOOM_MAX;
 
