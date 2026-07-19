@@ -723,6 +723,15 @@ static BOOL VCamOverwriteInPlace(CVImageBufferRef cameraBuf) {
     // its P3 tag. ScalingMode=Trim aspect-fills (CropSourceToCleanAperture when zooming).
     OSStatus ts = VTPixelTransferSessionTransferImage(useXfer, src, cameraBuf);
 
+    // Clear any CleanAperture the crop copied onto the OUTPUT buffer. We set CleanAperture on the
+    // SOURCE with ShouldPropagate so the crop session reads it; VT then copies that propagating
+    // attachment onto cameraBuf. The crop is already baked into cameraBuf's PIXELS, but the leftover
+    // attachment makes the downstream pipeline crop AGAIN — and since cameraBuf comes from a RECYCLED
+    // ISP pool, the stale rect persists after the user zooms back out (source cleared, but nothing
+    // overwrites the copy on the recycled dst). That was the "can zoom in but never back to 1x" bug.
+    // Scoped to zoomFollow so the default path never touches the ISP's own clean aperture.
+    if (cfg.zoomFollow) CVBufferRemoveAttachment(cameraBuf, kCVImageBufferCleanApertureKey);
+
     [store endEmitAccess];
 
 #if VCAM_PHOTO_COLOR
